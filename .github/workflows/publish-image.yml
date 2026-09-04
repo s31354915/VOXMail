@@ -65,3 +65,11 @@ jobs:
             "${IMAGE}:${TAG}-arm64"
       - name: Inspect published manifest
         run: docker buildx imagetools inspect "${IMAGE}:${TAG}"
+      - name: Move latest alias to this release
+        if: inputs.tag != 'latest'
+        run: |
+          docker buildx imagetools create \
+            --tag "${IMAGE}:latest" \
+            "${IMAGE}:${TAG}-amd64" \
+            "${IMAGE}:${TAG}-arm64"
+          docker buildx imagetools inspect "${IMAGE}:latest"

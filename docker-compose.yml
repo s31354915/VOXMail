@@ -1,6 +1,7 @@
 services:
   voxmail:
-    build: .
+    image: "${VOXMAIL_IMAGE:-ghcr.io/s31354915/voxmail:latest}"
+    pull_policy: always
     restart: unless-stopped
     env_file: .env
     environment:

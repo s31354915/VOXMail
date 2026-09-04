@@ -24,8 +24,15 @@ Copy `.env.example` to `.env`, set a long random `VOXMAIL_ENCRYPTION_KEY`,
 then:
 
 ```sh
-docker compose up --build
+docker compose pull
+docker compose up -d
 ```
+
+Compose pulls the latest multi-architecture image from GHCR by default. The
+manual publish workflow moves the `latest` alias whenever it publishes a
+different tag, so this follows the newest manually published release. Pin a
+specific release or digest with `VOXMAIL_IMAGE` in `.env` when repeatability is
+more important than tracking latest.
 
 The image builds baresip from pinned source, compiles the headless module set,
 and installs the VOXMail shim. Account synchronization is handled by mbsync;
