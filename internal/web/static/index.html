@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>VOXMail</title>
+  <style>
+    :root{color-scheme:dark;--bg:#0d1117;--panel:#161b22;--line:#30363d;--accent:#58a6ff;--muted:#8b949e}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:#e6edf3;font:15px system-ui,sans-serif}
+    main{max-width:1000px;margin:auto;padding:28px 16px}h1{font-size:2.2rem;margin:0 0 6px}h2{margin-top:0}p{color:var(--muted)}
+    section{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px;margin:14px 0}
+    form{display:grid;gap:10px;max-width:560px}label{display:grid;gap:5px;color:var(--muted)}input,select,button{font:inherit;border:1px solid var(--line);border-radius:7px;padding:9px;background:#0d1117;color:#e6edf3}
+    button{cursor:pointer;background:#21262d}button.primary{background:#238636;border-color:#2ea043}button.danger{background:#da3633;border-color:#f85149}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}.hidden{display:none}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.status{min-height:1.5em;color:var(--accent)}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:8px;border-bottom:1px solid var(--line)}code{color:#ffa657}
+  </style>
+</head>
+<body><main>
+  <header><h1>VOXMail</h1><p>Private telephone email, managed from one small console.</p></header>
+  <section id="auth"><div class="grid">
+    <form id="setup"><h2>First-run setup</h2><input name="username" placeholder="admin username" required minlength="3"><input name="password" type="password" placeholder="password (12+ chars)" required minlength="12"><input name="pin" inputmode="numeric" placeholder="telephone PIN" required><button class="primary">Create administrator</button></form>
+    <form id="login"><h2>Sign in</h2><input name="username" placeholder="username" required><input name="password" type="password" placeholder="password" required><input name="totp" inputmode="numeric" placeholder="2FA code (if enabled)"><button class="primary">Sign in</button></form>
+  </div><div class="status" id="auth-status"></div></section>
+  <section id="app" class="hidden"><div class="row"><h2 style="margin-right:auto">Console</h2><span id="who"></span><button id="logout">Sign out</button></div>
+    <div class="grid"><form id="account-form"><h3>Mail account</h3><input name="canonical_name" placeholder="Account name" required><input name="email" type="email" placeholder="Email address" required><input name="sender_name" placeholder="Sender name"><input name="imap_host" placeholder="IMAP host" required><input name="imap_user" placeholder="IMAP username" required><input name="imap_password" type="password" placeholder="IMAP/app password" required><input name="smtp_host" placeholder="SMTP host" required><input name="smtp_user" placeholder="SMTP username" required><input name="smtp_password" type="password" placeholder="SMTP/app password" required><button class="primary">Save account</button></form>
+    <form id="contact-form"><h3>Contact</h3><input name="name" placeholder="Name" required><input name="email" type="email" placeholder="Email" required><button class="primary">Add contact</button></form>
+    <form id="phone-form"><h3>Caller whitelist</h3><input name="phone" placeholder="+15551234567" required><button class="primary">Allow caller</button></form></div>
+    <p class="status" id="app-status"></p><div class="grid"><div><h3>Accounts</h3><div id="accounts"></div></div><div><h3>Contacts</h3><div id="contacts"></div></div><div><h3>Allowed callers</h3><div id="phones"></div></div></div>
+  </section>
+  <footer><p>IMAP synchronization is performed by <code>mbsync</code>; routine sync never expunges remote mail.</p></footer>
+  <script>
+  let csrf=''; const $=s=>document.querySelector(s); const status=(id,msg)=>$(id).textContent=msg;
+  async function api(path,opts={}){opts.headers={'Content-Type':'application/json','X-CSRF-Token':csrf,...(opts.headers||{})};const r=await fetch(path,opts);if(r.headers.get('X-CSRF-Token'))csrf=r.headers.get('X-CSRF-Token');const b=await r.json().catch(()=>({}));if(!r.ok)throw Error(b.error||r.statusText);return b}
+  function body(form){return Object.fromEntries(new FormData(form))}
+  (async()=>{try{const info=await api('/api/v1');$('#setup').classList.toggle('hidden',!info.setup_available)}catch(_){}})();
+  async function signIn(path,id){try{const u=await api(path,{method:'POST',body:JSON.stringify(body($(id)))}); status('#auth-status','Signed in as '+u.username); $('#auth').classList.add('hidden');$('#app').classList.remove('hidden');$('#who').textContent=u.username;load()}catch(e){status('#auth-status',e.message)}}
+  $('#setup').onsubmit=e=>{e.preventDefault();signIn('/api/v1/setup','#setup')}; $('#login').onsubmit=e=>{e.preventDefault();signIn('/api/v1/login','#login')};
+  $('#logout').onclick=async()=>{await api('/api/v1/logout',{method:'POST'}).catch(()=>{});location.reload()};
+  async function load(){for(const [path,id,key] of [['/api/v1/accounts','#accounts','canonical_name'],['/api/v1/contacts','#contacts','name'],['/api/v1/whitelist','#phones','phone']]){try{const rows=await api(path);$(id).innerHTML=rows.length?'<ul>'+rows.map(x=>'<li>'+String(x[key]).replace(/[<>&]/g,'')+'</li>').join('')+'</ul>':'<p>None yet.</p>'}catch(e){status('#app-status',e.message)}}}
+  for(const [id,path] of [['#account-form','/api/v1/accounts'],['#contact-form','/api/v1/contacts'],['#phone-form','/api/v1/whitelist']])$(id).onsubmit=async e=>{e.preventDefault();try{await api(path,{method:'POST',body:JSON.stringify(body($(id)))});$(id).reset();status('#app-status','Saved.');load()}catch(x){status('#app-status',x.message)}};
+  </script>
+</main></body></html>

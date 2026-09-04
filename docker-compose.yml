@@ -1,0 +1,25 @@
+services:
+  voxmail:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      VOXMAIL_DATA_DIR: /data
+      VOXMAIL_HTTP_ADDR: :8080
+      VOXMAIL_MAX_CALLS: 10
+      VOXMAIL_CONTROL_SOCKET: /data/run/baresip.sock
+      VOXMAIL_PROVISION_MODELS: "${VOXMAIL_PROVISION_MODELS:-0}"
+    ports:
+      - "8080:8080/tcp"
+      # Configure the provider's RTP range here when baresip is enabled.
+      - "10000-10100:10000-10100/udp"
+    volumes:
+      - voxmail-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/readyz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  voxmail-data:
