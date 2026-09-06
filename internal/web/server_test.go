@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
-	"net/http/cookiejar"
 	"net/http/httptest"
 	"testing"
 
@@ -20,19 +19,12 @@ func TestSetupAndCSRFProtectedContact(t *testing.T) {
 	defer db.Close()
 	box, _ := secret.New("test-key-with-more-than-32-characters-123456")
 	h := (&Server{Store: db, Secrets: box}).Handler()
-	ts := httptest.NewServer(h)
-	defer ts.Close()
-	jar, _ := cookiejar.New(nil)
-	client := ts.Client()
-	client.Jar = jar
 	body := bytes.NewBufferString(`{"username":"admin","password":"a-strong-password","pin":"1234"}`)
-	request, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/setup", body)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/setup", body)
 	request.Header.Set("Content-Type", "application/json")
-	response, err := client.Do(request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	response.Body.Close()
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, request)
+	response := recorder.Result()
 	if response.StatusCode != http.StatusCreated {
 		t.Fatalf("setup status %d", response.StatusCode)
 	}
@@ -41,14 +33,15 @@ func TestSetupAndCSRFProtectedContact(t *testing.T) {
 		t.Fatal("missing csrf token")
 	}
 	payload, _ := json.Marshal(map[string]string{"name": "Ada", "email": "ada@example.com"})
-	request, _ = http.NewRequest(http.MethodPost, ts.URL+"/api/v1/contacts", bytes.NewReader(payload))
+	request = httptest.NewRequest(http.MethodPost, "/api/v1/contacts", bytes.NewReader(payload))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("X-CSRF-Token", csrf)
-	response, err = client.Do(request)
-	if err != nil {
-		t.Fatal(err)
+	for _, cookie := range response.Cookies() {
+		request.AddCookie(cookie)
 	}
-	response.Body.Close()
+	recorder = httptest.NewRecorder()
+	h.ServeHTTP(recorder, request)
+	response = recorder.Result()
 	if response.StatusCode != http.StatusCreated {
 		t.Fatalf("contact status %d", response.StatusCode)
 	}

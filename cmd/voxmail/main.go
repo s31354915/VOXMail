@@ -34,7 +34,7 @@ func main() {
 		log.Error("cannot initialize secret store", "error", err)
 		os.Exit(1)
 	}
-	for _, dir := range []string{cfg.DataDir, filepath.Dir(cfg.DBPath), filepath.Dir(cfg.ControlSocket), filepath.Join(cfg.DataDir, "run", "voxmail"), filepath.Join(cfg.DataDir, "logs"), cfg.VoiceDir, cfg.RecordingsDir} {
+	for _, dir := range []string{cfg.DataDir, filepath.Dir(cfg.DBPath), filepath.Dir(cfg.ControlSocket), filepath.Join(cfg.DataDir, "run", "voxmail"), filepath.Join(cfg.DataDir, "run", "speech"), filepath.Join(cfg.DataDir, "logs"), cfg.VoiceDir, cfg.RecordingsDir, filepath.Dir(cfg.GreetingPath)} {
 		if err := os.MkdirAll(dir, 0700); err != nil {
 			log.Error("cannot create data directory", "path", dir, "error", err)
 			os.Exit(1)
@@ -48,6 +48,22 @@ func main() {
 			os.Exit(1)
 		}
 		cancel()
+	}
+	promptDir := filepath.Join(cfg.DataDir, "prompts")
+	staticPromptText := map[string]string{
+		"main": speech.StaticMainText,
+	}
+	mainMenuPath := filepath.Join(promptDir, "main-menu.wav")
+	manifestPath := filepath.Join(promptDir, "static-prompts.json")
+	promptContext, promptCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	staticManifest, promptErr := speech.PrepareStaticPrompts(promptContext, speech.Piper{Binary: cfg.PiperBinary, Model: cfg.PiperModel}, cfg.GreetingPath, mainMenuPath, manifestPath)
+	promptCancel()
+	if promptErr != nil {
+		log.Warn("static prompts unavailable; only existing recordings will be used", "error", promptErr)
+	}
+	staticPrompts := make(map[string]string)
+	if info, statErr := os.Stat(mainMenuPath); statErr == nil && info.Size() > 44 {
+		staticPrompts[staticPromptText["main"]] = mainMenuPath
 	}
 	db, err := store.Open(cfg.DBPath)
 	if err != nil {
@@ -70,14 +86,36 @@ func main() {
 		if os.Getenv("VOXMAIL_SIP_ACCOUNT") == "" && os.Getenv("VOXMAIL_ENABLE_CALLS") != "1" {
 			return
 		}
+		speechRuntime := speech.NewRuntime(
+			speech.Piper{Binary: cfg.PiperBinary, Model: cfg.PiperModel},
+			speech.Whisper{Binary: cfg.STTBinary, Model: cfg.STTModel},
+			filepath.Join(cfg.DataDir, "run", "speech"),
+		)
+		speechPool := speech.NewRuntimePool(
+			cfg.PiperBinary, cfg.VoiceDir, cfg.STTBinary, cfg.STTModel,
+			filepath.Join(cfg.DataDir, "run", "speech"),
+		)
 		bridgeService := &calls.Service{
 			Socket:   cfg.ControlSocket,
 			Store:    db,
 			Log:      log,
 			MaxCalls: cfg.MaxCalls,
+			DataRoot: cfg.DataDir,
 			Media: &calls.PromptPlayer{
-				Piper: speech.Piper{Binary: cfg.PiperBinary, Model: cfg.PiperModel},
-				Dir:   filepath.Join(cfg.DataDir, "prompts"),
+				Piper:        speech.Piper{Binary: cfg.PiperBinary, Model: cfg.PiperModel},
+				Runtime:      speechRuntime,
+				Pool:         speechPool,
+				Store:        db,
+				GreetingPath: cfg.GreetingPath,
+				Static:       staticPrompts,
+				StaticVoice:  staticManifest.VoiceModel,
+				Dir:          promptDir,
+			},
+			Recorder: &calls.VoiceRecorder{
+				Runtime: speechRuntime,
+				Whisper: speech.Whisper{Binary: cfg.STTBinary, Model: cfg.STTModel},
+				Dir:     cfg.RecordingsDir,
+				Window:  15 * time.Second,
 			},
 			Secrets: secrets,
 		}

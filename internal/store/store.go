@@ -100,21 +100,37 @@ func (s *Store) SMTPPassword(ctx context.Context, accountID string) (string, err
 }
 
 type User struct {
-	ID, Username, PasswordHash, PINHash, Role string
-	Enabled                                   bool
-	TOTPSecret, BackupCodes                   string
+	ID           string `json:"id"`
+	Username     string `json:"username"`
+	PasswordHash string `json:"-"`
+	PINHash      string `json:"-"`
+	Role         string `json:"role"`
+	Enabled      bool   `json:"enabled"`
+	TOTPSecret   string `json:"-"`
+	BackupCodes  string `json:"-"`
 }
 
 type Account struct {
-	ID, UserID, CanonicalName, Email, SenderName string
-	IMAPHost, IMAPUser, SMTPHost, SMTPUser       string
-	IMAPPort, SMTPPort                           int
-	IMAPPassword, SMTPPassword                   string
-	FolderMap, AlertFolders                      string
-	SyncIntervalMinutes, DisplayOrder            int
-	InitialCutoff                                *string
-	RetentionDays                                *int
-	CallAlertEnabled                             bool
+	ID                  string  `json:"id"`
+	UserID              string  `json:"user_id"`
+	CanonicalName       string  `json:"canonical_name"`
+	Email               string  `json:"email"`
+	SenderName          string  `json:"sender_name"`
+	IMAPHost            string  `json:"imap_host"`
+	IMAPUser            string  `json:"imap_user"`
+	SMTPHost            string  `json:"smtp_host"`
+	SMTPUser            string  `json:"smtp_user"`
+	IMAPPort            int     `json:"imap_port"`
+	SMTPPort            int     `json:"smtp_port"`
+	IMAPPassword        string  `json:"-"`
+	SMTPPassword        string  `json:"-"`
+	FolderMap           string  `json:"folder_map"`
+	AlertFolders        string  `json:"alert_folders"`
+	SyncIntervalMinutes int     `json:"sync_interval_minutes"`
+	DisplayOrder        int     `json:"display_order"`
+	InitialCutoff       *string `json:"initial_cutoff,omitempty"`
+	RetentionDays       *int    `json:"retention_days,omitempty"`
+	CallAlertEnabled    bool    `json:"call_alert_enabled"`
 }
 
 type Contact struct {
@@ -160,6 +176,52 @@ func (s *Store) ListMail(ctx context.Context, userID string, unreadOnly bool) ([
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) ListMailForAccount(ctx context.Context, userID, accountID, folder string, unreadOnly bool) ([]MailSummary, error) {
+	query := `SELECT m.id,m.account_id,m.folder,m.path,COALESCE(m.message_id,''),COALESCE(m.sender,''),COALESCE(m.recipients,''),COALESCE(m.subject,''),COALESCE(m.message_date,''),m.is_read,m.attachment_count FROM mail_messages m JOIN accounts a ON a.id=m.account_id WHERE a.user_id=? AND m.account_id=?`
+	args := []any{userID, accountID}
+	if folder != "" {
+		query += ` AND m.folder=?`
+		args = append(args, folder)
+	}
+	if unreadOnly {
+		query += ` AND m.is_read=0`
+	}
+	query += ` ORDER BY COALESCE(m.message_date,''),m.id DESC`
+	rows, err := s.DB.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []MailSummary
+	for rows.Next() {
+		var m MailSummary
+		var read int
+		if err := rows.Scan(&m.ID, &m.AccountID, &m.Folder, &m.Path, &m.MessageID, &m.Sender, &m.Recipients, &m.Subject, &m.Date, &read, &m.Attachments); err != nil {
+			return nil, err
+		}
+		m.Read = read != 0
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListMailFolders(ctx context.Context, userID, accountID string) ([]string, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT DISTINCT m.folder FROM mail_messages m JOIN accounts a ON a.id=m.account_id WHERE a.user_id=? AND m.account_id=? ORDER BY m.folder`, userID, accountID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var folders []string
+	for rows.Next() {
+		var folder string
+		if err := rows.Scan(&folder); err != nil {
+			return nil, err
+		}
+		folders = append(folders, folder)
+	}
+	return folders, rows.Err()
 }
 
 func (s *Store) MarkMailRead(ctx context.Context, userID string, id int64, read bool) error {
@@ -341,6 +403,10 @@ func (s *Store) DeleteAccount(ctx context.Context, userID, id string) error {
 
 func (s *Store) AddContact(ctx context.Context, contact Contact) error {
 	_, err := s.DB.ExecContext(ctx, `INSERT INTO contacts(user_id,name,email,display_order) VALUES (?,?,?,?)`, contact.UserID, contact.Name, contact.Email, contact.DisplayOrder)
+	return err
+}
+func (s *Store) UpdateContact(ctx context.Context, contact Contact) error {
+	_, err := s.DB.ExecContext(ctx, `UPDATE contacts SET name=?, email=?, display_order=? WHERE id=? AND user_id=?`, contact.Name, contact.Email, contact.DisplayOrder, contact.ID, contact.UserID)
 	return err
 }
 func (s *Store) ListContacts(ctx context.Context, userID string) ([]Contact, error) {

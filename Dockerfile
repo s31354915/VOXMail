@@ -54,6 +54,9 @@ COPY --from=baresip-build /opt/re/lib /usr/local/lib
 COPY --from=baresip-build /out/libbaresip.so /usr/local/lib/libbaresip.so
 COPY --from=baresip-build /out/modules /usr/local/lib/baresip/modules
 COPY --from=whisper-build /out/whisper-cli /usr/local/bin/whisper-cli
+COPY assets/welcome.wav /usr/local/share/voxmail/welcome.wav
+COPY assets/main-menu.wav /usr/local/share/voxmail/main-menu.wav
+COPY assets/static-prompts.json /usr/local/share/voxmail/static-prompts.json
 COPY scripts/entrypoint.sh /usr/local/bin/voxmail-entrypoint
 RUN chmod 0755 /usr/local/bin/voxmail-entrypoint && mkdir -p /data /data/logs && ldconfig
 VOLUME ["/data"]

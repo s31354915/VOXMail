@@ -3,6 +3,7 @@ package mailconfig
 import (
 	"fmt"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -14,6 +15,7 @@ type Account struct {
 	IMAPPort    int
 	IMAPUser    string
 	MaildirRoot string
+	FolderMap   map[string]string
 }
 
 // Generate creates a channel that mirrors every existing remote folder while
@@ -26,9 +28,40 @@ func Generate(a Account) (string, error) {
 	if a.IMAPPort == 0 {
 		a.IMAPPort = 993
 	}
+	for remote, local := range a.FolderMap {
+		if strings.TrimSpace(remote) == "" || strings.ContainsAny(remote, "\x00\r\n") {
+			return "", fmt.Errorf("invalid remote folder mapping")
+		}
+		if local == "" || strings.ContainsAny(local, "\x00\r\n") || strings.HasPrefix(local, "/") || strings.Contains(local, "..") {
+			return "", fmt.Errorf("invalid local folder mapping for %q", remote)
+		}
+	}
 	name := safe(a.ID)
 	root := strings.TrimRight(a.MaildirRoot, "/") + "/"
-	return fmt.Sprintf(`IMAPAccount %s
+	inbox := root + "Inbox"
+	for remote, local := range a.FolderMap {
+		if strings.EqualFold(remote, "INBOX") && local != "" {
+			inbox = root + strings.Trim(local, "/")
+			break
+		}
+	}
+	exclusions := make([]string, 0, len(a.FolderMap))
+	for remote := range a.FolderMap {
+		if !strings.EqualFold(remote, "INBOX") && remote != "" {
+			exclusions = append(exclusions, "!"+quote(remote))
+		}
+	}
+	patterns := "*"
+	if len(exclusions) > 0 {
+		sort.Strings(exclusions)
+		patterns += " " + strings.Join(exclusions, " ")
+	}
+	remotes := make([]string, 0, len(a.FolderMap))
+	for remote := range a.FolderMap {
+		remotes = append(remotes, remote)
+	}
+	sort.Strings(remotes)
+	base := fmt.Sprintf(`IMAPAccount %s
 Host %s
 Port %d
 User %s
@@ -40,19 +73,37 @@ Account %s
 
 MaildirStore %s-local
 Path %s
-Inbox %sInbox
+Inbox %s
 SubFolders Verbatim
 
 Channel %s
 Master :%s-remote:
 Slave :%s-local:
-Patterns *
+Patterns %s
 Create Slave
 Remove None
 Sync All
 Expunge None
 SyncState *
-	`, name, quote(a.IMAPHost), a.IMAPPort, quote(a.IMAPUser), name, name, name, name, quote(root), quote(root), name, name, name), nil
+	`, name, quote(a.IMAPHost), a.IMAPPort, quote(a.IMAPUser), name, name, name, name, quote(root), quote(inbox), name, name, name, patterns)
+	for _, remote := range remotes {
+		local := a.FolderMap[remote]
+		if strings.EqualFold(remote, "INBOX") || remote == "" || local == "" {
+			continue
+		}
+		channel := safe(name + "-" + remote)
+		base += fmt.Sprintf(`
+Channel %s
+Master :%s-remote:%s
+Slave :%s-local:%s
+Create Slave
+Remove None
+Sync All
+Expunge None
+SyncState *
+`, channel, name, quote(remote), name, quote(local))
+	}
+	return base, nil
 }
 
 func safe(value string) string {

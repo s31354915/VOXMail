@@ -21,6 +21,7 @@ type Config struct {
 	PiperModel    string
 	VoiceDir      string
 	RecordingsDir string
+	GreetingPath  string
 	BaresipBinary string
 	BaresipConfig string
 }
@@ -40,6 +41,7 @@ func Load() (Config, error) {
 		PiperModel:    env("VOXMAIL_PIPER_MODEL", filepath.Join(dataDir, "voices", "en_US-hfc_male-medium.onnx")),
 		VoiceDir:      env("VOXMAIL_VOICE_DIR", filepath.Join(dataDir, "voices")),
 		RecordingsDir: env("VOXMAIL_RECORDINGS_DIR", filepath.Join(dataDir, "recordings")),
+		GreetingPath:  env("VOXMAIL_GREETING_PATH", filepath.Join(dataDir, "prompts", "welcome.wav")),
 		BaresipBinary: env("VOXMAIL_BARESIP_BINARY", "baresip"),
 		BaresipConfig: env("VOXMAIL_BARESIP_CONFIG", filepath.Join(dataDir, "config", "baresip")),
 	}

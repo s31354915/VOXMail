@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "voice_model": "en_US-hfc_male-medium",
+  "model_sha256": "d11e403a02bdf5a670c877b3dc56e0e1c8cece6fb30289586314dffdc0a78cb0",
+  "welcome_text": "Welcome to VOXMail. Please enter your PIN, then press pound.",
+  "main_text": "You are signed in. Press 1 for unread mail, 2 for all mail, 3 for accounts, 4 for contacts, 5 to compose, or 6 for settings."
+}

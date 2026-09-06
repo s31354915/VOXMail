@@ -37,6 +37,7 @@ static volatile sig_atomic_t running;
 static int server_fd = -1;
 static int client_fd = -1;
 static pthread_mutex_t client_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t session_lock = PTHREAD_MUTEX_INITIALIZER;
 static char socket_path[SOCKET_PATH_MAX];
 static char audio_root[AUDIO_PATH_MAX] = "/data/run/voxmail";
 
@@ -213,7 +214,9 @@ static void session_destructor(void *arg)
 {
 	struct session *session = arg;
 	char path[AUDIO_PATH_MAX];
+	pthread_mutex_lock(&session_lock);
 	list_unlink(&session->le);
+	pthread_mutex_unlock(&session_lock);
 	pcm_path(path, sizeof(path), session->id, "tx.pcm");
 	(void)unlink(path);
 	pcm_path(path, sizeof(path), session->id, "rx.pcm");
@@ -224,12 +227,16 @@ static void session_destructor(void *arg)
 static struct session *find_session(const char *id)
 {
 	struct le *le;
+	struct session *found = NULL;
+	pthread_mutex_lock(&session_lock);
 	for (le = sessions.head; le; le = le->next) {
 		struct session *session = le->data;
 		if (0 == strcmp(session->id, id))
-			return session;
+			found = mem_ref(session);
+			break;
 	}
-	return NULL;
+	pthread_mutex_unlock(&session_lock);
+	return found;
 }
 
 static void emit_event(const char *type, const struct session *session,
@@ -291,7 +298,9 @@ static int new_session(struct call *call)
 	if (call_audio(call))
 		(void)audio_set_devicename(call_audio(call), session->id, session->id);
 	call_set_handlers(call, call_event_handler, call_dtmf_handler, session);
+	pthread_mutex_lock(&session_lock);
 	list_append(&sessions, &session->le, session);
+	pthread_mutex_unlock(&session_lock);
 	char extra[256];
 	re_snprintf(extra, sizeof(extra), ",\"from\":\"%s\",\"tx_path\":\"%s\",\"rx_path\":\"%s\"", call_peeruri(call), txpath, rxpath);
 	/* Admission is decided by Go. Do not answer an unwhitelisted caller. */
@@ -340,6 +349,7 @@ static void *socket_worker(void *arg)
 			else if (strstr(buffer, "\"type\":\"answer\"")) {
 				(void)call_answer(session->call, 200, VIDMODE_OFF);
 			}
+			mem_deref(session);
 		}
 		pthread_mutex_lock(&client_lock);
 		if (client_fd == fd) client_fd = -1;

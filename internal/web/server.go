@@ -29,6 +29,13 @@ type Server struct {
 	Secrets  *secret.Box
 	Log      *slog.Logger
 	Sessions *SessionStore
+	loginMu  sync.Mutex
+	logins   map[string]loginState
+}
+
+type loginState struct {
+	Failures int
+	Until    time.Time
 }
 
 type SessionStore struct {
@@ -65,6 +72,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/v1/accounts/{id}", s.deleteAccount)
 	mux.HandleFunc("GET /api/v1/contacts", s.contacts)
 	mux.HandleFunc("POST /api/v1/contacts", s.createContact)
+	mux.HandleFunc("PUT /api/v1/contacts/{id}", s.updateContact)
 	mux.HandleFunc("DELETE /api/v1/contacts/{id}", s.deleteContact)
 	mux.HandleFunc("GET /api/v1/whitelist", s.whitelist)
 	mux.HandleFunc("POST /api/v1/whitelist", s.addWhitelist)
@@ -95,8 +103,16 @@ func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	pw, _ := auth.Hash(req.Password)
-	pin, _ := auth.Hash(req.PIN)
+	pw, err := auth.Hash(req.Password)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "password cannot be hashed")
+		return
+	}
+	pin, err := auth.Hash(req.PIN)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "PIN cannot be hashed")
+		return
+	}
 	id := newID()
 	u := store.User{ID: id, Username: strings.TrimSpace(req.Username), PasswordHash: pw, PINHash: pin, Role: "admin", Enabled: true}
 	if err := s.Store.CreateUser(r.Context(), u); err != nil {
@@ -115,15 +131,24 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
+	loginKey := r.RemoteAddr + "|" + strings.ToLower(strings.TrimSpace(req.Username))
+	if retry := s.loginBlocked(loginKey); retry > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(int(retry.Seconds())+1))
+		writeError(w, http.StatusTooManyRequests, "too many sign-in attempts; try again later")
+		return
+	}
 	u, err := s.Store.UserByUsername(r.Context(), strings.TrimSpace(req.Username))
 	if err != nil || !u.Enabled || !auth.Check(u.PasswordHash, req.Password) {
+		s.loginFailure(loginKey)
 		writeError(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
 	if u.TOTPSecret != "" && !auth.TOTP(u.TOTPSecret, req.TOTP, time.Now().UTC()) {
+		s.loginFailure(loginKey)
 		writeError(w, http.StatusUnauthorized, "authenticator code required")
 		return
 	}
+	s.loginSuccess(loginKey)
 	s.issueSession(w, u.ID)
 	writeJSON(w, http.StatusOK, publicUser(u))
 }
@@ -173,8 +198,16 @@ func (s *Server) createUser(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	pw, _ := auth.Hash(req.Password)
-	pin, _ := auth.Hash(req.PIN)
+	pw, err := auth.Hash(req.Password)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "password cannot be hashed")
+		return
+	}
+	pin, err := auth.Hash(req.PIN)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "PIN cannot be hashed")
+		return
+	}
 	role := "user"
 	if req.Role == "admin" {
 		role = "admin"
@@ -214,6 +247,37 @@ type accountRequest struct {
 	CallAlertEnabled                                                       bool
 }
 
+type accountView struct {
+	ID                  string            `json:"id"`
+	CanonicalName       string            `json:"canonical_name"`
+	Email               string            `json:"email"`
+	SenderName          string            `json:"sender_name"`
+	IMAPHost            string            `json:"imap_host"`
+	IMAPPort            int               `json:"imap_port"`
+	IMAPUser            string            `json:"imap_user"`
+	SMTPHost            string            `json:"smtp_host"`
+	SMTPPort            int               `json:"smtp_port"`
+	SMTPUser            string            `json:"smtp_user"`
+	FolderMap           map[string]string `json:"folder_map"`
+	AlertFolders        []string          `json:"alert_folders"`
+	SyncIntervalMinutes int               `json:"sync_interval_minutes"`
+	DisplayOrder        int               `json:"display_order"`
+	InitialCutoff       *string           `json:"initial_cutoff,omitempty"`
+	RetentionDays       *int              `json:"retention_days,omitempty"`
+	CallAlertEnabled    bool              `json:"call_alert_enabled"`
+}
+
+func accountJSON(a store.Account) accountView {
+	v := accountView{ID: a.ID, CanonicalName: a.CanonicalName, Email: a.Email, SenderName: a.SenderName, IMAPHost: a.IMAPHost, IMAPPort: a.IMAPPort, IMAPUser: a.IMAPUser, SMTPHost: a.SMTPHost, SMTPPort: a.SMTPPort, SMTPUser: a.SMTPUser, SyncIntervalMinutes: a.SyncIntervalMinutes, DisplayOrder: a.DisplayOrder, InitialCutoff: a.InitialCutoff, RetentionDays: a.RetentionDays, CallAlertEnabled: a.CallAlertEnabled}
+	if err := json.Unmarshal([]byte(a.FolderMap), &v.FolderMap); err != nil || v.FolderMap == nil {
+		v.FolderMap = map[string]string{}
+	}
+	if err := json.Unmarshal([]byte(a.AlertFolders), &v.AlertFolders); err != nil || v.AlertFolders == nil {
+		v.AlertFolders = []string{}
+	}
+	return v
+}
+
 func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 	u, ok := s.require(w, r, false)
 	if !ok {
@@ -224,11 +288,11 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 		serverError(w, err)
 		return
 	}
-	for i := range accounts {
-		accounts[i].IMAPPassword = ""
-		accounts[i].SMTPPassword = ""
+	out := make([]accountView, 0, len(accounts))
+	for _, account := range accounts {
+		out = append(out, accountJSON(account))
 	}
-	writeJSON(w, http.StatusOK, accounts)
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) saveAccount(w http.ResponseWriter, r *http.Request) {
@@ -247,6 +311,30 @@ func (s *Server) saveAccount(w http.ResponseWriter, r *http.Request) {
 	if _, err := mail.ParseAddress(req.Email); err != nil {
 		writeError(w, http.StatusBadRequest, "email address is invalid")
 		return
+	}
+	if req.IMAPPort < 0 || req.IMAPPort > 65535 || req.SMTPPort < 0 || req.SMTPPort > 65535 {
+		writeError(w, http.StatusBadRequest, "mail ports must be between 1 and 65535")
+		return
+	}
+	if req.DisplayOrder < 0 || req.SyncIntervalMinutes < 0 || (req.RetentionDays != nil && *req.RetentionDays < 1) {
+		writeError(w, http.StatusBadRequest, "order, sync interval, and retention values are invalid")
+		return
+	}
+	if req.InitialCutoff != nil && strings.TrimSpace(*req.InitialCutoff) != "" {
+		if _, err := time.Parse(time.RFC3339, strings.TrimSpace(*req.InitialCutoff)); err != nil {
+			writeError(w, http.StatusBadRequest, "initial cutoff must be RFC3339")
+			return
+		}
+	}
+	if err := validateFolderMap(req.FolderMap); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	for _, folder := range req.AlertFolders {
+		if strings.TrimSpace(folder) == "" || strings.ContainsAny(folder, "\x00\r\n") {
+			writeError(w, http.StatusBadRequest, "alert folders must be non-empty names")
+			return
+		}
 	}
 	if req.ID != "" {
 		accounts, err := s.Store.ListAccounts(r.Context(), u.ID)
@@ -304,22 +392,43 @@ func (s *Server) deleteAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 type testAccountRequest struct {
-	Host string
-	Port int
+	AccountID string `json:"account_id"`
 }
 
 func (s *Server) testAccount(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.require(w, r, true); !ok {
+	u, ok := s.require(w, r, true)
+	if !ok {
 		return
 	}
 	var req testAccountRequest
 	if !decode(w, r, &req) {
 		return
 	}
-	if req.Port == 0 {
-		req.Port = 993
+	if req.AccountID == "" {
+		writeError(w, http.StatusBadRequest, "account id is required")
+		return
 	}
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(req.Host, strconv.Itoa(req.Port)), 5*time.Second)
+	accounts, err := s.Store.ListAccounts(r.Context(), u.ID)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	var account store.Account
+	for _, candidate := range accounts {
+		if candidate.ID == req.AccountID {
+			account = candidate
+			break
+		}
+	}
+	if account.ID == "" {
+		writeError(w, http.StatusNotFound, "account not found")
+		return
+	}
+	port := account.IMAPPort
+	if port == 0 {
+		port = 993
+	}
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(account.IMAPHost, strconv.Itoa(port)), 5*time.Second)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "connection failed")
 		return
@@ -358,6 +467,30 @@ func (s *Server) createContact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, c)
+}
+
+func (s *Server) updateContact(w http.ResponseWriter, r *http.Request) {
+	u, ok := s.require(w, r, true)
+	if !ok {
+		return
+	}
+	c := store.Contact{ID: parseID(r.PathValue("id"))}
+	if c.ID < 1 || !decode(w, r, &c) {
+		if c.ID < 1 {
+			writeError(w, http.StatusBadRequest, "invalid contact id")
+		}
+		return
+	}
+	c.UserID = u.ID
+	if strings.TrimSpace(c.Name) == "" || strings.TrimSpace(c.Email) == "" {
+		writeError(w, http.StatusBadRequest, "name and email are required")
+		return
+	}
+	if err := s.Store.UpdateContact(r.Context(), c); err != nil {
+		serverError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, c)
 }
 func (s *Server) deleteContact(w http.ResponseWriter, r *http.Request) {
 	u, ok := s.require(w, r, true)
@@ -465,6 +598,19 @@ func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
 	if body.EmailSpeed < 1 || body.EmailSpeed > 5 {
 		body.EmailSpeed = 2
 	}
+	body.TTSVoice = strings.TrimSpace(body.TTSVoice)
+	if body.TTSVoice == "" || strings.ContainsAny(body.TTSVoice, `/\\\x00\r\n`) || strings.Contains(body.TTSVoice, "..") {
+		writeError(w, http.StatusBadRequest, "invalid voice model")
+		return
+	}
+	if body.AlertPhone != nil {
+		phone := normalizePhone(*body.AlertPhone)
+		if phone == "" {
+			body.AlertPhone = nil
+		} else {
+			body.AlertPhone = &phone
+		}
+	}
 	_, err := s.Store.DB.ExecContext(r.Context(), `INSERT INTO settings(user_id,tts_voice,menu_speed,email_speed,alerts_enabled,alert_phone) VALUES(?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET tts_voice=excluded.tts_voice,menu_speed=excluded.menu_speed,email_speed=excluded.email_speed,alerts_enabled=excluded.alerts_enabled,alert_phone=excluded.alert_phone`, u.ID, body.TTSVoice, body.MenuSpeed, body.EmailSpeed, body.AlertsEnabled, body.AlertPhone)
 	if err != nil {
 		serverError(w, err)
@@ -565,6 +711,40 @@ func (s *SessionStore) Delete(token string) {
 	defer s.mu.Unlock()
 	delete(s.byToken, token)
 }
+
+func (s *Server) loginBlocked(key string) time.Duration {
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	if s.logins == nil {
+		s.logins = make(map[string]loginState)
+	}
+	state := s.logins[key]
+	if time.Now().Before(state.Until) {
+		return time.Until(state.Until)
+	}
+	return 0
+}
+
+func (s *Server) loginFailure(key string) {
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	if s.logins == nil {
+		s.logins = make(map[string]loginState)
+	}
+	state := s.logins[key]
+	state.Failures++
+	if state.Failures >= 5 {
+		state.Until = time.Now().Add(5 * time.Minute)
+		state.Failures = 0
+	}
+	s.logins[key] = state
+}
+
+func (s *Server) loginSuccess(key string) {
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	delete(s.logins, key)
+}
 func publicUser(u store.User) map[string]any {
 	return map[string]any{"id": u.ID, "username": u.Username, "role": u.Role, "enabled": u.Enabled, "two_factor_enabled": u.TOTPSecret != ""}
 }
@@ -582,6 +762,21 @@ func validateCredentials(username, password, pin string) error {
 		if r < '0' || r > '9' {
 			return errors.New("PIN must contain digits only")
 		}
+	}
+	return nil
+}
+
+func validateFolderMap(mapping map[string]string) error {
+	seen := make(map[string]struct{}, len(mapping))
+	for remote, local := range mapping {
+		remote, local = strings.TrimSpace(remote), strings.TrimSpace(local)
+		if remote == "" || local == "" || strings.ContainsAny(remote+local, "\x00\r\n") || strings.Contains(remote, "..") || strings.Contains(local, "..") || strings.HasPrefix(remote, "/") || strings.HasPrefix(local, "/") {
+			return errors.New("folder mappings must be relative, non-empty names")
+		}
+		if _, ok := seen[local]; ok {
+			return errors.New("folder mappings must have unique local names")
+		}
+		seen[local] = struct{}{}
 	}
 	return nil
 }

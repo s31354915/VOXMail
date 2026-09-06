@@ -2,6 +2,7 @@ package mailsync
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -45,6 +46,7 @@ func (s *Service) Run(ctx context.Context) error {
 }
 
 func (s *Service) SyncAll(ctx context.Context) error {
+	s.ensureState()
 	accounts, err := s.Store.ListAllAccounts(ctx)
 	if err != nil {
 		return err
@@ -58,6 +60,7 @@ func (s *Service) SyncAll(ctx context.Context) error {
 }
 
 func (s *Service) SyncDue(ctx context.Context) error {
+	s.ensureState()
 	accounts, err := s.Store.ListAllAccounts(ctx)
 	if err != nil {
 		return err
@@ -80,6 +83,17 @@ func (s *Service) SyncDue(ctx context.Context) error {
 	return nil
 }
 
+func (s *Service) ensureState() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.busy == nil {
+		s.busy = make(map[string]bool)
+	}
+	if s.last == nil {
+		s.last = make(map[string]time.Time)
+	}
+}
+
 func (s *Service) syncAccount(ctx context.Context, account store.Account) error {
 	s.mu.Lock()
 	if s.busy[account.ID] {
@@ -93,7 +107,11 @@ func (s *Service) syncAccount(ctx context.Context, account store.Account) error 
 	if err := os.MkdirAll(root, 0700); err != nil {
 		return err
 	}
-	configText, err := mailconfig.Generate(mailconfig.Account{ID: account.ID, IMAPHost: account.IMAPHost, IMAPPort: account.IMAPPort, IMAPUser: account.IMAPUser, MaildirRoot: root})
+	var folderMap map[string]string
+	if account.FolderMap != "" {
+		_ = json.Unmarshal([]byte(account.FolderMap), &folderMap)
+	}
+	configText, err := mailconfig.Generate(mailconfig.Account{ID: account.ID, IMAPHost: account.IMAPHost, IMAPPort: account.IMAPPort, IMAPUser: account.IMAPUser, MaildirRoot: root, FolderMap: folderMap})
 	if err != nil {
 		return err
 	}

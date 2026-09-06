@@ -1,8 +1,22 @@
 #!/bin/sh
 set -eu
+umask 077
 
-mkdir -p /data/config /data/sqlite /data/run /data/mail /data/recordings /data/voices /data/whisper /data/logs /data/run/voxmail
-chmod 700 /data /data/config /data/sqlite /data/run /data/mail /data/recordings /data/voices /data/whisper /data/logs /data/run/voxmail
+mkdir -p /data/config /data/sqlite /data/run /data/mail /data/recordings /data/voices /data/whisper /data/logs /data/prompts /data/run/voxmail
+chmod 700 /data /data/config /data/sqlite /data/run /data/mail /data/recordings /data/voices /data/whisper /data/logs /data/prompts /data/run/voxmail
+
+if [ ! -s /data/prompts/welcome.wav ]; then
+  cp /usr/local/share/voxmail/welcome.wav /data/prompts/welcome.wav
+  chmod 600 /data/prompts/welcome.wav
+fi
+if [ ! -s /data/prompts/main-menu.wav ]; then
+  cp /usr/local/share/voxmail/main-menu.wav /data/prompts/main-menu.wav
+  chmod 600 /data/prompts/main-menu.wav
+fi
+if [ ! -s /data/prompts/static-prompts.json ]; then
+  cp /usr/local/share/voxmail/static-prompts.json /data/prompts/static-prompts.json
+  chmod 600 /data/prompts/static-prompts.json
+fi
 
 if [ -z "${VOXMAIL_ENCRYPTION_KEY:-}" ]; then
   echo 'VOXMAIL_ENCRYPTION_KEY must be provided through Docker secrets or the environment' >&2
@@ -38,6 +52,7 @@ call_max_calls 10
 EOF
   fi
   printf '%s\n' "$VOXMAIL_SIP_ACCOUNT" > "$baresip_dir/accounts"
+  chmod 600 "$baresip_dir/accounts"
   /usr/local/bin/baresip -f "$baresip_dir" > /data/logs/baresip.log 2>&1 &
   baresip_pid=$!
 fi

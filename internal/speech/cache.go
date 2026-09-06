@@ -26,6 +26,20 @@ type Cache struct {
 	Synth Synthesizer
 }
 
+func (c Cache) Paths(voice string, speed int, prompts map[string]string) map[string]string {
+	paths := make(map[string]string, len(prompts))
+	active := filepath.Join(c.Root, "active")
+	for key, text := range prompts {
+		digest := sha256.Sum256([]byte(voice + fmt.Sprint(speed) + key + text))
+		name := hex.EncodeToString(digest[:]) + ".wav"
+		path := filepath.Join(active, name)
+		if info, err := os.Stat(path); err == nil && info.Size() > 44 {
+			paths[text] = path
+		}
+	}
+	return paths
+}
+
 func (c Cache) Build(ctx context.Context, voice string, speed int, prompts map[string]string) (Manifest, error) {
 	if c.Root == "" || c.Synth == nil {
 		return Manifest{}, fmt.Errorf("cache root and synthesizer are required")
