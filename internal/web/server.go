@@ -571,10 +571,12 @@ func (s *Server) createContact(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "name and email are required")
 		return
 	}
-	if err := s.Store.AddContact(r.Context(), c); err != nil {
+	id, err := s.Store.AddContact(r.Context(), c)
+	if err != nil {
 		writeError(w, http.StatusConflict, "contact already exists")
 		return
 	}
+	c.ID = id
 	writeJSON(w, http.StatusCreated, c)
 }
 
@@ -824,7 +826,9 @@ func (s *Server) saveSIP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.SIP != nil {
-		if err := s.SIP.Apply(r.Context()); err != nil {
+		// Apply must not inherit the request context: baresip would be killed
+		// the moment the handler returns. Use an uncancelled ctx instead.
+		if err := s.SIP.Apply(context.WithoutCancel(r.Context())); err != nil {
 			s.log().Error("sip settings applied but baresip restart failed", "error", err)
 			writeError(w, http.StatusInternalServerError, "SIP settings saved, but the call client could not be restarted")
 			return

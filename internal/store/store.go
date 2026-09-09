@@ -507,9 +507,12 @@ func (s *Store) DeleteAccount(ctx context.Context, userID, id string) error {
 	return err
 }
 
-func (s *Store) AddContact(ctx context.Context, contact Contact) error {
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO contacts(user_id,name,email,display_order) VALUES (?,?,?,?)`, contact.UserID, contact.Name, contact.Email, contact.DisplayOrder)
-	return err
+func (s *Store) AddContact(ctx context.Context, contact Contact) (int64, error) {
+	res, err := s.DB.ExecContext(ctx, `INSERT INTO contacts(user_id,name,email,display_order) VALUES (?,?,?,?)`, contact.UserID, contact.Name, contact.Email, contact.DisplayOrder)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
 }
 func (s *Store) UpdateContact(ctx context.Context, contact Contact) error {
 	res, err := s.DB.ExecContext(ctx, `UPDATE contacts SET name=?, email=?, display_order=? WHERE id=? AND user_id=?`, contact.Name, contact.Email, contact.DisplayOrder, contact.ID, contact.UserID)
