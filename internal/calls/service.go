@@ -39,14 +39,63 @@ type Service struct {
 	Secrets  *secret.Box
 	mu       sync.Mutex
 	sessions map[string]*session
+	client   *bridge.Client
+	pending  []DialRequest
+}
+
+// DialRequest describes an outgoing call. Outgoing calls back a subscribed
+// phone number instead of admitting a caller, so the session is attached to
+// the caller's account and plays Text once the far end answers.
+type DialRequest struct {
+	URI       string `json:"uri"`
+	UserID    string `json:"user_id"`
+	AccountID string `json:"account_id"`
+	Text      string `json:"text"`
+}
+
+// Dial asks baresip to place an outgoing call to URI. The request is queued
+// until the matching call_outgoing event arrives, which then becomes an
+// established session with Text played once the far end picks up.
+func (s *Service) Dial(ctx context.Context, req DialRequest) error {
+	s.mu.Lock()
+	c := s.client
+	s.mu.Unlock()
+	if c == nil {
+		return errors.New("bridge is not connected")
+	}
+	if strings.TrimSpace(req.URI) == "" {
+		return errors.New("dial uri is required")
+	}
+	if err := c.Dial(ctx, strings.TrimSpace(req.URI)); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.pending = append(s.pending, req)
+	s.mu.Unlock()
+	if s.Log != nil {
+		s.Log.Info("outgoing call dialed", "uri", req.URI, "user_id", req.UserID, "account_id", req.AccountID)
+	}
+	return nil
+}
+
+func (s *Service) hangup(callID string) error {
+	s.mu.Lock()
+	c := s.client
+	s.mu.Unlock()
+	if c == nil {
+		return errors.New("bridge is not connected")
+	}
+	return c.Send(bridge.Message{Type: "hangup", CallID: callID})
 }
 
 type session struct {
+	CallID        string
 	UserID        string
 	PIN           string
 	Failures      int
 	Authenticated bool
 	State         string
+	AlertText     string
 	Messages      []store.MailSummary
 	Cursor        int
 	Accounts      []store.Account
@@ -64,6 +113,8 @@ type session struct {
 }
 
 type draft struct{ To, Subject, Body string }
+
+const callTimeout = 45 * time.Second
 
 type VoiceRecorder struct {
 	Runtime *speech.Runtime
@@ -255,9 +306,15 @@ func (p *PromptPlayer) playWAV(ctx context.Context, fifo, wav string) error {
 }
 
 func (s *Service) Run(ctx context.Context) error {
+	connected := false
 	for {
-		if err := s.runConnection(ctx); err != nil && !errors.Is(err, context.Canceled) && s.Log != nil {
-			s.Log.Warn("baresip bridge disconnected", "error", err)
+		if err := s.runConnection(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			if connected && s.Log != nil {
+				s.Log.Warn("baresip bridge disconnected", "error", err)
+			}
+			connected = false
+		} else if err == nil {
+			connected = true
 		}
 		select {
 		case <-ctx.Done():
@@ -278,6 +335,15 @@ func (s *Service) runConnection(ctx context.Context) error {
 		return err
 	}
 	defer conn.Close()
+	s.mu.Lock()
+	s.client = bridge.NewClient(conn)
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.client = nil
+		s.pending = nil
+		s.mu.Unlock()
+	}()
 	reader := bufio.NewReader(conn)
 	for {
 		select {
@@ -294,6 +360,12 @@ func (s *Service) runConnection(ctx context.Context) error {
 			if err := s.admit(conn, message); err != nil {
 				return err
 			}
+		case "call_outgoing":
+			if err := s.startOutgoing(conn, message); err != nil {
+				return err
+			}
+		case "call_established":
+			s.onEstablished(message)
 		case "call_closed":
 			s.mu.Lock()
 			sess := s.sessions[message.CallID]
@@ -316,6 +388,29 @@ func (s *Service) runConnection(ctx context.Context) error {
 	}
 }
 
+// onEstablished triggers playback that must follow media establishment. RTP
+// flows only once the audio stream starts, so greetings and alert text are
+// deferred from admission/dial to this point rather than written into a FIFO
+// that baresip has not opened yet.
+func (s *Service) onEstablished(message bridge.Message) {
+	s.mu.Lock()
+	sess := s.sessions[message.CallID]
+	sessState := ""
+	if sess != nil {
+		sessState = sess.State
+	}
+	s.mu.Unlock()
+	if sess == nil {
+		return
+	}
+	switch sessState {
+	case "outgoing":
+		go s.playOutgoingAlert(sess)
+	default:
+		go s.greet(sess)
+	}
+}
+
 func (s *Service) admit(conn net.Conn, message bridge.Message) error {
 	if s.Store == nil {
 		return bridge.Encode(conn, bridge.Message{Type: "hangup", CallID: message.CallID, Code: 500, Reason: "server unavailable"})
@@ -327,7 +422,7 @@ func (s *Service) admit(conn net.Conn, message bridge.Message) error {
 	s.mu.Lock()
 	busy := s.MaxCalls > 0 && len(s.sessions) >= s.MaxCalls
 	if !busy {
-		s.sessions[message.CallID] = &session{UserID: user.ID, State: "pin", TxPath: message.TxPath, RxPath: message.RxPath}
+		s.sessions[message.CallID] = &session{CallID: message.CallID, UserID: user.ID, State: "pin", TxPath: message.TxPath, RxPath: message.RxPath}
 	}
 	s.mu.Unlock()
 	if busy {
@@ -342,8 +437,67 @@ func (s *Service) admit(conn net.Conn, message bridge.Message) error {
 		sess.Runtime, sess.Lease = s.Media.ActivateForUser(user.ID)
 	}
 	s.mu.Unlock()
-	go s.greet(sess)
 	return nil
+}
+
+// startOutgoing turns a call_outgoing event into a session. The pending dial
+// request supplies the callee's account and the text to read once the far end
+// answers. Baresip rings until the remote phone picks up; an unanswered
+// outgoing session is torn down after the call timeout.
+func (s *Service) startOutgoing(conn net.Conn, message bridge.Message) error {
+	s.mu.Lock()
+	var req DialRequest
+	if len(s.pending) > 0 {
+		req = s.pending[0]
+		s.pending = s.pending[1:]
+	}
+	s.mu.Unlock()
+	sess := &session{CallID: message.CallID, UserID: req.UserID, State: "outgoing", AlertText: req.Text, TxPath: message.TxPath, RxPath: message.RxPath}
+	s.mu.Lock()
+	s.sessions[message.CallID] = sess
+	if s.Media != nil && sess.UserID != "" {
+		sess.Runtime, sess.Lease = s.Media.ActivateForUser(sess.UserID)
+	}
+	s.mu.Unlock()
+	if sess.UserID == "" {
+		if s.Log != nil {
+			s.Log.Warn("outgoing call without a pending request; hanging up", "call_id", message.CallID)
+		}
+		return bridge.Encode(conn, bridge.Message{Type: "hangup", CallID: message.CallID, Code: 603, Reason: "unknown outgoing call"})
+	}
+	if s.Log != nil {
+		s.Log.Info("outgoing call session", "call_id", message.CallID, "user_id", sess.UserID, "tx_path", message.TxPath)
+	}
+	time.AfterFunc(callTimeout, func() {
+		s.mu.Lock()
+		current := s.sessions[message.CallID]
+		timeout := current == sess && sess.State == "outgoing"
+		s.mu.Unlock()
+		if timeout {
+			if s.Log != nil {
+				s.Log.Warn("outgoing call timed out", "call_id", message.CallID)
+			}
+			_ = s.hangup(message.CallID)
+		}
+	})
+	return nil
+}
+
+// playOutgoingAlert reads the alert text to the answered phone and then hangs
+// up. It is the established-phase counterpart of greet for outbound calls.
+func (s *Service) playOutgoingAlert(sess *session) {
+	if sess == nil {
+		return
+	}
+	s.mu.Lock()
+	sess.State = "announce"
+	s.mu.Unlock()
+	if s.Media != nil && sess.AlertText != "" {
+		s.prompt(sess, sess.AlertText)
+	}
+	if err := s.hangup(sess.CallID); err != nil && s.Log != nil {
+		s.Log.Warn("alert hangup failed", "call_id", sess.CallID, "error", err)
+	}
 }
 
 func (s *Service) greet(sess *session) {

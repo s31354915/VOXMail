@@ -60,6 +60,30 @@ Whisper's CLI is invoked for transcription after the warm check. Caller
 recordings are bounded, private, and deleted after transcription, including
 failure paths.
 
+## Outbound alert calls
+
+New unread mail in an account with call alerts enabled and non-empty alert
+folders is surfaced to the user's phone. The alert service runs on a 20-second
+ticker, groups pending messages per user, and dials the user's alert number via
+the same baresip control socket used for inbound events. One dial command per
+round carries the sender and subject summary for the first message of the
+batch. Folder membership is checked in Go (`alertFolderMatch`); the SQL
+candidate query only filters read state, the `alerted` flag, the global/user
+switch, and a non-empty alert-folder list. Claiming happens only after a
+successful dial, and a per-user minimum delay (default five minutes) prevents
+alert storms while a phone is off-hook.
+
+Outgoing calls share the socket with incoming ones. `bridge.Client.Dial` writes
+a `dial` command with a `to` URI; the shim reports the new call as `call_outgoing`
+and later `call_established`, which the calls service correlates with a FIFO of
+pending dial requests (`calls.DialRequest`). Sessions created for an outgoing
+call play the per-user alert (or test) prompt and hang up. Caller-initiated
+sessions are unaffected.
+
+`Service.TestAlert` (web `POST /api/v1/alerts/test`, console button **Send test
+alert call**) dials the configured alert number with a canned message. It
+requires a non-empty alert phone and an SIP registrar, and it never claims mail.
+
 ## Settings ownership
 
 SQLite stores user settings, account metadata, folder mappings, alert folders,

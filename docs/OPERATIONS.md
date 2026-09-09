@@ -8,15 +8,24 @@ Create `.env` from the example and set a unique key:
 VOXMAIL_ENCRYPTION_KEY=<at least 32 random bytes>
 ```
 
-For telephone service, add the provider account line accepted by baresip:
+For telephone service, configure the provider credentials in the web console's
+**SIP connection** panel (registrar, SIP username, password, port, transport,
+registration interval). The `voxmail` process writes the baresip configuration
+and supervises the call client, so a save applies immediately. Until a
+registrar is configured and enabled there, baresip does not register and no
+calls are accepted.
+
+`VOXMAIL_SIP_ACCOUNT` exists as a deployment override for the account line
+baresip would otherwise generate from the console settings:
 
 ```dotenv
 VOXMAIL_SIP_ACCOUNT=<sip:YOUR_NUMBER:YOUR_PASSWORD@YOUR_PROVIDER>;regint=300
-VOXMAIL_ENABLE_CALLS=1
 ```
 
 Provider-specific account syntax, outbound proxy, codecs, and NAT behavior are
-provider-dependent. Do not commit provider credentials.
+provider-dependent. SIP uses TCP/UDP port 5060, and RTP uses UDP
+10000–10100; both ranges must be reachable from the provider. Do not commit
+provider credentials.
 
 ## Models
 
@@ -105,9 +114,10 @@ saved. The account test checks only that account's configured IMAP host.
 
 ### Calls are not admitted
 
-Confirm baresip is registered, the caller is whitelisted, and the PIN is
-entered followed by `#`. Check baresip and VOXMail logs. RTP requires UDP
-10000–10100 to be reachable from the provider.
+Confirm baresip registered (SIP connection panel or logs), the caller is
+whitelisted, and the PIN is entered followed by `#`. Check baresip and VOXMail
+logs. SIP needs TCP/UDP 5060 and RTP needs UDP 10000–10100 reachable from the
+provider.
 
 ### Speech is slow on the first call
 

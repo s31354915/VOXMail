@@ -12,11 +12,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/voxmail/voxmail/internal/alerts"
 	"github.com/voxmail/voxmail/internal/calls"
 	"github.com/voxmail/voxmail/internal/config"
 	"github.com/voxmail/voxmail/internal/mailindex"
 	"github.com/voxmail/voxmail/internal/mailsync"
 	"github.com/voxmail/voxmail/internal/secret"
+	"github.com/voxmail/voxmail/internal/sip"
 	"github.com/voxmail/voxmail/internal/speech"
 	"github.com/voxmail/voxmail/internal/store"
 	"github.com/voxmail/voxmail/internal/web"
@@ -72,7 +74,19 @@ func main() {
 	}
 	defer db.Close()
 
-	server := &http.Server{Addr: cfg.HTTPAddr, Handler: (&web.Server{Store: db, Secrets: secrets, Log: log}).Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
+	sipBridge := &sip.Baresip{
+		Binary:        cfg.BaresipBinary,
+		ConfigDir:     cfg.BaresipConfig,
+		ControlSocket: cfg.ControlSocket,
+		AudioDir:      filepath.Join(cfg.DataDir, "run", "voxmail"),
+		LogPath:       filepath.Join(cfg.DataDir, "logs", "baresip.log"),
+		MaxCalls:      cfg.MaxCalls,
+		Store:         db,
+		Secrets:       secrets,
+		Log:           log,
+	}
+	webApp := &web.Server{Store: db, Secrets: secrets, Log: log, SIP: sipBridge}
+	server := &http.Server{Addr: cfg.HTTPAddr, Handler: webApp.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	appContext, stopApp := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stopApp()
 	indexer := &mailindex.Indexer{Store: db}
@@ -83,9 +97,6 @@ func main() {
 		}
 	}()
 	go func() {
-		if os.Getenv("VOXMAIL_SIP_ACCOUNT") == "" && os.Getenv("VOXMAIL_ENABLE_CALLS") != "1" {
-			return
-		}
 		speechRuntime := speech.NewRuntime(
 			speech.Piper{Binary: cfg.PiperBinary, Model: cfg.PiperModel},
 			speech.Whisper{Binary: cfg.STTBinary, Model: cfg.STTModel},
@@ -119,6 +130,16 @@ func main() {
 			},
 			Secrets: secrets,
 		}
+		alertService := &alerts.Service{Store: db, Bridge: bridgeService, Log: log}
+		webApp.Alerts = alertService
+		go func() {
+			if err := alertService.Run(appContext); err != nil && !errors.Is(err, context.Canceled) {
+				log.Error("alert service stopped", "error", err)
+			}
+		}()
+		if err := sipBridge.Apply(appContext); err != nil {
+			log.Warn("baresip did not start", "error", err)
+		}
 		if err := bridgeService.Run(appContext); err != nil && !errors.Is(err, context.Canceled) {
 			log.Warn("call bridge stopped", "error", err)
 		}
@@ -137,4 +158,5 @@ func main() {
 	if err := server.Shutdown(shutdown); err != nil {
 		log.Error("graceful shutdown failed", "error", err)
 	}
+	sipBridge.Stop()
 }

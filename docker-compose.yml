@@ -11,9 +11,14 @@ services:
       VOXMAIL_CONTROL_SOCKET: /data/run/baresip.sock
       VOXMAIL_PROVISION_MODELS: "${VOXMAIL_PROVISION_MODELS:-0}"
     ports:
-      - "8080:8080/tcp"
+      # The web console binds to the Docker host only. On a remote host use an
+      # SSH tunnel or set VOXMAIL_HTTP_ADDR in .env to publish it wider.
+      - "127.0.0.1:8080:8080/tcp"
       # Configure the provider's RTP range here when baresip is enabled.
       - "10000-10100:10000-10100/udp"
+      # SIP signaling for registration and incoming calls (set in the console).
+      - "5060:5060/udp"
+      - "5060:5060/tcp"
     volumes:
       - voxmail-data:/data
     healthcheck:

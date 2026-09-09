@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Go unit tests and static checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+          cache: true
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test ./...
+      - name: E2E harness compiles
+        run: go build ./tests/e2e
+      - name: Dockerfile is well-formed
+        run: docker build --check -f Dockerfile .
+
+  e2e:
+    name: End-to-end container tests (killer suite)
+    runs-on: ubuntu-24.04
+    needs: unit
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+      - name: Run E2E suite (builds image, container, restart persistence, cleanup)
+        run: scripts/e2e.sh
+      - name: No docker residue left behind
+        run: |
+          test -z "$(docker ps -aqf name=voxmail-e2e)" || { docker ps -aqf name=voxmail-e2e; exit 1; }
+          test -z "$(docker volume ls -qf name=voxmail-e2e-data)" || { docker volume ls -qf name=voxmail-e2e-data; exit 1; }
+          if docker image inspect voxmail-e2e:test >/dev/null 2>&1; then echo "image voxmail-e2e:test was not removed"; exit 1; fi

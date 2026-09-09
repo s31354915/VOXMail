@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/voxmail/voxmail/internal/secret"
@@ -64,6 +65,13 @@ CREATE TABLE IF NOT EXISTS settings (
  menu_speed INTEGER NOT NULL DEFAULT 3, email_speed INTEGER NOT NULL DEFAULT 2,
  alerts_enabled INTEGER NOT NULL DEFAULT 0, alert_phone TEXT
 );
+CREATE TABLE IF NOT EXISTS sip_settings (
+ id INTEGER PRIMARY KEY CHECK (id = 1),
+ domain TEXT NOT NULL DEFAULT '', username TEXT NOT NULL DEFAULT '',
+ password TEXT NOT NULL DEFAULT '', port INTEGER NOT NULL DEFAULT 5060,
+ transport TEXT NOT NULL DEFAULT 'udp', reg_interval INTEGER NOT NULL DEFAULT 300,
+ enabled INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS audit_log (
  id INTEGER PRIMARY KEY, user_id TEXT, action TEXT NOT NULL, detail TEXT,
  created_at TEXT NOT NULL
@@ -72,12 +80,35 @@ CREATE TABLE IF NOT EXISTS mail_messages (
  id INTEGER PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
  folder TEXT NOT NULL, path TEXT NOT NULL UNIQUE, message_id TEXT, sender TEXT,
  recipients TEXT, subject TEXT, message_date TEXT, is_read INTEGER NOT NULL DEFAULT 0,
- attachment_count INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL
-);`)
+ attachment_count INTEGER NOT NULL DEFAULT 0, alerted INTEGER NOT NULL DEFAULT 0,
+ updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS mail_alert_idx ON mail_messages(account_id, folder, is_read, alerted);`)
 	if err != nil {
 		return fmt.Errorf("migrate database: %w", err)
 	}
+	if err := s.ensureColumn(ctx, "mail_messages", "alerted", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if _, err := s.DB.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS mail_alert_idx ON mail_messages(account_id, folder, is_read, alerted)`); err != nil {
+		return fmt.Errorf("migrate alter table: %w", err)
+	}
 	return nil
+}
+
+// ensureColumn adds a column to an existing table when the schema predates it.
+func (s *Store) ensureColumn(ctx context.Context, table, column, declaration string) error {
+	query := fmt.Sprintf(`SELECT COUNT(*) FROM pragma_table_info(%q) WHERE name = %q`, table, column)
+	var count int
+	if err := s.DB.QueryRowContext(ctx, query).Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+	statement := fmt.Sprintf(`ALTER TABLE %q ADD COLUMN %q %s`, table, column, declaration)
+	_, err := s.DB.ExecContext(ctx, statement)
+	return err
 }
 
 func (s *Store) Healthy(ctx context.Context) error { return s.DB.PingContext(ctx) }
@@ -145,6 +176,18 @@ type WhitelistEntry struct {
 	ID     int64  `json:"id"`
 	UserID string `json:"user_id"`
 	Phone  string `json:"phone"`
+}
+
+// SIPSettings is the single deployment-wide baresip account. Password holds
+// the sealed ciphertext as read from the database; it is never serialized.
+type SIPSettings struct {
+	Domain      string `json:"domain"`
+	Username    string `json:"username"`
+	Password    string `json:"-"`
+	Port        int    `json:"port"`
+	Transport   string `json:"transport"`
+	RegInterval int    `json:"reg_interval"`
+	Enabled     bool   `json:"enabled"`
 }
 
 type MailSummary struct {
@@ -231,6 +274,66 @@ func (s *Store) MarkMailRead(ctx context.Context, userID string, id int64, read 
 
 func (s *Store) DeleteMailIndex(ctx context.Context, userID string, id int64) error {
 	_, err := s.DB.ExecContext(ctx, `DELETE FROM mail_messages WHERE id=? AND account_id IN (SELECT id FROM accounts WHERE user_id=?)`, id, userID)
+	return err
+}
+
+// AlertCandidate is an unseen, unsent message in an alert-enabled account.
+// Phone is the normalized alert number and Voice the user's TTS voice; the
+// alerts service rounds up candidates per user and dials the number.
+type AlertCandidate struct {
+	MessageID    int64
+	AccountID    string
+	Folder       string
+	Sender       string
+	Subject      string
+	UserID       string
+	Phone        string
+	Voice        string
+	AlertFolders string
+	Date         string
+}
+
+// PendingAlerts returns unread messages that have not been announced by a
+// phone alert and belong to accounts with call alerts enabled whose owner has
+// an enabled alerts setting and a number on file.
+func (s *Store) PendingAlerts(ctx context.Context) ([]AlertCandidate, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT m.id,m.account_id,m.folder,COALESCE(m.sender,''),COALESCE(m.subject,''),u.id,COALESCE(s.alert_phone,''),s.tts_voice,COALESCE(a.alert_folders,'[]'),COALESCE(m.message_date,'')
+FROM mail_messages m
+JOIN accounts a ON a.id = m.account_id
+JOIN users u ON u.id = a.user_id
+JOIN settings s ON s.user_id = u.id
+WHERE m.is_read = 0 AND m.alerted = 0
+  AND a.call_alert_enabled = 1 AND s.alerts_enabled = 1 AND u.enabled = 1
+  AND COALESCE(s.alert_phone,'') <> '' AND COALESCE(a.alert_folders,'[]') <> '[]'
+ORDER BY COALESCE(m.message_date,'') DESC, m.id DESC
+LIMIT 100`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AlertCandidate
+	for rows.Next() {
+		var c AlertCandidate
+		if err := rows.Scan(&c.MessageID, &c.AccountID, &c.Folder, &c.Sender, &c.Subject, &c.UserID, &c.Phone, &c.Voice, &c.AlertFolders, &c.Date); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// MarkAlertsNotified claims candidates so a later sync cannot announce the
+// same message a second time.
+func (s *Store) MarkAlertsNotified(ctx context.Context, ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+	args := make([]any, 0, len(ids))
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	_, err := s.DB.ExecContext(ctx, `UPDATE mail_messages SET alerted = 1 WHERE id IN (`+placeholders+`)`, args...)
 	return err
 }
 
@@ -427,5 +530,49 @@ func (s *Store) ListContacts(ctx context.Context, userID string) ([]Contact, err
 }
 func (s *Store) DeleteContact(ctx context.Context, userID string, id int64) error {
 	_, err := s.DB.ExecContext(ctx, `DELETE FROM contacts WHERE user_id=? AND id=?`, userID, id)
+	return err
+}
+
+func (s *Store) GetSIP(ctx context.Context) (SIPSettings, error) {
+	var st SIPSettings
+	var enabled int
+	err := s.DB.QueryRowContext(ctx, `SELECT domain,username,password,port,transport,reg_interval,enabled FROM sip_settings WHERE id=1`).Scan(&st.Domain, &st.Username, &st.Password, &st.Port, &st.Transport, &st.RegInterval, &enabled)
+	if err != nil {
+		return SIPSettings{}, err
+	}
+	st.Enabled = enabled != 0
+	return st, nil
+}
+
+// UpsertSIP persists the deployment SIP account. When storage.Password is
+// blank the previously sealed password is preserved; otherwise the plaintext
+// is sealed before writing.
+func (s *Store) UpsertSIP(ctx context.Context, box *secret.Box, storage SIPSettings) error {
+	if box == nil {
+		return fmt.Errorf("secret box is required")
+	}
+	if storage.Port == 0 {
+		storage.Port = 5060
+	}
+	if storage.Transport == "" {
+		storage.Transport = "udp"
+	}
+	if storage.RegInterval == 0 {
+		storage.RegInterval = 300
+	}
+	sealed := storage.Password
+	if sealed == "" {
+		_ = s.DB.QueryRowContext(ctx, `SELECT password FROM sip_settings WHERE id=1`).Scan(&sealed)
+	}
+	if storage.Password != "" {
+		value, err := box.Seal(storage.Password)
+		if err != nil {
+			return err
+		}
+		sealed = value
+	}
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO sip_settings(id,domain,username,password,port,transport,reg_interval,enabled,updated_at) VALUES(1,?,?,?,?,?,?,?,?)
+ON CONFLICT(id) DO UPDATE SET domain=excluded.domain,username=excluded.username,password=excluded.password,port=excluded.port,transport=excluded.transport,reg_interval=excluded.reg_interval,enabled=excluded.enabled,updated_at=excluded.updated_at`,
+		storage.Domain, storage.Username, sealed, storage.Port, storage.Transport, storage.RegInterval, storage.Enabled, time.Now().UTC().Format(time.RFC3339Nano))
 	return err
 }

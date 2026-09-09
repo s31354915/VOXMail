@@ -1,5 +1,7 @@
-# Build/runtime image for the first production slice. Baresip, Piper,
-# whisper.cpp, and mbsync are intentionally pinned by build arguments.
+# Build/runtime image for VOXMail. Baresip, Piper, whisper.cpp, and mbsync are
+# intentionally pinned by build arguments. BuildKit cache mounts keep the git
+# sources and build trees across rebuilds so CI and local iterations are fast;
+# the images themselves stay lean.
 FROM debian:bookworm AS baresip-build
 ARG BARESIP_REF=v4.11.0
 ARG RE_REF=main
@@ -7,37 +9,44 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates git cmake make gcc g++ pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
-RUN git clone --depth 1 --branch ${RE_REF} https://github.com/baresip/re.git re \
-    && cmake -S re -B re/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/re \
-    && cmake --build re/build -j2 && cmake --install re/build
-RUN git clone --depth 1 --branch ${BARESIP_REF} https://github.com/baresip/baresip.git baresip
+RUN --mount=type=cache,id=bare-re,target=/src/re \
+    { test -d /src/re/.git || git clone --depth 1 --branch ${RE_REF} https://github.com/baresip/re.git /src/re; } \
+    && cmake -S /src/re -B /src/re/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/re \
+    && cmake --build /src/re/build --config Release -j$(nproc) \
+    && cmake --install /src/re/build
+RUN --mount=type=cache,id=bare-baresip,target=/src/baresip \
+    { test -d /src/baresip/.git || git clone --depth 1 --branch ${BARESIP_REF} https://github.com/baresip/baresip.git /src/baresip; }
 COPY baresip/shim /src/appmodules/voxmail
-RUN cmake -S baresip -B baresip/build -DCMAKE_BUILD_TYPE=Release \
+RUN --mount=type=cache,id=bare-baresip,target=/src/baresip \
+    cmake -S /src/baresip -B /src/baresip/build -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_PREFIX_PATH=/opt/re \
     -DMODULES='account;g711;auconv;auresamp;aubridge;aufile;in_band_dtmf;ice;stun;srtp;dtls_srtp;stdio' \
     -DAPP_MODULES_DIR=/src/appmodules -DAPP_MODULES=voxmail \
-    && cmake --build baresip/build -j2
-RUN mkdir -p /out/modules && cp baresip/build/baresip /out/baresip && \
-    cp baresip/build/libbaresip.so /out/libbaresip.so && \
-    find baresip/build -name '*.so' -path '*/modules/*' -exec cp {} /out/modules/ \; && \
-    find baresip/build -name '*.so' -path '*/app_modules/*' -exec cp {} /out/modules/ \;
+    && cmake --build /src/baresip/build --config Release -j$(nproc)
+RUN --mount=type=cache,id=bare-baresip,target=/src/baresip \
+    mkdir -p /out/modules && cp /src/baresip/build/baresip /out/baresip && \
+    cp /src/baresip/build/libbaresip.so /out/libbaresip.so && \
+    find /src/baresip/build -name '*.so' -path '*/modules/*' -exec cp {} /out/modules/ \; && \
+    find /src/baresip/build -name '*.so' -path '*/app_modules/*' -exec cp {} /out/modules/ \;
 
 FROM debian:bookworm AS whisper-build
 ARG WHISPER_REF=v1.7.1
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git cmake make gcc g++ pkg-config && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
-RUN git clone --depth 1 --branch ${WHISPER_REF} https://github.com/ggml-org/whisper.cpp.git whisper.cpp && \
-    cmake -S whisper.cpp -B whisper.cpp/build -DCMAKE_BUILD_TYPE=Release -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_EXAMPLES=ON -DGGML_NATIVE=OFF && \
-    cmake --build whisper.cpp/build --config Release -j2 --target main && \
-    mkdir -p /out && cp whisper.cpp/build/bin/main /out/whisper-cli
+RUN --mount=type=cache,id=whisper-src,target=/src/whisper.cpp \
+    { test -d /src/whisper.cpp/.git || git clone --depth 1 --branch ${WHISPER_REF} https://github.com/ggml-org/whisper.cpp.git /src/whisper.cpp; } \
+    && cmake -S /src/whisper.cpp -B /src/whisper.cpp/build -DCMAKE_BUILD_TYPE=Release -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_EXAMPLES=ON -DGGML_NATIVE=OFF \
+    && cmake --build /src/whisper.cpp/build --config Release -j$(nproc) --target main \
+    && mkdir -p /out && cp /src/whisper.cpp/build/bin/main /out/whisper-cli
 
 FROM golang:1.23-bookworm AS build
 WORKDIR /src
 COPY go.mod ./
 COPY go.sum* ./
-RUN go mod download
+RUN --mount=type=cache,id=gomod,target=/go/pkg/mod go mod download
 COPY . .
-RUN CGO_ENABLED=1 go build -trimpath -ldflags='-s -w' -o /out/voxmail ./cmd/voxmail && \
+RUN --mount=type=cache,id=gobuild,target=/root/.cache/go-build \
+    CGO_ENABLED=1 go build -trimpath -ldflags='-s -w' -o /out/voxmail ./cmd/voxmail && \
     CGO_ENABLED=1 go build -trimpath -ldflags='-s -w' -o /out/voxmail-secret ./cmd/voxmail-secret
 
 FROM python:3.11-slim
@@ -60,5 +69,5 @@ COPY assets/static-prompts.json /usr/local/share/voxmail/static-prompts.json
 COPY scripts/entrypoint.sh /usr/local/bin/voxmail-entrypoint
 RUN chmod 0755 /usr/local/bin/voxmail-entrypoint && mkdir -p /data /data/logs && ldconfig
 VOLUME ["/data"]
-EXPOSE 8080/udp 8080/tcp
+EXPOSE 5060/udp 5060/tcp 8080/udp 8080/tcp
 ENTRYPOINT ["/usr/local/bin/voxmail-entrypoint"]

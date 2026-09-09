@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -25,6 +26,7 @@ type Message struct {
 	RxPath  string `json:"rx_path,omitempty"`
 	Command string `json:"command,omitempty"`
 	Code    int    `json:"code,omitempty"`
+	To      string `json:"to,omitempty"`
 }
 
 func Encode(w io.Writer, message Message) error {
@@ -56,7 +58,21 @@ func Dial(path string) (*Client, error) {
 	return &Client{conn: conn}, nil
 }
 
+// NewClient wraps an existing connection as a bridge client so a long-lived
+// connection can be shared for event reception and command sending.
+func NewClient(conn net.Conn) *Client { return &Client{conn: conn} }
+
 func (c *Client) Close() error { return c.conn.Close() }
+
+// Dial requests an outgoing call. The remote callee is identified by uri, for
+// example "sip:+15551212@sip.example.com". It returns when the request has
+// been written, not when the call is answered.
+func (c *Client) Dial(ctx context.Context, uri string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return c.Send(Message{Type: "dial", To: uri})
+}
 
 func (c *Client) Send(message Message) error {
 	c.mu.Lock()

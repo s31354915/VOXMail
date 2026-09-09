@@ -29,7 +29,7 @@ type Config struct {
 func Load() (Config, error) {
 	dataDir := env("VOXMAIL_DATA_DIR", "/data")
 	c := Config{
-		HTTPAddr:      env("VOXMAIL_HTTP_ADDR", ":8080"),
+		HTTPAddr:      env("VOXMAIL_HTTP_ADDR", "127.0.0.1:8080"),
 		DataDir:       dataDir,
 		DBPath:        env("VOXMAIL_DB_PATH", filepath.Join(dataDir, "sqlite", "voxmail.db")),
 		EncryptionKey: os.Getenv("VOXMAIL_ENCRYPTION_KEY"),

@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
@@ -24,11 +25,26 @@ import (
 //go:embed static/index.html
 var indexHTML []byte
 
+// SIPController applies deployment SIP changes to the local baresip process.
+// It is optional: without it the console still persists SIP settings, but no
+// baresip child is managed.
+type SIPController interface {
+	Apply(context.Context) error
+}
+
+// AlertService places outgoing test alert calls on demand. It is optional:
+// without it the console reports that the call service is unavailable.
+type AlertService interface {
+	TestAlert(context.Context, string) error
+}
+
 type Server struct {
 	Store    *store.Store
 	Secrets  *secret.Box
 	Log      *slog.Logger
 	Sessions *SessionStore
+	SIP      SIPController
+	Alerts   AlertService
 	loginMu  sync.Mutex
 	logins   map[string]loginState
 }
@@ -79,11 +95,18 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/v1/whitelist/{id}", s.deleteWhitelist)
 	mux.HandleFunc("GET /api/v1/settings", s.settings)
 	mux.HandleFunc("PUT /api/v1/settings", s.saveSettings)
+	mux.HandleFunc("POST /api/v1/alerts/test", s.testAlert)
+	mux.HandleFunc("GET /api/v1/sip", s.sipSettings)
+	mux.HandleFunc("PUT /api/v1/sip", s.saveSIP)
 	mux.HandleFunc("GET /", s.index)
 	return withSecurityHeaders(mux)
 }
 
-type setupRequest struct{ Username, Password, PIN string }
+type setupRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+	PIN      string `json:"pin"`
+}
 
 func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
 	count, err := s.Store.UserCount(r.Context())
@@ -124,7 +147,11 @@ func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, publicUser(u))
 }
 
-type loginRequest struct{ Username, Password, TOTP string }
+type loginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+	TOTP     string `json:"totp"`
+}
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	var req loginRequest
@@ -184,7 +211,12 @@ func (s *Server) users(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-type userRequest struct{ Username, Password, PIN, Role string }
+type userRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+	PIN      string `json:"pin"`
+	Role     string `json:"role"`
+}
 
 func (s *Server) createUser(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireAdmin(w, r); !ok {
@@ -237,14 +269,25 @@ func (s *Server) deleteUser(w http.ResponseWriter, r *http.Request) {
 }
 
 type accountRequest struct {
-	ID, CanonicalName, Email, SenderName, IMAPHost, IMAPUser, IMAPPassword string
-	SMTPHost, SMTPUser, SMTPPassword                                       string
-	IMAPPort, SMTPPort, SyncIntervalMinutes, DisplayOrder                  int
-	FolderMap                                                              map[string]string
-	AlertFolders                                                           []string
-	InitialCutoff                                                          *string
-	RetentionDays                                                          *int
-	CallAlertEnabled                                                       bool
+	ID                  string            `json:"id"`
+	CanonicalName       string            `json:"canonical_name"`
+	Email               string            `json:"email"`
+	SenderName          string            `json:"sender_name"`
+	IMAPHost            string            `json:"imap_host"`
+	IMAPUser            string            `json:"imap_user"`
+	IMAPPassword        string            `json:"imap_password"`
+	SMTPHost            string            `json:"smtp_host"`
+	SMTPUser            string            `json:"smtp_user"`
+	SMTPPassword        string            `json:"smtp_password"`
+	IMAPPort            int               `json:"imap_port"`
+	SMTPPort            int               `json:"smtp_port"`
+	SyncIntervalMinutes int               `json:"sync_interval_minutes"`
+	DisplayOrder        int               `json:"display_order"`
+	FolderMap           map[string]string `json:"folder_map"`
+	AlertFolders        []string          `json:"alert_folders"`
+	InitialCutoff       *string           `json:"initial_cutoff,omitempty"`
+	RetentionDays       *int              `json:"retention_days,omitempty"`
+	CallAlertEnabled    bool              `json:"call_alert_enabled"`
 }
 
 type accountView struct {
@@ -617,6 +660,140 @@ func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, body)
+}
+
+func (s *Server) testAlert(w http.ResponseWriter, r *http.Request) {
+	u, ok := s.require(w, r, true)
+	if !ok {
+		return
+	}
+	if s.Alerts == nil {
+		writeError(w, http.StatusServiceUnavailable, "the call service is not running")
+		return
+	}
+	if err := s.Alerts.TestAlert(r.Context(), u.ID); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "alert_call_placed"})
+}
+
+func (s *Server) sipSettings(w http.ResponseWriter, r *http.Request) {
+	u, ok := s.requireAdmin(w, r)
+	if !ok {
+		return
+	}
+	_ = u
+	st, err := s.Store.GetSIP(r.Context())
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		serverError(w, err)
+		return
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		st = store.SIPSettings{Port: 5060, Transport: "udp", RegInterval: 300}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"domain":       st.Domain,
+		"username":     st.Username,
+		"port":         st.Port,
+		"transport":    st.Transport,
+		"reg_interval": st.RegInterval,
+		"enabled":      st.Enabled,
+		"password_set": st.Password != "",
+	})
+}
+
+func (s *Server) saveSIP(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	var body struct {
+		Domain      string `json:"domain"`
+		Username    string `json:"username"`
+		Password    string `json:"password"`
+		Port        int    `json:"port"`
+		Transport   string `json:"transport"`
+		RegInterval int    `json:"reg_interval"`
+		Enabled     bool   `json:"enabled"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	body.Domain = strings.TrimSpace(body.Domain)
+	body.Username = strings.TrimSpace(body.Username)
+	if body.Port < 1 || body.Port > 65535 {
+		writeError(w, http.StatusBadRequest, "SIP port must be between 1 and 65535")
+		return
+	}
+	switch body.Transport {
+	case "udp", "tcp", "tls":
+	default:
+		body.Transport = "udp"
+	}
+	if body.RegInterval < 0 || body.RegInterval > 86400 {
+		writeError(w, http.StatusBadRequest, "registration interval must be between 0 and 86400 seconds")
+		return
+	}
+	if body.Enabled {
+		if body.Domain == "" || body.Username == "" {
+			writeError(w, http.StatusBadRequest, "domain and username are required to enable SIP")
+			return
+		}
+		if !validSIPHost(body.Domain) {
+			writeError(w, http.StatusBadRequest, "SIP domain is invalid")
+			return
+		}
+		if !validSIPUsername(body.Username) {
+			writeError(w, http.StatusBadRequest, "SIP username contains invalid characters")
+			return
+		}
+	}
+	st := store.SIPSettings{Domain: body.Domain, Username: body.Username, Password: body.Password, Port: body.Port, Transport: body.Transport, RegInterval: body.RegInterval, Enabled: body.Enabled}
+	if err := s.Store.UpsertSIP(r.Context(), s.Secrets, st); err != nil {
+		serverError(w, err)
+		return
+	}
+	if s.SIP != nil {
+		if err := s.SIP.Apply(r.Context()); err != nil {
+			s.log().Error("sip settings applied but baresip restart failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "SIP settings saved, but the call client could not be restarted")
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "saved"})
+}
+func (s *Server) log() *slog.Logger {
+	if s.Log != nil {
+		return s.Log
+	}
+	return slog.Default()
+}
+
+func validSIPHost(host string) bool {
+	if host == "" || strings.ContainsAny(host, " \t\r\n;/\x00\\\"") || strings.Contains(host, "..") {
+		return false
+	}
+	if strings.HasPrefix(host, ".") || strings.HasSuffix(host, ".") {
+		return false
+	}
+	for _, r := range host {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '.' && r != '-' && r != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+func validSIPUsername(username string) bool {
+	if username == "" {
+		return false
+	}
+	for _, r := range username {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '+' && r != '-' && r != '.' && r != '_' && r != '~' {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
