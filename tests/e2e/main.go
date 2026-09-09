@@ -1,4 +1,4 @@
-// vuxmail.e2e is a "killer" end-to-end harness that runs against a live
+// vuxmail.e2e is an end-to-end harness that runs against a live
 // VOXMail container over HTTP. It is intentionally aggressive: every write
 // path is poked with malformed input, cross-user isolation is verified, the
 // sign-in brute-force guard is exercised over one TCP connection, and phase 2
@@ -141,6 +141,22 @@ func bodyContains(data []byte, sub string) bool {
 	return data != nil && strings.Contains(string(data), sub)
 }
 
+// jsonID extracts an "id" from a JSON object, tolerating both string and
+// numeric representations so it works for any entity endpoint.
+func jsonID(data []byte) string {
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		return ""
+	}
+	switch v := m["id"].(type) {
+	case string:
+		return v
+	case float64:
+		return strconv.FormatInt(int64(v), 10)
+	}
+	return ""
+}
+
 // bruteforce exercises the login rate-limit gate over a single TCP connection
 // so every attempt shares the same RemoteAddr and cannot spread across ports.
 // expected holds the status code for each attempt in order.
@@ -165,6 +181,8 @@ func bruteforce(base, username, password string, expected []int) {
 	}
 }
 
+// rawStatus reads one full HTTP response (status line, headers, and body) so
+// keep-alive connections stay in sync between requests on the same socket.
 func rawStatus(reader *bufio.Reader) (int, error) {
 	line, err := reader.ReadString('\n')
 	if err != nil {
@@ -174,7 +192,29 @@ func rawStatus(reader *bufio.Reader) (int, error) {
 	if len(parts) < 2 {
 		return 0, errors.New("malformed status line")
 	}
-	return strconv.Atoi(parts[1])
+	status, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, err
+	}
+	var contentLength int
+	for {
+		header, err := reader.ReadString('\n')
+		if err != nil {
+			return 0, err
+		}
+		if strings.TrimSpace(header) == "" {
+			break
+		}
+		if key, value, ok := strings.Cut(header, ":"); ok && strings.EqualFold(strings.TrimSpace(key), "content-length") {
+			if n, err := strconv.Atoi(strings.TrimSpace(value)); err == nil {
+				contentLength = n
+			}
+		}
+	}
+	if _, err := io.CopyN(io.Discard, reader, int64(contentLength)); err != nil {
+		return 0, err
+	}
+	return status, nil
 }
 
 func waitReady(base string, timeout time.Duration) bool {
@@ -301,7 +341,7 @@ func phase1(base string) {
 	check(bodyContains(got, `"alert_phone":"`+phone+`"`), "alert phone is normalized to the stable telephone identity")
 	resp, data = admin.do("POST", "/api/v1/alerts/test", nil, true)
 	check(resp.StatusCode == 400 && bodyContains(data, "SIP registrar"), "alert test refused without an SIP registrar (%d)", resp.StatusCode)
-	admin.must("PUT", "/api/v1/sip", map[string]any{"domain": "sip.example.com", "username": "voxmail", "password": "secret", "port": 5060, "transport": "udp", "reg_interval": 300, "enabled": false}, 200)
+	admin.must("PUT", "/api/v1/sip", map[string]any{"domain": "sip.example.com", "username": "voxmail", "password": "secret", "port": 5060, "transport": "udp", "reg_interval": 300, "enabled": true}, 200)
 	time.Sleep(2 * time.Second) // allow the bridge to reconnect to baresip
 	admin.must("POST", "/api/v1/alerts/test", nil, 200)
 
@@ -317,7 +357,12 @@ func phase1(base string) {
 
 	fmt.Println("mail account validation and isolation")
 	admin.must("POST", "/api/v1/accounts", map[string]any{"canonical_name": "Work", "email": "a@example.com", "imap_host": "imap.example.com", "imap_user": "a", "smtp_host": "smtp.example.com", "smtp_user": "a"}, 400)
-	admin.must("POST", "/api/v1/accounts", acct("bad-email", "imap.example.com", 993, "a", "pw", nil, nil), 400)
+	admin.must("POST", "/api/v1/accounts", map[string]any{
+		"canonical_name": "Bad-Email", "email": "not-an-email",
+		"imap_host": "imap.example.com", "imap_port": 993, "imap_user": "a", "imap_password": "pw",
+		"smtp_host": "smtp.example.com", "smtp_port": 465, "smtp_user": "a", "smtp_password": "pw",
+		"folder_map": map[string]string{}, "alert_folders": []string{},
+	}, 400)
 	admin.must("POST", "/api/v1/accounts", acct("Work", "imap.example.com", 70000, "a", "pw", &map[string]string{}, &[]string{}), 400)
 	admin.must("POST", "/api/v1/accounts", acct("Work", "imap.example.com", 993, "a", "pw", &map[string]string{"INBOX": ".."}, &[]string{}), 400)
 	admin.must("POST", "/api/v1/accounts", acct("Work", "imap.example.com", 993, "a", "pw", &map[string]string{"a": "X", "b": "X"}, &[]string{}), 400)
@@ -346,6 +391,7 @@ func phase1(base string) {
 	admin.must("DELETE", "/api/v1/accounts/"+probeResult["id"], nil, 204)
 
 	bob2 := newSess(base)
+	admin.must("POST", "/api/v1/users", map[string]any{"username": bobUser, "password": bobPass, "pin": bobPIN, "role": "user"}, 201)
 	bob2.login(bobUser, bobPass, "")
 	recreated := admin.must("POST", "/api/v1/accounts", acct("Jane Mail", "imap.example.com", 993, "j", "pw", &map[string]string{}, &[]string{}), 201)
 	recreatedID := ""
@@ -363,10 +409,8 @@ func phase1(base string) {
 	admin.must("POST", "/api/v1/contacts", map[string]any{"name": "", "email": "x@example.com"}, 400)
 	admin.must("POST", "/api/v1/contacts", map[string]any{"name": "Peach", "email": "peach@example.com"}, 201)
 	admin.must("POST", "/api/v1/contacts", map[string]any{"name": "Peach", "email": "peach@example.com"}, 409)
-	created = map[string]string{}
 	data = admin.must("POST", "/api/v1/contacts", map[string]any{"name": "Toad", "email": "toad@example.com"}, 201)
-	_ = json.Unmarshal(data, &created)
-	contactID := created["id"]
+	contactID := jsonID(data)
 	admin.must("PUT", "/api/v1/contacts/"+contactID, map[string]any{"name": "Toadstool", "email": "toad@example.com"}, 200)
 	got = admin.must("GET", "/api/v1/contacts", nil, 200)
 	check(bodyContains(got, "Peach") && bodyContains(got, "Toadstool"), "contacts are listed after create/update")

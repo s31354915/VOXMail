@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -72,7 +73,6 @@ func main() {
 		log.Error("cannot open database", "error", err)
 		os.Exit(1)
 	}
-	defer db.Close()
 
 	sipBridge := &sip.Baresip{
 		Binary:        cfg.BaresipBinary,
@@ -85,58 +85,71 @@ func main() {
 		Secrets:       secrets,
 		Log:           log,
 	}
-	webApp := &web.Server{Store: db, Secrets: secrets, Log: log, SIP: sipBridge}
+	speechRuntime := speech.NewRuntime(
+		speech.Piper{Binary: cfg.PiperBinary, Model: cfg.PiperModel},
+		speech.Whisper{Binary: cfg.STTBinary, Model: cfg.STTModel},
+		filepath.Join(cfg.DataDir, "run", "speech"),
+	)
+	speechPool := speech.NewRuntimePool(
+		cfg.PiperBinary, cfg.VoiceDir, cfg.STTBinary, cfg.STTModel,
+		filepath.Join(cfg.DataDir, "run", "speech"),
+	)
+	bridgeService := &calls.Service{
+		Socket:   cfg.ControlSocket,
+		Store:    db,
+		Log:      log,
+		MaxCalls: cfg.MaxCalls,
+		DataRoot: cfg.DataDir,
+		Media: &calls.PromptPlayer{
+			Piper:        speech.Piper{Binary: cfg.PiperBinary, Model: cfg.PiperModel},
+			Runtime:      speechRuntime,
+			Pool:         speechPool,
+			Store:        db,
+			GreetingPath: cfg.GreetingPath,
+			Static:       staticPrompts,
+			StaticVoice:  staticManifest.VoiceModel,
+			Dir:          promptDir,
+		},
+		Recorder: &calls.VoiceRecorder{
+			Runtime: speechRuntime,
+			Whisper: speech.Whisper{Binary: cfg.STTBinary, Model: cfg.STTModel},
+			Dir:     cfg.RecordingsDir,
+			Window:  15 * time.Second,
+		},
+		Secrets: secrets,
+	}
+	alertService := &alerts.Service{Store: db, Bridge: bridgeService, Log: log}
+	webApp := &web.Server{Store: db, Secrets: secrets, Log: log, SIP: sipBridge, Alerts: alertService, DataRoot: cfg.DataDir, Ready: func(ctx context.Context) error {
+		if sipBridge.Enabled() && !bridgeService.Healthy() {
+			return errors.New("call bridge not connected")
+		}
+		return nil
+	}}
 	server := &http.Server{Addr: cfg.HTTPAddr, Handler: webApp.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	appContext, stopApp := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stopApp()
+
 	indexer := &mailindex.Indexer{Store: db}
 	syncService := &mailsync.Service{Store: db, Root: cfg.DataDir, Runner: mailsync.Runner{}, Index: indexer, Log: log}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		if err := syncService.Run(appContext); err != nil && !errors.Is(err, context.Canceled) {
 			log.Error("sync service stopped", "error", err)
 		}
 	}()
+	wg.Add(1)
 	go func() {
-		speechRuntime := speech.NewRuntime(
-			speech.Piper{Binary: cfg.PiperBinary, Model: cfg.PiperModel},
-			speech.Whisper{Binary: cfg.STTBinary, Model: cfg.STTModel},
-			filepath.Join(cfg.DataDir, "run", "speech"),
-		)
-		speechPool := speech.NewRuntimePool(
-			cfg.PiperBinary, cfg.VoiceDir, cfg.STTBinary, cfg.STTModel,
-			filepath.Join(cfg.DataDir, "run", "speech"),
-		)
-		bridgeService := &calls.Service{
-			Socket:   cfg.ControlSocket,
-			Store:    db,
-			Log:      log,
-			MaxCalls: cfg.MaxCalls,
-			DataRoot: cfg.DataDir,
-			Media: &calls.PromptPlayer{
-				Piper:        speech.Piper{Binary: cfg.PiperBinary, Model: cfg.PiperModel},
-				Runtime:      speechRuntime,
-				Pool:         speechPool,
-				Store:        db,
-				GreetingPath: cfg.GreetingPath,
-				Static:       staticPrompts,
-				StaticVoice:  staticManifest.VoiceModel,
-				Dir:          promptDir,
-			},
-			Recorder: &calls.VoiceRecorder{
-				Runtime: speechRuntime,
-				Whisper: speech.Whisper{Binary: cfg.STTBinary, Model: cfg.STTModel},
-				Dir:     cfg.RecordingsDir,
-				Window:  15 * time.Second,
-			},
-			Secrets: secrets,
+		defer wg.Done()
+		if err := alertService.Run(appContext); err != nil && !errors.Is(err, context.Canceled) {
+			log.Error("alert service stopped", "error", err)
 		}
-		alertService := &alerts.Service{Store: db, Bridge: bridgeService, Log: log}
-		webApp.Alerts = alertService
-		go func() {
-			if err := alertService.Run(appContext); err != nil && !errors.Is(err, context.Canceled) {
-				log.Error("alert service stopped", "error", err)
-			}
-		}()
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
 		if err := sipBridge.Apply(appContext); err != nil {
 			log.Warn("baresip did not start", "error", err)
 		}
@@ -144,11 +157,15 @@ func main() {
 			log.Warn("call bridge stopped", "error", err)
 		}
 	}()
+	serverFailed := make(chan error, 1)
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		log.Info("web server listening", "addr", cfg.HTTPAddr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("web server stopped", "error", err)
-			os.Exit(1)
+			serverFailed <- err
+			stopApp()
 		}
 	}()
 
@@ -159,4 +176,16 @@ func main() {
 		log.Error("graceful shutdown failed", "error", err)
 	}
 	sipBridge.Stop()
+	wg.Wait()
+	if err := db.Close(); err != nil {
+		log.Error("closing database", "error", err)
+	}
+	var serverErr error
+	select {
+	case serverErr = <-serverFailed:
+	default:
+	}
+	if serverErr != nil {
+		os.Exit(1)
+	}
 }

@@ -62,15 +62,14 @@ func Send(c Config, to []string, raw []byte) error {
 func BuildMessage(from, sender string, to, cc, bcc []string, subject, body string) []byte {
 	clean := func(value string) string { return strings.NewReplacer("\r", " ", "\n", " ").Replace(value) }
 	from, sender, subject = clean(from), clean(sender), clean(subject)
-	for i := range to {
-		to[i] = clean(to[i])
+	cleanList := func(input []string) []string {
+		out := make([]string, len(input))
+		for i, recipient := range input {
+			out[i] = clean(recipient)
+		}
+		return out
 	}
-	for i := range cc {
-		cc[i] = clean(cc[i])
-	}
-	for i := range bcc {
-		bcc[i] = clean(bcc[i])
-	}
+	to, cc, bcc = cleanList(to), cleanList(cc), cleanList(bcc)
 	lines := []string{"From: " + sender + " <" + from + ">", "To: " + strings.Join(to, ", ")}
 	if len(cc) > 0 {
 		lines = append(lines, "Cc: "+strings.Join(cc, ", "))

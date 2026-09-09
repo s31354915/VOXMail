@@ -236,6 +236,7 @@ func (r *Runtime) warm(ctx context.Context, ready chan struct{}) {
 	var wg sync.WaitGroup
 	var firstErr error
 	var errMu sync.Mutex
+	var worker *piperWorker
 	record := func(err error) {
 		if err != nil {
 			errMu.Lock()
@@ -248,21 +249,22 @@ func (r *Runtime) warm(ctx context.Context, ready chan struct{}) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		worker, err := startPiperWorker(ctx, r.Piper)
+		w, err := startPiperWorker(ctx, r.Piper)
 		if err != nil {
 			record(err)
 			return
 		}
 		r.mu.Lock()
-		if r.ready == ready {
-			r.worker = worker
+		installed := r.ready == ready && r.worker == nil
+		if installed {
+			r.worker = w
 		}
-		installed := r.worker == worker
 		r.mu.Unlock()
 		if !installed {
-			worker.close()
+			w.close()
 			return
 		}
+		worker = w
 		warmDir := r.Dir
 		if warmDir == "" {
 			warmDir = os.TempDir()
@@ -292,11 +294,18 @@ func (r *Runtime) warm(ctx context.Context, ready chan struct{}) {
 	if r.ready == ready {
 		r.warmErr = firstErr
 		close(ready)
-	} else if r.worker != nil {
-		r.worker.close()
+		r.mu.Unlock()
+		return
+	}
+	// This warm belongs to a superseded generation. Tear down only the worker
+	// we installed, never a worker installed by a newer warm.
+	if r.worker == worker {
 		r.worker = nil
 	}
 	r.mu.Unlock()
+	if worker != nil {
+		worker.close()
+	}
 }
 
 func (r *Runtime) Wait(ctx context.Context) error {

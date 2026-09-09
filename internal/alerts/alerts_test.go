@@ -93,7 +93,7 @@ func seedAlertStore(t *testing.T) *store.Store {
 		t.Fatal(err)
 	}
 	mail := []struct {
-		folder, path string
+		folder, path  string
 		read, alerted int
 	}{
 		{"INBOX", "/m/a1/1", 0, 0},

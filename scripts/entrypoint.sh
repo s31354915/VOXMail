@@ -26,11 +26,23 @@ fi
 # baresip is spawned and supervised by the voxmail process itself, using the
 # SIP account configured in the web console (or VOXMAIL_SIP_ACCOUNT override).
 
+# Remove a stale pid file and, if it still points at a live process from an
+# earlier run, stop it so orphaned children do not outlive the entrypoint.
+if [ -f /data/run/voxmail.pid ]; then
+  stale_pid="$(cat /data/run/voxmail.pid 2>/dev/null || true)"
+  case "$stale_pid" in
+    ''|*[!0-9]*) ;;
+    *) kill "$stale_pid" 2>/dev/null || true ;;
+  esac
+  rm -f /data/run/voxmail.pid
+fi
+
 voxmail_pid=""
-term() {
+cleanup() {
   if [ -n "$voxmail_pid" ]; then kill "$voxmail_pid" 2>/dev/null || true; fi
+  rm -f /data/run/voxmail.pid
 }
-trap term INT TERM EXIT
+trap cleanup INT TERM EXIT
 
 /usr/local/bin/voxmail &
 voxmail_pid=$!

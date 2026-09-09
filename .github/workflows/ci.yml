@@ -22,14 +22,14 @@ jobs:
       - name: Vet
         run: go vet ./...
       - name: Test
-        run: go test ./...
+        run: go test -race -count=1 ./...
       - name: E2E harness compiles
         run: go build ./tests/e2e
       - name: Dockerfile is well-formed
         run: docker build --check -f Dockerfile .
 
   e2e:
-    name: End-to-end container tests (killer suite)
+    name: End-to-end container tests
     runs-on: ubuntu-24.04
     needs: unit
     steps:

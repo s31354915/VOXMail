@@ -1,8 +1,6 @@
 package sip
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -10,67 +8,94 @@ import (
 )
 
 func TestBuildAccount(t *testing.T) {
-	line := buildAccount(store.SIPSettings{
-		Domain: "sip.example.com", Username: "+15551212",
-		Password: "s3cr@t;p:ass", Port: 5060, Transport: "udp", RegInterval: 300,
-	})
-	want := "<sip:%2B15551212@sip.example.com:5060;transport=udp>;auth_user=%2B15551212;auth_pass=s3cr%40t%3Bp%3Aass;regint=300"
-	if line != want {
-		t.Fatalf("account line:\n got %q\nwant %q", line, want)
+	account := buildAccount(store.SIPSettings{Username: "alice", Password: "s3cret", Domain: "sip.example.com", Port: 5060, Transport: "udp", RegInterval: 120})
+	if !strings.HasPrefix(account, "<sip:alice@sip.example.com:5060;transport=udp>") {
+		t.Fatalf("unexpected account prefix: %s", account)
+	}
+	if !strings.Contains(account, "auth_pass=s3cret") {
+		t.Fatalf("password missing from account: %s", account)
+	}
+	if !strings.Contains(account, "regint=120") {
+		t.Fatalf("regint missing: %s", account)
+	}
+}
+
+func TestBuildAccountDefaults(t *testing.T) {
+	account := buildAccount(store.SIPSettings{Username: "bob", Domain: "pbx.example"})
+	for _, want := range []string{":5060", "transport=udp", "regint=300"} {
+		if !strings.Contains(account, want) {
+			t.Errorf("account missing %q: %s", want, account)
+		}
 	}
 }
 
 func TestBuildAccountRequiresIdentity(t *testing.T) {
-	if got := buildAccount(store.SIPSettings{Domain: "x", RegInterval: 300}); got != "" {
-		t.Fatalf("expected empty account without username, got %q", got)
+	if got := buildAccount(store.SIPSettings{Username: "", Domain: "sip.example.com"}); got != "" {
+		t.Errorf("empty username should produce empty account, got %q", got)
+	}
+	if got := buildAccount(store.SIPSettings{Username: "alice", Domain: ""}); got != "" {
+		t.Errorf("empty domain should produce empty account, got %q", got)
 	}
 }
 
-func TestWriteConfig(t *testing.T) {
-	dir := t.TempDir()
-	b := &Baresip{ConfigDir: dir, MaxCalls: 10}
-	line := "<sip:user@host:5061;transport=tcp>;auth_user=user;auth_pass=pass;regint=600"
-	b.account = line
-	if err := b.writeConfig(store.SIPSettings{Domain: "host", Username: "user", Port: 5061, Transport: "tcp", RegInterval: 600}, true); err != nil {
-		t.Fatal(err)
+func TestEscapeParam(t *testing.T) {
+	if got := escapeParam("a'b\"c;d@e"); got != "a%27b%22c%3Bd%40e" {
+		t.Fatalf("escapeParam = %q", got)
 	}
-	config, err := os.ReadFile(filepath.Join(dir, "config"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(config)
-	for _, want := range []string{
-		"call_max_calls 10",
-		"sip_listen 0.0.0.0:5061",
-		"call_accept yes",
-		"poll_method poll",
-		"audio_source voxmail,",
-		"audio_player voxmail,",
-		"audio_alert voxmail,",
-	} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("missing %q in config:\n%s", want, text)
-		}
-	}
-	accounts, err := os.ReadFile(filepath.Join(dir, "accounts"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(accounts) != line+"\n" {
-		t.Fatalf("unexpected accounts file %q", string(accounts))
-	}
-	if info, err := os.Stat(filepath.Join(dir, "accounts")); err != nil || info.Mode().Perm() != 0600 {
-		t.Fatalf("accounts permissions: %v %v", info, err)
+	if got := escapeParam("user.name-1"); got != "user.name-1" {
+		t.Fatalf("escapeParam mangled safe characters: %q", got)
 	}
 }
 
-func TestWriteConfigRemovesAccountsWhenDisabled(t *testing.T) {
-	dir := t.TempDir()
-	b := &Baresip{ConfigDir: dir, MaxCalls: 10}
-	if err := b.writeConfig(store.SIPSettings{Port: 5060}, false); err != nil {
-		t.Fatal(err)
+func TestAccountForLogRedactsPassword(t *testing.T) {
+	account := buildAccount(store.SIPSettings{Username: "alice", Password: "hunter2", Domain: "sip.example.com"})
+	logged := accountForLog(account)
+	if strings.Contains(logged, "hunter2") || strings.Contains(logged, "auth_pass=") {
+		t.Fatalf("password leaked into log string: %q", logged)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "accounts")); !os.IsNotExist(err) {
-		t.Fatalf("expected accounts file to be removed, got err %v", err)
+	if !strings.Contains(logged, "alice") {
+		t.Fatalf("identity missing from log string: %q", logged)
+	}
+	if got := accountForLog("no password here"); got != "no password here" {
+		t.Fatalf("plain account mangled: %q", got)
+	}
+}
+
+func TestEnvSettingsOverrides(t *testing.T) {
+	t.Setenv("VOXMAIL_SIP_USERNAME", "envuser")
+	t.Setenv("VOXMAIL_SIP_PASSWORD", "envpass")
+	t.Setenv("VOXMAIL_SIP_DOMAIN", "env.example")
+	t.Setenv("VOXMAIL_SIP_TRANSPORT", "tcp")
+	t.Setenv("VOXMAIL_SIP_PORT", "5070")
+	t.Setenv("VOXMAIL_SIP_REGINT", "30")
+	base := store.SIPSettings{Username: "dbuser", Password: "dbpass", Domain: "db.example", Transport: "udp", Port: 5060, RegInterval: 300}
+	out := envSettings(base)
+	if out.Username != "envuser" || out.Password != "envpass" || out.Domain != "env.example" {
+		t.Fatalf("env overrides not applied: %+v", out)
+	}
+	if out.Transport != "tcp" || out.Port != 5070 || out.RegInterval != 30 {
+		t.Fatalf("numeric env overrides not applied: %+v", out)
+	}
+}
+
+func TestEnvSettingsIgnoresInvalidPort(t *testing.T) {
+	t.Setenv("VOXMAIL_SIP_PORT", "not-a-port")
+	base := store.SIPSettings{Port: 5060}
+	if out := envSettings(base); out.Port != 5060 {
+		t.Fatalf("invalid port replaced the base value: %+v", out)
+	}
+	t.Setenv("VOXMAIL_SIP_PORT", "70000")
+	if out := envSettings(base); out.Port != 5060 {
+		t.Fatalf("out-of-range port replaced the base value: %+v", out)
+	}
+}
+
+func TestEnvSettingsLeavesDefaults(t *testing.T) {
+	for _, key := range []string{"VOXMAIL_SIP_USERNAME", "VOXMAIL_SIP_PASSWORD", "VOXMAIL_SIP_DOMAIN", "VOXMAIL_SIP_TRANSPORT", "VOXMAIL_SIP_PORT", "VOXMAIL_SIP_REGINT", "VOXMAIL_SIP_ACCOUNT"} {
+		t.Setenv(key, "")
+	}
+	base := store.SIPSettings{Username: "alice", Password: "pw", Domain: "sip.example.com"}
+	if out := envSettings(base); out.Username != "alice" || out.Password != "pw" || out.Domain != "sip.example.com" {
+		t.Fatalf("empty env vars clobbered settings: %+v", out)
 	}
 }

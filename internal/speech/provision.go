@@ -15,6 +15,11 @@ const (
 	WhisperBaseENURL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin?download=true"
 )
 
+// maxModelDownload is a safety ceiling for anything Provision may fetch. The
+// largest legitimate artifact is whisper.cpp's ggml-base.en.bin at roughly
+// 150MB, so 4GiB only guards against a server returning garbage.
+const maxModelDownload = 4 << 30
+
 // Provision downloads only missing model files, writing each file atomically.
 // It is opt-in because model downloads are large and should be visible in
 // deployment logs.
@@ -57,9 +62,14 @@ func download(ctx context.Context, url, destination string) error {
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
-	if _, err = io.Copy(tmp, resp.Body); err != nil {
+	n, err := io.Copy(tmp, io.LimitReader(resp.Body, maxModelDownload))
+	if err != nil {
 		tmp.Close()
 		return err
+	}
+	if n >= maxModelDownload {
+		tmp.Close()
+		return fmt.Errorf("download model: file exceeds size limit")
 	}
 	if err = tmp.Chmod(0600); err != nil {
 		tmp.Close()

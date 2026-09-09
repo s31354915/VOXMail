@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -61,6 +62,7 @@ func (b *Baresip) Apply(ctx context.Context) error {
 
 func (b *Baresip) applyLocked(ctx context.Context) error {
 	settings := b.loadSettings(ctx)
+	settings = envSettings(settings)
 	envAccount := strings.TrimSpace(os.Getenv("VOXMAIL_SIP_ACCOUNT"))
 	enableCalls := os.Getenv("VOXMAIL_ENABLE_CALLS") == "1"
 
@@ -76,6 +78,44 @@ func (b *Baresip) applyLocked(ctx context.Context) error {
 		return err
 	}
 	return b.startLocked(ctx)
+}
+
+// envSettings lets deployment overlays supply SIP credentials without touching
+// the database. VOXMAIL_SIP_ACCOUNT remains supported as a ready-made account
+// line, while the individual variables map onto the normal settings fields.
+func envSettings(settings store.SIPSettings) store.SIPSettings {
+	if value := strings.TrimSpace(os.Getenv("VOXMAIL_SIP_USERNAME")); value != "" {
+		settings.Username = value
+	}
+	if value := os.Getenv("VOXMAIL_SIP_PASSWORD"); value != "" {
+		settings.Password = value
+	}
+	if value := strings.TrimSpace(os.Getenv("VOXMAIL_SIP_DOMAIN")); value != "" {
+		settings.Domain = value
+	}
+	if value := strings.TrimSpace(os.Getenv("VOXMAIL_SIP_TRANSPORT")); value != "" {
+		settings.Transport = value
+	}
+	if value := strings.TrimSpace(os.Getenv("VOXMAIL_SIP_PORT")); value != "" {
+		if port, err := strconv.Atoi(value); err == nil && port > 0 && port <= 65535 {
+			settings.Port = port
+		}
+	}
+	if value := strings.TrimSpace(os.Getenv("VOXMAIL_SIP_REGINT")); value != "" {
+		if regint, err := strconv.Atoi(value); err == nil && regint >= 0 {
+			settings.RegInterval = regint
+		}
+	}
+	return settings
+}
+
+// accountForLog redacts the auth_pass component so credentials never reach
+// logs while still showing which identity the UAC registered as.
+func accountForLog(account string) string {
+	if at := strings.Index(account, ";auth_pass="); at >= 0 {
+		account = account[:at]
+	}
+	return account
 }
 
 func (b *Baresip) loadSettings(ctx context.Context) store.SIPSettings {
@@ -112,6 +152,13 @@ func (b *Baresip) AccountLine() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.account
+}
+
+// Enabled reports whether baresip is currently meant to run.
+func (b *Baresip) Enabled() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.enabled
 }
 
 func (b *Baresip) writeConfig(settings store.SIPSettings, hasAccount bool) error {
@@ -211,7 +258,7 @@ func (b *Baresip) startLocked(ctx context.Context) error {
 	waitDone := make(chan struct{})
 	b.waitDone = waitDone
 	if b.Log != nil {
-		b.Log.Info("baresip started", "dir", b.ConfigDir, "account", b.account)
+		b.Log.Info("baresip started", "dir", b.ConfigDir, "account", accountForLog(b.account))
 	}
 	go func() {
 		_ = cmd.Wait()
@@ -234,7 +281,7 @@ func (b *Baresip) onExit(cmd *exec.Cmd) {
 	}
 	b.mu.Unlock()
 	if b.Log != nil && current {
-		b.Log.Warn("baresip exited; restarting", "account", b.account)
+		b.Log.Warn("baresip exited; restarting", "account", accountForLog(b.account))
 	}
 	if current {
 		b.respawn()
@@ -295,8 +342,8 @@ func buildAccount(settings store.SIPSettings) string {
 		transport = DefaultTransport
 	}
 	regint := settings.RegInterval
-	if regint < 0 {
-		regint = 0
+	if regint <= 0 {
+		regint = DefaultRegint
 	}
 	user := escapeParam(username)
 	password := escapeParam(settings.Password)

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end "killer" tests for VOXMail: build the image, run a throwaway
+# End-to-end tests for VOXMail: build the image, run a throwaway
 # container, hammer it over HTTP, restart it to prove state persistence, then
 # remove every trace (container, volume, image, the temp dir) on the way out.
 #
@@ -19,10 +19,6 @@ cleanup() {
   docker rm -f "$NAME" >/dev/null 2>&1
   docker volume rm -f "$VOLUME" >/dev/null 2>&1
   docker image rm -f "$IMAGE" >/dev/null 2>&1
-  docker container prune -f >/dev/null 2>&1
-  docker volume prune -f >/dev/null 2>&1
-  docker image prune -f >/dev/null 2>&1
-  docker system prune -f >/dev/null 2>&1
   rm -rf -- "$WORK"
   set -e
 }
@@ -54,7 +50,7 @@ wait_ready() {
 }
 wait_ready
 
-echo "== phase 1: API killer tests"
+echo "== phase 1: API tests"
 VOXMAIL_URL="http://127.0.0.1:$WEBPORT" go run "$ROOT/tests/e2e"
 
 echo "== phase 1.5: container internals"

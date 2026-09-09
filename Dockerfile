@@ -4,7 +4,7 @@
 # the images themselves stay lean.
 FROM debian:bookworm AS baresip-build
 ARG BARESIP_REF=v4.11.0
-ARG RE_REF=main
+ARG RE_REF=v4.11.0
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates git cmake make gcc g++ pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -67,7 +67,12 @@ COPY assets/welcome.wav /usr/local/share/voxmail/welcome.wav
 COPY assets/main-menu.wav /usr/local/share/voxmail/main-menu.wav
 COPY assets/static-prompts.json /usr/local/share/voxmail/static-prompts.json
 COPY scripts/entrypoint.sh /usr/local/bin/voxmail-entrypoint
-RUN chmod 0755 /usr/local/bin/voxmail-entrypoint && mkdir -p /data /data/logs && ldconfig
+RUN chmod 0755 /usr/local/bin/voxmail-entrypoint && \
+    useradd --system --uid 10001 --no-create-home voxmail && \
+    mkdir -p /data /data/logs /data/run/voxmail && \
+    chown -R voxmail:voxmail /data && \
+    ldconfig
+USER voxmail
 VOLUME ["/data"]
-EXPOSE 5060/udp 5060/tcp 8080/udp 8080/tcp
+EXPOSE 5060/udp 5060/tcp 8080/tcp
 ENTRYPOINT ["/usr/local/bin/voxmail-entrypoint"]

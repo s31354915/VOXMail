@@ -98,18 +98,21 @@ CREATE INDEX IF NOT EXISTS mail_alert_idx ON mail_messages(account_id, folder, i
 
 // ensureColumn adds a column to an existing table when the schema predates it.
 func (s *Store) ensureColumn(ctx context.Context, table, column, declaration string) error {
-	query := fmt.Sprintf(`SELECT COUNT(*) FROM pragma_table_info(%q) WHERE name = %q`, table, column)
 	var count int
-	if err := s.DB.QueryRowContext(ctx, query).Scan(&count); err != nil {
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&count); err != nil {
 		return err
 	}
 	if count > 0 {
 		return nil
 	}
-	statement := fmt.Sprintf(`ALTER TABLE %q ADD COLUMN %q %s`, table, column, declaration)
+	statement := fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, quoteIdent(table), quoteIdent(column), declaration)
 	_, err := s.DB.ExecContext(ctx, statement)
 	return err
 }
+
+// quoteIdent renders a SQLite identifier safely for use inside a literal ALTER
+// TABLE statement; identifiers cannot be bound as parameters.
+func quoteIdent(value string) string { return `"` + strings.ReplaceAll(value, `"`, `""`) + `"` }
 
 func (s *Store) Healthy(ctx context.Context) error { return s.DB.PingContext(ctx) }
 
@@ -509,8 +512,14 @@ func (s *Store) AddContact(ctx context.Context, contact Contact) error {
 	return err
 }
 func (s *Store) UpdateContact(ctx context.Context, contact Contact) error {
-	_, err := s.DB.ExecContext(ctx, `UPDATE contacts SET name=?, email=?, display_order=? WHERE id=? AND user_id=?`, contact.Name, contact.Email, contact.DisplayOrder, contact.ID, contact.UserID)
-	return err
+	res, err := s.DB.ExecContext(ctx, `UPDATE contacts SET name=?, email=?, display_order=? WHERE id=? AND user_id=?`, contact.Name, contact.Email, contact.DisplayOrder, contact.ID, contact.UserID)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 func (s *Store) ListContacts(ctx context.Context, userID string) ([]Contact, error) {
 	rows, err := s.DB.QueryContext(ctx, `SELECT id,user_id,name,email,display_order FROM contacts WHERE user_id=? ORDER BY display_order,name`, userID)

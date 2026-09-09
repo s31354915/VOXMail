@@ -41,7 +41,15 @@ type Service struct {
 	sessions map[string]*session
 	client   *bridge.Client
 	pending  []DialRequest
+	ctx      context.Context
+
+	pinMu   sync.Mutex
+	pinLock map[string]time.Time
 }
+
+// pinCooldown is how long a caller is locked out after failing the IVR PIN
+// three times, across separate sessions from the same number.
+const pinCooldown = 15 * time.Minute
 
 // DialRequest describes an outgoing call. Outgoing calls back a subscribed
 // phone number instead of admitting a caller, so the session is attached to
@@ -91,6 +99,7 @@ func (s *Service) hangup(callID string) error {
 type session struct {
 	CallID        string
 	UserID        string
+	Phone         string
 	PIN           string
 	Failures      int
 	Authenticated bool
@@ -306,6 +315,10 @@ func (p *PromptPlayer) playWAV(ctx context.Context, fifo, wav string) error {
 }
 
 func (s *Service) Run(ctx context.Context) error {
+	s.mu.Lock()
+	s.ctx = ctx
+	s.pinLock = make(map[string]time.Time)
+	s.mu.Unlock()
 	connected := false
 	for {
 		if err := s.runConnection(ctx); err != nil && !errors.Is(err, context.Canceled) {
@@ -322,6 +335,17 @@ func (s *Service) Run(ctx context.Context) error {
 		case <-time.After(time.Second):
 		}
 	}
+}
+
+// baseContext returns the service context (cancelled during shutdown) or
+// context.Background when the service has not been started yet.
+func (s *Service) baseContext() context.Context {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ctx != nil {
+		return s.ctx
+	}
+	return context.Background()
 }
 
 func (s *Service) runConnection(ctx context.Context) error {
@@ -342,7 +366,20 @@ func (s *Service) runConnection(ctx context.Context) error {
 		s.mu.Lock()
 		s.client = nil
 		s.pending = nil
+		sessions := s.sessions
+		s.sessions = make(map[string]*session)
 		s.mu.Unlock()
+		for _, sess := range sessions {
+			if sess == nil {
+				continue
+			}
+			s.mu.Lock()
+			sess.Closed = true
+			s.mu.Unlock()
+			if sess.Lease != nil {
+				sess.Lease.Release()
+			}
+		}
 	}()
 	reader := bufio.NewReader(conn)
 	for {
@@ -411,18 +448,35 @@ func (s *Service) onEstablished(message bridge.Message) {
 	}
 }
 
+// Healthy reports whether the call bridge is currently connected to baresip.
+func (s *Service) Healthy() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.client == nil {
+		return false
+	}
+	if s.ctx != nil && s.ctx.Err() != nil {
+		return false
+	}
+	return true
+}
+
 func (s *Service) admit(conn net.Conn, message bridge.Message) error {
 	if s.Store == nil {
 		return bridge.Encode(conn, bridge.Message{Type: "hangup", CallID: message.CallID, Code: 500, Reason: "server unavailable"})
 	}
-	user, err := s.Store.UserByPhone(context.Background(), normalizePhone(message.From))
+	phone := normalizePhone(message.From)
+	if locked := s.pinLockedUntil(phone); !locked.IsZero() {
+		return bridge.Encode(conn, bridge.Message{Type: "hangup", CallID: message.CallID, Code: 603, Reason: "caller is temporarily locked out"})
+	}
+	user, err := s.Store.UserByPhone(s.baseContext(), phone)
 	if err != nil || !user.Enabled {
 		return bridge.Encode(conn, bridge.Message{Type: "hangup", CallID: message.CallID, Code: 603, Reason: "caller not authorized"})
 	}
 	s.mu.Lock()
 	busy := s.MaxCalls > 0 && len(s.sessions) >= s.MaxCalls
 	if !busy {
-		s.sessions[message.CallID] = &session{CallID: message.CallID, UserID: user.ID, State: "pin", TxPath: message.TxPath, RxPath: message.RxPath}
+		s.sessions[message.CallID] = &session{CallID: message.CallID, UserID: user.ID, Phone: phone, State: "pin", TxPath: message.TxPath, RxPath: message.RxPath}
 	}
 	s.mu.Unlock()
 	if busy {
@@ -438,6 +492,44 @@ func (s *Service) admit(conn net.Conn, message bridge.Message) error {
 	}
 	s.mu.Unlock()
 	return nil
+}
+
+func (s *Service) pinLockedUntil(phone string) time.Time {
+	if phone == "" {
+		return time.Time{}
+	}
+	s.pinMu.Lock()
+	defer s.pinMu.Unlock()
+	if s.pinLock == nil {
+		s.pinLock = make(map[string]time.Time)
+	}
+	until := s.pinLock[phone]
+	if !until.IsZero() && time.Now().After(until) {
+		delete(s.pinLock, phone)
+		return time.Time{}
+	}
+	return until
+}
+
+func (s *Service) recordPinFailure(phone string) {
+	if phone == "" {
+		return
+	}
+	s.pinMu.Lock()
+	if s.pinLock == nil {
+		s.pinLock = make(map[string]time.Time)
+	}
+	s.pinLock[phone] = time.Now().Add(pinCooldown)
+	s.pinMu.Unlock()
+}
+
+func (s *Service) clearPinFailure(phone string) {
+	if phone == "" {
+		return
+	}
+	s.pinMu.Lock()
+	delete(s.pinLock, phone)
+	s.pinMu.Unlock()
 }
 
 // startOutgoing turns a call_outgoing event into a session. The pending dial
@@ -519,42 +611,57 @@ func (s *Service) greet(sess *session) {
 func (s *Service) handleDTMF(conn net.Conn, message bridge.Message) error {
 	s.mu.Lock()
 	sess := s.sessions[message.CallID]
-	s.mu.Unlock()
 	if sess == nil {
+		s.mu.Unlock()
 		return nil
 	}
 	if sess.Authenticated {
+		s.mu.Unlock()
 		return s.handleMenu(conn, sess, message)
 	}
 	if message.Digit == "*" {
 		sess.PIN = ""
+		s.mu.Unlock()
 		return nil
 	}
 	if message.Digit != "#" {
 		if len(sess.PIN) < 12 && len(message.Digit) == 1 && message.Digit[0] >= '0' && message.Digit[0] <= '9' {
 			sess.PIN += message.Digit
 		}
-		return nil
-	}
-	user, err := s.Store.UserByID(context.Background(), sess.UserID)
-	if err == nil && auth.Check(user.PINHash, sess.PIN) {
-		s.mu.Lock()
-		sess.Authenticated = true
-		sess.Failures = 0
 		s.mu.Unlock()
-		if s.Log != nil {
-			s.Log.Info("ivr PIN accepted", "call_id", message.CallID, "user_id", sess.UserID)
-		}
-		sess.State = "main"
-		s.prompt(sess, "You are signed in. Press 1 for unread mail, 2 for all mail, 3 for accounts, 4 for contacts, 5 to compose, or 6 for settings.")
 		return nil
 	}
-	sess.PIN = ""
-	sess.Failures++
-	if sess.Failures >= 3 {
-		return bridge.Encode(conn, bridge.Message{Type: "hangup", CallID: message.CallID, Code: 603, Reason: "PIN verification failed"})
+	userID, pin := sess.UserID, sess.PIN
+	s.mu.Unlock()
+	user, err := s.Store.UserByID(s.baseContext(), userID)
+	if err != nil || !auth.Check(user.PINHash, pin) {
+		s.mu.Lock()
+		sess.PIN = ""
+		sess.Failures++
+		if sess.Failures >= 3 {
+			phone := sess.Phone
+			s.mu.Unlock()
+			s.recordPinFailure(phone)
+			if s.Log != nil {
+				s.Log.Warn("ivr PIN locked out", "call_id", message.CallID, "phone", phone)
+			}
+			return bridge.Encode(conn, bridge.Message{Type: "hangup", CallID: message.CallID, Code: 603, Reason: "PIN verification failed"})
+		}
+		s.mu.Unlock()
+		s.prompt(sess, "That PIN was not accepted. Try again, or press star to clear.")
+		return nil
 	}
-	s.prompt(sess, "That PIN was not accepted. Try again, or press star to clear.")
+	s.mu.Lock()
+	sess.Authenticated = true
+	sess.Failures = 0
+	sess.State = "main"
+	phone := sess.Phone
+	s.mu.Unlock()
+	s.clearPinFailure(phone)
+	if s.Log != nil {
+		s.Log.Info("ivr PIN accepted", "call_id", message.CallID, "user_id", sess.UserID)
+	}
+	s.prompt(sess, "You are signed in. Press 1 for unread mail, 2 for all mail, 3 for accounts, 4 for contacts, 5 to compose, or 6 for settings.")
 	return nil
 }
 
@@ -577,7 +684,7 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 	if key == "#" {
 		s.mu.Lock()
 		switch sess.State {
-		case "compose", "accounts", "contacts", "settings":
+		case "accounts", "contacts", "settings":
 			sess.State = "main"
 		case "list":
 			if sess.ActiveAccount != "" {
@@ -600,11 +707,14 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 		s.prompt(sess, menuPrompt(sess.State))
 		return nil
 	}
-	switch sess.State {
+	s.mu.Lock()
+	state := sess.State
+	s.mu.Unlock()
+	switch state {
 	case "main":
 		switch key {
 		case "1", "2":
-			mails, err := s.Store.ListMail(context.Background(), sess.UserID, key == "1")
+			mails, err := s.Store.ListMail(s.baseContext(), sess.UserID, key == "1")
 			if err != nil {
 				s.prompt(sess, "Mail is temporarily unavailable.")
 				return nil
@@ -710,8 +820,6 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 			s.mu.Unlock()
 			s.prompt(sess, menuPrompt("list"))
 		}
-	case "compose", "subject", "body":
-		s.handleCompose(sess, key)
 	case "review":
 		if key == "1" {
 			s.sendDraft(sess)
@@ -729,7 +837,7 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 }
 
 func (s *Service) openAccounts(sess *session) {
-	accounts, err := s.Store.ListAccounts(context.Background(), sess.UserID)
+	accounts, err := s.Store.ListAccounts(s.baseContext(), sess.UserID)
 	if err != nil || len(accounts) == 0 {
 		s.prompt(sess, "No mail accounts are configured.")
 		return
@@ -755,7 +863,7 @@ func (s *Service) handleAccountMenu(sess *session, key string) {
 	account := sess.Accounts[index]
 	sess.ActiveAccount = account.ID
 	s.mu.Unlock()
-	folders, err := s.Store.ListMailFolders(context.Background(), sess.UserID, account.ID)
+	folders, err := s.Store.ListMailFolders(s.baseContext(), sess.UserID, account.ID)
 	if err != nil {
 		s.prompt(sess, "Folders are temporarily unavailable.")
 		return
@@ -802,7 +910,7 @@ func (s *Service) handleFolderMenu(sess *session, key string) {
 	folder := sess.Folders[index]
 	accountID := sess.ActiveAccount
 	s.mu.Unlock()
-	mails, err := s.Store.ListMailForAccount(context.Background(), sess.UserID, accountID, folder, false)
+	mails, err := s.Store.ListMailForAccount(s.baseContext(), sess.UserID, accountID, folder, false)
 	if err != nil {
 		s.prompt(sess, "Mail is temporarily unavailable.")
 		return
@@ -818,7 +926,7 @@ func (s *Service) handleFolderMenu(sess *session, key string) {
 }
 
 func (s *Service) openContacts(sess *session) {
-	contacts, err := s.Store.ListContacts(context.Background(), sess.UserID)
+	contacts, err := s.Store.ListContacts(s.baseContext(), sess.UserID)
 	if err != nil || len(contacts) == 0 {
 		s.prompt(sess, "You have no contacts.")
 		return
@@ -852,12 +960,12 @@ func (s *Service) handleSettingsMenu(sess *session, key string) {
 		s.prompt(sess, "Voice model and speech speed are managed in the web console.")
 	case "2":
 		var enabled int
-		if err := s.Store.DB.QueryRowContext(context.Background(), `SELECT alerts_enabled FROM settings WHERE user_id=?`, sess.UserID).Scan(&enabled); err != nil {
+		if err := s.Store.DB.QueryRowContext(s.baseContext(), `SELECT alerts_enabled FROM settings WHERE user_id=?`, sess.UserID).Scan(&enabled); err != nil {
 			s.prompt(sess, "Alert settings are unavailable.")
 			return
 		}
 		enabled = 1 - enabled
-		if _, err := s.Store.DB.ExecContext(context.Background(), `UPDATE settings SET alerts_enabled=? WHERE user_id=?`, enabled, sess.UserID); err != nil {
+		if _, err := s.Store.DB.ExecContext(s.baseContext(), `UPDATE settings SET alerts_enabled=? WHERE user_id=?`, enabled, sess.UserID); err != nil {
 			s.prompt(sess, "Alert settings could not be changed.")
 			return
 		}
@@ -1039,7 +1147,9 @@ func (s *Service) readMessage(sess *session, m store.MailSummary) {
 	}
 	parsed, err := mailparse.Parse(file)
 	_ = file.Close()
-	_ = s.Store.MarkMailRead(context.Background(), sess.UserID, m.ID, true)
+	if err := s.Store.MarkMailRead(s.baseContext(), sess.UserID, m.ID, true); err != nil && s.Log != nil {
+		s.Log.Warn("ivr could not mark mail read", "error", err)
+	}
 	if err != nil {
 		s.prompt(sess, "I could not read that message.")
 		return
@@ -1075,7 +1185,7 @@ func (s *Service) deleteCurrent(sess *session) {
 		return
 	}
 	trashName := "Trash"
-	if accounts, err := s.Store.ListAccounts(context.Background(), sess.UserID); err == nil {
+	if accounts, err := s.Store.ListAccounts(s.baseContext(), sess.UserID); err == nil {
 		for _, account := range accounts {
 			if account.ID != m.AccountID {
 				continue
@@ -1105,7 +1215,7 @@ func (s *Service) deleteCurrent(sess *session) {
 	}
 	err := os.Rename(pathAbs, target)
 	if err == nil {
-		if indexErr := s.Store.DeleteMailIndex(context.Background(), sess.UserID, m.ID); indexErr != nil {
+		if indexErr := s.Store.DeleteMailIndex(s.baseContext(), sess.UserID, m.ID); indexErr != nil {
 			err = indexErr
 		}
 	}
@@ -1128,7 +1238,7 @@ func (s *Service) sendDraft(sess *session) {
 		s.prompt(sess, "That recipient is not valid.")
 		return
 	}
-	accounts, err := s.Store.ListAccounts(context.Background(), sess.UserID)
+	accounts, err := s.Store.ListAccounts(s.baseContext(), sess.UserID)
 	if err != nil || len(accounts) == 0 || s.Secrets == nil {
 		s.prompt(sess, "No sending account is configured.")
 		return

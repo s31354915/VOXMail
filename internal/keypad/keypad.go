@@ -24,9 +24,9 @@ var groups = map[byte]string{
 	'4': "ghi4",
 	'5': "jkl5",
 	'6': "mno6",
-	'7': "p q r s 7",
-	'8': "t u v 8",
-	'9': "w x y z 9",
+	'7': "pqrs7",
+	'8': "tuv8",
+	'9': "wxyz9",
 	'0': "0 ",
 }
 

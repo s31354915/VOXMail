@@ -3,14 +3,20 @@ package speech
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 )
+
+// piperStallTimeout is how long synthesize waits for the output file to appear
+// or grow before declaring the worker stalled and recycling it.
+const piperStallTimeout = 2 * time.Minute
 
 type piperWorker struct {
 	cmd    *exec.Cmd
@@ -68,34 +74,82 @@ func (w *piperWorker) synthesize(ctx context.Context, text, output string) error
 	if w.closed {
 		return fmt.Errorf("piper worker is closed")
 	}
-	if err := writeWithContext(ctx, w.stdin, request); err != nil {
+	if err := w.writeWithContext(ctx, request); err != nil {
 		return err
 	}
-	ticker := time.NewTicker(10 * time.Millisecond)
+	lastSize := int64(-1)
+	lastProgress := time.Now()
+	if info, err := os.Stat(output); err == nil {
+		lastSize = info.Size()
+	}
+	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if info, err := os.Stat(output); err == nil && info.Size() > 44 {
-			return nil
-		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
 		}
+		info, err := os.Stat(output)
+		if err == nil && info.Size() > 44 {
+			return nil
+		}
+		size := int64(0)
+		if err == nil {
+			size = info.Size()
+		}
+		if size != lastSize {
+			lastProgress = time.Now()
+			lastSize = size
+			continue
+		}
+		if time.Since(lastProgress) > piperStallTimeout {
+			w.killLocked()
+			return errors.New("piper worker stalled")
+		}
+		if !w.aliveLocked() {
+			return errors.New("piper worker exited")
+		}
 	}
 }
 
-func writeWithContext(ctx context.Context, writer io.Writer, data []byte) error {
-	done := make(chan error, 1)
+// writeWithContext writes to the worker's stdin without leaking a goroutine:
+// if the request is cancelled while the pipe is full, the pending write is
+// released by closing the pipe and the worker is marked unusable.
+func (w *piperWorker) writeWithContext(ctx context.Context, data []byte) error {
+	written := make(chan error, 1)
 	go func() {
-		_, err := writer.Write(data)
-		done <- err
+		_, err := w.stdin.Write(data)
+		written <- err
 	}()
 	select {
-	case err := <-done:
+	case err := <-written:
 		return err
 	case <-ctx.Done():
+		w.killLocked()
+		<-written
 		return ctx.Err()
+	}
+}
+
+func (w *piperWorker) aliveLocked() bool {
+	if w.cmd == nil || w.cmd.Process == nil {
+		return false
+	}
+	err := w.cmd.Process.Signal(syscall.Signal(0))
+	return err == nil
+}
+
+func (w *piperWorker) killLocked() {
+	if w.closed {
+		return
+	}
+	w.closed = true
+	if w.stdin != nil {
+		_ = w.stdin.Close()
+	}
+	if w.cmd != nil && w.cmd.Process != nil {
+		_ = w.cmd.Process.Kill()
 	}
 }
 
@@ -104,13 +158,20 @@ func (w *piperWorker) close() {
 		return
 	}
 	w.mu.Lock()
-	if w.closed {
-		w.mu.Unlock()
+	alreadyClosed := w.closed
+	if !alreadyClosed {
+		w.closed = true
+		if w.stdin != nil {
+			_ = w.stdin.Close()
+		}
+	}
+	w.mu.Unlock()
+	if w.cmd == nil {
 		return
 	}
-	w.closed = true
-	_ = w.stdin.Close()
-	w.mu.Unlock()
+	if !alreadyClosed && w.cmd.Process != nil {
+		_ = w.cmd.Process.Kill()
+	}
 	done := make(chan struct{})
 	go func() {
 		_ = w.cmd.Wait()
@@ -119,7 +180,5 @@ func (w *piperWorker) close() {
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		_ = w.cmd.Process.Kill()
-		<-done
 	}
 }

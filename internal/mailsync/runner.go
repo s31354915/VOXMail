@@ -32,13 +32,22 @@ func (r Runner) Sync(ctx context.Context, configPath, channel string) (Result, e
 	defer cancel()
 	cmd := exec.CommandContext(work, r.Binary, "--config", configPath, "--ext-exit", channel)
 	output, err := cmd.CombinedOutput()
+	code := 0
+	if cmd.ProcessState != nil {
+		code = cmd.ProcessState.ExitCode()
+	}
+	// --ext-exit ORs 32/64 in when the near/far side changed. Those are
+	// success indicators, not errors; keep the logic here so callers can
+	// trigger indexing only when work actually occurred.
+	changed := code&96 != 0
 	if work.Err() != nil {
-		return Result{Account: channel, Output: output}, work.Err()
+		return Result{Account: channel, Output: output, Changed: changed}, work.Err()
 	}
-	if err != nil {
-		return Result{Account: channel, Output: output}, fmt.Errorf("mbsync %s: %w: %s", channel, err, output)
+	if err == nil {
+		return Result{Account: channel, Output: output}, nil
 	}
-	// --ext-exit adds 32/64 when the far/near side changed. Keep this logic
-	// here so callers can trigger indexing only when work actually occurred.
-	return Result{Account: channel, Output: output, Changed: cmd.ProcessState.ExitCode()&96 != 0}, nil
+	if changed {
+		return Result{Account: channel, Output: output, Changed: true}, nil
+	}
+	return Result{Account: channel, Output: output}, fmt.Errorf("mbsync %s: %w: %s", channel, err, output)
 }

@@ -1,7 +1,8 @@
 .PHONY: test build run
 
 test:
-	go test ./...
+	go vet ./...
+	go test -race -count=1 ./...
 
 build:
 	CGO_ENABLED=1 go build -trimpath -o bin/voxmail ./cmd/voxmail

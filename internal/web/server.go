@@ -12,6 +12,8 @@ import (
 	"net"
 	"net/http"
 	"net/mail"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,6 +47,8 @@ type Server struct {
 	Sessions *SessionStore
 	SIP      SIPController
 	Alerts   AlertService
+	DataRoot string
+	Ready    func(context.Context) error
 	loginMu  sync.Mutex
 	logins   map[string]loginState
 }
@@ -52,11 +56,13 @@ type Server struct {
 type loginState struct {
 	Failures int
 	Until    time.Time
+	Seen     time.Time
 }
 
 type SessionStore struct {
-	mu      sync.Mutex
-	byToken map[string]Session
+	mu       sync.Mutex
+	byToken  map[string]Session
+	lastReap time.Time
 }
 
 type Session struct {
@@ -143,7 +149,7 @@ func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = s.Store.Audit(r.Context(), id, "setup_completed", "")
-	s.issueSession(w, id)
+	s.issueSession(w, r, id)
 	writeJSON(w, http.StatusCreated, publicUser(u))
 }
 
@@ -176,7 +182,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.loginSuccess(loginKey)
-	s.issueSession(w, u.ID)
+	s.issueSession(w, r, u.ID)
 	writeJSON(w, http.StatusOK, publicUser(u))
 }
 
@@ -430,6 +436,15 @@ func (s *Server) deleteAccount(w http.ResponseWriter, r *http.Request) {
 			serverError(w, err)
 			return
 		}
+		if s.DataRoot != "" {
+			root := filepath.Join(s.DataRoot, "mail")
+			maildir := filepath.Join(root, r.PathValue("id"))
+			if rel, err := filepath.Rel(root, maildir); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				if err := os.RemoveAll(maildir); err != nil && s.log() != nil {
+					s.log().Warn("could not remove account maildir", "path", maildir, "error", err)
+				}
+			}
+		}
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
@@ -471,13 +486,64 @@ func (s *Server) testAccount(w http.ResponseWriter, r *http.Request) {
 	if port == 0 {
 		port = 993
 	}
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(account.IMAPHost, strconv.Itoa(port)), 5*time.Second)
-	if err != nil {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	if err := ssrfSafeDial(ctx, account.IMAPHost, port); err != nil {
 		writeError(w, http.StatusBadGateway, "connection failed")
 		return
 	}
-	_ = conn.Close()
 	writeJSON(w, http.StatusOK, map[string]string{"status": "reachable"})
+}
+
+// ssrfSafeDial resolves host and connects to a validated, globally routable
+// address so the glance test can never be redirected at loopback, private,
+// link-local, metadata, or CGNAT ranges.
+func ssrfSafeDial(ctx context.Context, host string, port int) error {
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return err
+	}
+	var dialErr error
+	for _, resolved := range ips {
+		if ssrfBlocked(resolved.IP) {
+			continue
+		}
+		deadline, _ := ctx.Deadline()
+		timeout := 5 * time.Second
+		if remaining := time.Until(deadline); remaining > 0 {
+			timeout = remaining
+		}
+		conn, dialErr := net.DialTimeout("tcp", net.JoinHostPort(resolved.IP.String(), strconv.Itoa(port)), timeout)
+		if dialErr == nil {
+			return conn.Close()
+		}
+	}
+	if len(ips) == 0 {
+		return errors.New("no addresses resolved")
+	}
+	if dialErr != nil {
+		return dialErr
+	}
+	return errors.New("host resolves only to blocked addresses")
+}
+
+func ssrfBlocked(ip net.IP) bool {
+	if ip4 := ip.To4(); ip4 != nil {
+		ip = ip4
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return true
+	}
+	if v4 := ip.To4(); v4 != nil {
+		if v4[0] == 0 || v4[0] >= 224 {
+			return true
+		}
+		if v4[0] == 100 && v4[1]&0xc0 == 0x40 {
+			return true
+		}
+		return false
+	}
+	return false
 }
 
 func (s *Server) contacts(w http.ResponseWriter, r *http.Request) {
@@ -530,6 +596,10 @@ func (s *Server) updateContact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.Store.UpdateContact(r.Context(), c); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusBadRequest, "contact not found")
+			return
+		}
 		serverError(w, err)
 		return
 	}
@@ -642,7 +712,7 @@ func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
 		body.EmailSpeed = 2
 	}
 	body.TTSVoice = strings.TrimSpace(body.TTSVoice)
-	if body.TTSVoice == "" || strings.ContainsAny(body.TTSVoice, `/\\\x00\r\n`) || strings.Contains(body.TTSVoice, "..") {
+	if body.TTSVoice == "" || strings.ContainsAny(body.TTSVoice, "/\\\x00\r\n") || strings.Contains(body.TTSVoice, "..") {
 		writeError(w, http.StatusBadRequest, "invalid voice model")
 		return
 	}
@@ -806,6 +876,12 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not_ready"})
 		return
 	}
+	if s.Ready != nil {
+		if err := s.Ready(ctx); err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not_ready", "reason": "bridge unavailable"})
+			return
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 func (s *Server) apiInfo(w http.ResponseWriter, r *http.Request) {
@@ -854,11 +930,12 @@ func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) (store.Use
 	}
 	return u, true
 }
-func (s *Server) issueSession(w http.ResponseWriter, userID string) {
+func (s *Server) issueSession(w http.ResponseWriter, r *http.Request, userID string) {
 	token := newID()
 	csrf := newID()
 	s.Sessions.Put(token, Session{UserID: userID, CSRF: csrf, Expires: time.Now().Add(12 * time.Hour)})
-	http.SetCookie(w, &http.Cookie{Name: "voxmail_session", Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: 43200})
+	secure := r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+	http.SetCookie(w, &http.Cookie{Name: "voxmail_session", Value: token, Path: "/", HttpOnly: true, Secure: secure, SameSite: http.SameSiteStrictMode, MaxAge: 43200})
 	w.Header().Set("X-CSRF-Token", csrf)
 }
 func sessionToken(r *http.Request) string {
@@ -872,6 +949,7 @@ func (s *SessionStore) Put(token string, session Session) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.byToken[token] = session
+	s.reapLocked()
 }
 func (s *SessionStore) Get(token string) (Session, bool) {
 	s.mu.Lock()
@@ -881,6 +959,7 @@ func (s *SessionStore) Get(token string) (Session, bool) {
 		delete(s.byToken, token)
 		return Session{}, false
 	}
+	s.reapLocked()
 	return session, true
 }
 func (s *SessionStore) Delete(token string) {
@@ -888,13 +967,23 @@ func (s *SessionStore) Delete(token string) {
 	defer s.mu.Unlock()
 	delete(s.byToken, token)
 }
+func (s *SessionStore) reapLocked() {
+	if len(s.byToken) < 256 || time.Since(s.lastReap) < time.Minute {
+		return
+	}
+	s.lastReap = time.Now()
+	now := time.Now()
+	for token, session := range s.byToken {
+		if now.After(session.Expires) {
+			delete(s.byToken, token)
+		}
+	}
+}
 
 func (s *Server) loginBlocked(key string) time.Duration {
 	s.loginMu.Lock()
 	defer s.loginMu.Unlock()
-	if s.logins == nil {
-		s.logins = make(map[string]loginState)
-	}
+	s.reapLoginsLocked()
 	state := s.logins[key]
 	if time.Now().Before(state.Until) {
 		return time.Until(state.Until)
@@ -905,11 +994,13 @@ func (s *Server) loginBlocked(key string) time.Duration {
 func (s *Server) loginFailure(key string) {
 	s.loginMu.Lock()
 	defer s.loginMu.Unlock()
+	s.reapLoginsLocked()
 	if s.logins == nil {
 		s.logins = make(map[string]loginState)
 	}
 	state := s.logins[key]
 	state.Failures++
+	state.Seen = time.Now()
 	if state.Failures >= 5 {
 		state.Until = time.Now().Add(5 * time.Minute)
 		state.Failures = 0
@@ -921,6 +1012,18 @@ func (s *Server) loginSuccess(key string) {
 	s.loginMu.Lock()
 	defer s.loginMu.Unlock()
 	delete(s.logins, key)
+}
+
+func (s *Server) reapLoginsLocked() {
+	if len(s.logins) < 256 {
+		return
+	}
+	cutoff := time.Now().Add(-1 * time.Hour)
+	for key, state := range s.logins {
+		if state.Seen.Before(cutoff) && !time.Now().Before(state.Until) {
+			delete(s.logins, key)
+		}
+	}
 }
 func publicUser(u store.User) map[string]any {
 	return map[string]any{"id": u.ID, "username": u.Username, "role": u.Role, "enabled": u.Enabled, "two_factor_enabled": u.TOTPSecret != ""}
@@ -983,6 +1086,7 @@ func withSecurityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; frame-src 'none'; media-src 'none'; object-src 'none'")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -997,6 +1101,9 @@ func parseID(value string) int64 {
 	var id int64
 	for _, r := range value {
 		if r < '0' || r > '9' {
+			return 0
+		}
+		if id > (1<<53-9)/10 {
 			return 0
 		}
 		id = id*10 + int64(r-'0')

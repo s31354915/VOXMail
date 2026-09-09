@@ -2,7 +2,6 @@ package speech
 
 import (
 	"html"
-	"net/url"
 	"regexp"
 	"strings"
 )
@@ -15,7 +14,7 @@ var (
 	urlRE      = regexp.MustCompile(`(?i)\bhttps?://[^\s<>]+`)
 	emailRE    = regexp.MustCompile(`(?i)\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b`)
 	percentRE  = regexp.MustCompile(`\b(\d+(?:\.\d+)?)%`)
-	currencyRE = regexp.MustCompile(`([$€£])\s?(\d+(?:[.,]\d{2})?)`)
+	currencyRE = regexp.MustCompile(`([$€££])\s?(\d+(?:[.,]\d{1,2})?)`)
 	phoneRE    = regexp.MustCompile(`(?:\+?\d[\d .()\-]{6,}\d)`)
 )
 
@@ -26,17 +25,10 @@ func EmailToSpeech(input string) string {
 	input = garbageRE.ReplaceAllString(input, " ")
 	input = anchorRE.ReplaceAllString(input, "link $1")
 	input = tagRE.ReplaceAllString(input, " ")
-	input = urlRE.ReplaceAllStringFunc(input, func(raw string) string {
-		if parsed, err := url.Parse(raw); err == nil && parsed.Host != "" {
-			return "link"
-		}
-		return "link"
-	})
+	input = urlRE.ReplaceAllString(input, " link ")
 	input = emailRE.ReplaceAllStringFunc(input, spellEmail)
 	input = percentRE.ReplaceAllString(input, `$1 percent`)
-	input = currencyRE.ReplaceAllStringFunc(input, func(raw string) string {
-		return strings.ReplaceAll(raw, ".", " point ")
-	})
+	input = currencyRE.ReplaceAllStringFunc(input, speakCurrency)
 	input = phoneRE.ReplaceAllStringFunc(input, groupDigits)
 	input = spaceRE.ReplaceAllString(input, " ")
 	return strings.TrimSpace(input)
@@ -49,6 +41,20 @@ func spellEmail(value string) string {
 	value = strings.ReplaceAll(value, "-", " dash ")
 	value = strings.ReplaceAll(value, "_", " underscore ")
 	return value
+}
+
+func speakCurrency(raw string) string {
+	kind := map[string]string{"$": "dollars", "€": "euros", "£": "pounds"}
+	body := raw[1:]
+	if i := strings.IndexAny(body, ".,"); i >= 0 {
+		major := strings.ReplaceAll(body[:i], ",", " ")
+		minor := strings.TrimLeft(body[i+1:], "0")
+		if minor == "" {
+			return major + " " + kind[raw[:1]]
+		}
+		return major + " " + kind[raw[:1]] + " and " + minor + " cents"
+	}
+	return strings.ReplaceAll(body, ",", " ") + " " + kind[raw[:1]]
 }
 
 func groupDigits(value string) string {
