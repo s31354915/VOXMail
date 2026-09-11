@@ -32,7 +32,11 @@ if [ -f /data/run/voxmail.pid ]; then
   stale_pid="$(cat /data/run/voxmail.pid 2>/dev/null || true)"
   case "$stale_pid" in
     ''|*[!0-9]*) ;;
-    *) kill "$stale_pid" 2>/dev/null || true ;;
+    *)
+      if [ -r "/proc/$stale_pid/cmdline" ] && tr '\000' ' ' < "/proc/$stale_pid/cmdline" | grep -Fq '/usr/local/bin/voxmail'; then
+        kill "$stale_pid" 2>/dev/null || true
+      fi
+      ;;
   esac
   rm -f /data/run/voxmail.pid
 fi
