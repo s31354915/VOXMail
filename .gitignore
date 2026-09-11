@@ -6,3 +6,6 @@
 *.db-wal
 .env
 b.pid
+# Runtime-only draft attachment files created when tests use the default
+# working-directory data root.
+/internal/calls/drafts/
