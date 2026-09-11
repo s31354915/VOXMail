@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/voxmail/voxmail/internal/secret"
@@ -28,6 +29,32 @@ type fakeAlerts struct {
 func (f *fakeAlerts) TestAlert(context.Context, string) error {
 	f.calls++
 	return nil
+}
+
+func TestNormalizeAlertFoldersUsesLocalInboxByDefault(t *testing.T) {
+	if got := normalizeAlertFolders(nil, map[string]string{"INBOX": "Inbox"}); len(got) != 1 || got[0] != "Inbox" {
+		t.Fatalf("default mapped folders=%v", got)
+	}
+	got := normalizeAlertFolders([]string{"INBOX", "Inbox", "Junk"}, map[string]string{"INBOX": "Inbox", "Junk": "Spam"})
+	if len(got) != 2 || got[0] != "Inbox" || got[1] != "Spam" {
+		t.Fatalf("normalized folders=%v", got)
+	}
+}
+
+func TestSecurityHeadersAllowOnlyGeneratedPreviewMedia(t *testing.T) {
+	db, err := store.Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	box, _ := secret.New("test-key-with-more-than-32-characters-123456")
+	h := (&Server{Store: db, Secrets: box}).Handler()
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	policy := recorder.Header().Get("Content-Security-Policy")
+	if !strings.Contains(policy, "media-src 'self' blob:") || strings.Contains(policy, "media-src 'none'") {
+		t.Fatalf("unexpected media policy: %q", policy)
+	}
 }
 
 func TestTestAlertEndpoint(t *testing.T) {
@@ -56,8 +83,137 @@ func TestTestAlertEndpoint(t *testing.T) {
 	if alerts.calls != 1 {
 		t.Fatalf("alert service invoked %d times, want 1", alerts.calls)
 	}
+	request = httptest.NewRequest(http.MethodPut, "/api/v1/admin/alerts", bytes.NewBufferString(`{"available":false}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-CSRF-Token", csrf)
+	for _, cookie := range cookies {
+		request.AddCookie(cookie)
+	}
+	recorder = httptest.NewRecorder()
+	h.ServeHTTP(recorder, request)
+	if response := recorder.Result(); response.StatusCode != http.StatusOK {
+		t.Fatalf("global alert disable status %d", response.StatusCode)
+	}
+	request = httptest.NewRequest(http.MethodPost, "/api/v1/alerts/test", nil)
+	request.Header.Set("X-CSRF-Token", csrf)
+	for _, cookie := range cookies {
+		request.AddCookie(cookie)
+	}
+	recorder = httptest.NewRecorder()
+	h.ServeHTTP(recorder, request)
+	if response := recorder.Result(); response.StatusCode != http.StatusNotFound {
+		t.Fatalf("disabled alert endpoint status %d, want 404", response.StatusCode)
+	}
+	request = httptest.NewRequest(http.MethodPost, "/api/v1/users", bytes.NewBufferString(`{"username":"ordinary","password":"another-strong-password","pin":"5678"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-CSRF-Token", csrf)
+	for _, cookie := range cookies {
+		request.AddCookie(cookie)
+	}
+	recorder = httptest.NewRecorder()
+	h.ServeHTTP(recorder, request)
+	if response := recorder.Result(); response.StatusCode != http.StatusCreated {
+		t.Fatalf("ordinary user creation status %d", response.StatusCode)
+	}
+
+	request = httptest.NewRequest(http.MethodPost, "/api/v1/login", bytes.NewBufferString(`{"username":"ordinary","password":"another-strong-password"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder = httptest.NewRecorder()
+	h.ServeHTTP(recorder, request)
+	loginResponse := recorder.Result()
+	if loginResponse.StatusCode != http.StatusOK {
+		t.Fatalf("ordinary user login status %d", loginResponse.StatusCode)
+	}
+	userCSRF := loginResponse.Header.Get("X-CSRF-Token")
+	userCookies := loginResponse.Cookies()
+	request = httptest.NewRequest(http.MethodGet, "/api/v1/settings", nil)
+	for _, cookie := range userCookies {
+		request.AddCookie(cookie)
+	}
+	recorder = httptest.NewRecorder()
+	h.ServeHTTP(recorder, request)
+	if response := recorder.Result(); response.StatusCode != http.StatusOK {
+		t.Fatalf("ordinary user settings status %d", response.StatusCode)
+	} else {
+		var settings map[string]any
+		if err := json.NewDecoder(response.Body).Decode(&settings); err != nil {
+			t.Fatal(err)
+		}
+		if _, exists := settings["alerts_enabled"]; exists {
+			t.Fatal("disabled alert controls leaked alerts_enabled to ordinary user")
+		}
+		if _, exists := settings["alert_phone"]; exists {
+			t.Fatal("disabled alert controls leaked alert_phone to ordinary user")
+		}
+	}
+	request = httptest.NewRequest(http.MethodGet, "/api/v1/alert-numbers", nil)
+	for _, cookie := range userCookies {
+		request.AddCookie(cookie)
+	}
+	recorder = httptest.NewRecorder()
+	h.ServeHTTP(recorder, request)
+	if response := recorder.Result(); response.StatusCode != http.StatusNotFound {
+		t.Fatalf("ordinary user alert-number status %d, want 404", response.StatusCode)
+	}
+	request = httptest.NewRequest(http.MethodGet, "/api/v1/voices", nil)
+	for _, cookie := range userCookies {
+		request.AddCookie(cookie)
+	}
+	recorder = httptest.NewRecorder()
+	h.ServeHTTP(recorder, request)
+	if response := recorder.Result(); response.StatusCode != http.StatusOK {
+		t.Fatalf("ordinary user voices status %d", response.StatusCode)
+	}
+	request = httptest.NewRequest(http.MethodPost, "/api/v1/voices/install", bytes.NewBufferString(`{"voice":"en_US-hfc_male-medium"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-CSRF-Token", userCSRF)
+	for _, cookie := range userCookies {
+		request.AddCookie(cookie)
+	}
+	recorder = httptest.NewRecorder()
+	h.ServeHTTP(recorder, request)
+	if response := recorder.Result(); response.StatusCode != http.StatusForbidden {
+		t.Fatalf("ordinary user voice install status %d, want 403", response.StatusCode)
+	}
+	request = httptest.NewRequest(http.MethodPut, "/api/v1/settings", bytes.NewBufferString(`{"tts_voice":"en_US-hfc_male-medium","alerts_enabled":true,"alert_phone":"+15551234567"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-CSRF-Token", userCSRF)
+	for _, cookie := range userCookies {
+		request.AddCookie(cookie)
+	}
+	recorder = httptest.NewRecorder()
+	h.ServeHTTP(recorder, request)
+	if response := recorder.Result(); response.StatusCode != http.StatusOK {
+		t.Fatalf("ordinary user settings save status %d", response.StatusCode)
+	}
+	var saved map[string]any
+	if err := json.NewDecoder(recorder.Result().Body).Decode(&saved); err != nil {
+		t.Fatal(err)
+	}
+	if enabled, _ := saved["alerts_enabled"].(bool); enabled {
+		t.Fatal("ordinary user could enable globally disabled alerts")
+	}
+	if _, exists := saved["alert_phone"]; exists {
+		t.Fatal("ordinary user response exposed alert_phone while alerts were disabled")
+	}
+	request = httptest.NewRequest(http.MethodPut, "/api/v1/admin/alerts", bytes.NewBufferString(`{"available":true}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-CSRF-Token", csrf)
+	for _, cookie := range cookies {
+		request.AddCookie(cookie)
+	}
+	recorder = httptest.NewRecorder()
+	h.ServeHTTP(recorder, request)
+	if response := recorder.Result(); response.StatusCode != http.StatusOK {
+		t.Fatalf("global alert enable status %d", response.StatusCode)
+	}
 
 	svc.Alerts = nil
+	request = httptest.NewRequest(http.MethodPost, "/api/v1/alerts/test", nil)
+	request.Header.Set("X-CSRF-Token", csrf)
+	for _, cookie := range cookies {
+		request.AddCookie(cookie)
+	}
 	recorder = httptest.NewRecorder()
 	h.ServeHTTP(recorder, request)
 	if response := recorder.Result(); response.StatusCode != http.StatusServiceUnavailable {

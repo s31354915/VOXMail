@@ -10,12 +10,13 @@ import (
 
 // Account is the non-secret portion needed to generate an mbsync channel.
 type Account struct {
-	ID          string
-	IMAPHost    string
-	IMAPPort    int
-	IMAPUser    string
-	MaildirRoot string
-	FolderMap   map[string]string
+	ID           string
+	IMAPHost     string
+	IMAPPort     int
+	IMAPSecurity string
+	IMAPUser     string
+	MaildirRoot  string
+	FolderMap    map[string]string
 }
 
 // Generate creates a channel that mirrors every existing remote folder while
@@ -27,6 +28,13 @@ func Generate(a Account) (string, error) {
 	}
 	if a.IMAPPort == 0 {
 		a.IMAPPort = 993
+	}
+	security := strings.ToUpper(strings.TrimSpace(a.IMAPSecurity))
+	if security == "" {
+		security = "IMAPS"
+	}
+	if security != "IMAPS" && security != "STARTTLS" {
+		return "", fmt.Errorf("unsupported IMAP security mode")
 	}
 	for remote, local := range a.FolderMap {
 		if strings.TrimSpace(remote) == "" || strings.ContainsAny(remote, "\x00\r\n") {
@@ -56,17 +64,13 @@ func Generate(a Account) (string, error) {
 		sort.Strings(exclusions)
 		patterns += " " + strings.Join(exclusions, " ")
 	}
-	remotes := make([]string, 0, len(a.FolderMap))
-	for remote := range a.FolderMap {
-		remotes = append(remotes, remote)
-	}
-	sort.Strings(remotes)
+	remotes := mappedRemotes(a)
 	base := fmt.Sprintf(`IMAPAccount %s
 Host %s
 Port %d
 User %s
 PassCmd "/usr/local/bin/voxmail-secret %s"
-SSLType IMAPS
+SSLType %s
 
 IMAPStore %s-remote
 Account %s
@@ -85,13 +89,10 @@ Remove None
 Sync All
 Expunge None
 SyncState *
-	`, name, quote(a.IMAPHost), a.IMAPPort, quote(a.IMAPUser), name, name, name, name, quote(root), quote(inbox), name, name, name, patterns)
-	for _, remote := range remotes {
+	`, name, quote(a.IMAPHost), a.IMAPPort, quote(a.IMAPUser), name, security, name, name, name, quote(root), quote(inbox), name, name, name, patterns)
+	for i, remote := range remotes {
 		local := a.FolderMap[remote]
-		if strings.EqualFold(remote, "INBOX") || remote == "" || local == "" {
-			continue
-		}
-		channel := safe(name + "-" + remote)
+		channel := safe(fmt.Sprintf("%s-folder-%d", name, i+1))
 		base += fmt.Sprintf(`
 Channel %s
 Master :%s-remote:%s
@@ -104,6 +105,33 @@ SyncState *
 `, channel, name, quote(remote), name, quote(local))
 	}
 	return base, nil
+}
+
+// ChannelNames returns the exact channels emitted by Generate.  The main
+// channel mirrors the unmapped folders; each mapped non-Inbox folder gets its
+// own channel so its local alias is preserved. Numeric suffixes avoid channel
+// collisions when two remote names sanitize to the same value.
+func ChannelNames(a Account) []string {
+	name := safe(a.ID)
+	remotes := mappedRemotes(a)
+	channels := make([]string, 0, len(remotes)+1)
+	channels = append(channels, name)
+	for i := range remotes {
+		channels = append(channels, safe(fmt.Sprintf("%s-folder-%d", name, i+1)))
+	}
+	return channels
+}
+
+func mappedRemotes(a Account) []string {
+	remotes := make([]string, 0, len(a.FolderMap))
+	for remote, local := range a.FolderMap {
+		if strings.EqualFold(remote, "INBOX") || strings.TrimSpace(remote) == "" || strings.TrimSpace(local) == "" {
+			continue
+		}
+		remotes = append(remotes, remote)
+	}
+	sort.Strings(remotes)
+	return remotes
 }
 
 func safe(value string) string {

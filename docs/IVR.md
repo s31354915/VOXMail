@@ -9,13 +9,15 @@ repeats a prompt outside an editor.
 1. An allowed caller hears the prerecorded welcome: “Welcome to VOXMail.
    Please enter your PIN, then press pound.”
 2. Enter the numeric PIN and press `#`.
-3. The fixed signed-in menu is:
-   - `1` — unread mail across accounts;
-   - `2` — all mail across accounts;
-   - `3` — choose an account, then a synchronized folder;
-   - `4` — choose a contact and compose to it;
-   - `5` — compose a new message;
-   - `6` — settings.
+3. The signed-in menu is:
+   - `1` — Email. The next menu offers `0` for all unread Inbox mail and
+     paged account selection;
+   - `2` — settings, including global alert toggle and contacts;
+   - `3` — information and instructions.
+
+After selecting an account, `1` opens synchronized folders, `2` starts a new
+message, `3` explains that refresh is automatic, and `4` describes account
+settings in the web console.
 
 `#` backs out one menu level. `*` repeats the current menu. The top-level menu
 is always six choices; account count does not alter its prerecorded audio.
@@ -34,8 +36,11 @@ In a message list:
 - `#` returns to the folder or main menu.
 
 Reading speaks sender, subject, and body. Long bodies are bounded and marked
-truncated. MIME attachments are announced by count and remain available in
-the local Maildir for normal email clients.
+truncated. MIME attachments are announced by count. `8` lists playable audio
+attachments, including the audio track of video containers; the selected item
+is extracted privately and normalized through FFmpeg to 8 kHz mono signed PCM
+for the call. Playback can be interrupted with DTMF or `#` and temporary files
+are removed afterward.
 
 ## Multi-tap text entry
 
@@ -71,14 +76,15 @@ New compose asks for recipient, subject, and body, then reads a review prompt:
 - `3` records the body by voice;
 - `#` returns to the body.
 
-Reply seeds the sender and `Re:` subject. Forward seeds the recipient and
-`Fwd:` subject and adds a forwarded-message notice. Sending uses the selected
-account when one was chosen through account navigation; otherwise it uses the
-first ordered account.
+Reply seeds the sender and `Re:` subject. Forward asks whether to include the
+original raw message and attachments, then seeds the recipient and `Fwd:`
+subject. Sending uses the selected account when one was chosen through account
+navigation; otherwise it uses the first ordered account. Review also offers
+recording one or more WAV audio attachments.
 
 ## Voice composition
 
-At review, press `3` and speak after the prompt. The bounded 15-second capture
+At review, press `5` to record an audio attachment. The bounded capture
 is converted to 16 kHz mono WAV, sent through Whisper, and removed after
 transcription. Recognized text is placed into the reviewable draft. On failure
 the draft returns to keypad editing. Temporary files are private and are
@@ -86,6 +92,6 @@ removed on success, failure, or timeout.
 
 ## Settings
 
-Under `6`, press `1` for voice-settings guidance or `2` to toggle global call
-alerts. Detailed model, speed, alert-number, account-alert, and folder-alert
-configuration is in the web console.
+Under `2`, press `1` for voice-settings guidance, `2` to toggle global call
+alerts, or `3` for contacts. Detailed model, speed, alert-number,
+account-alert, and folder-alert configuration is in the web console.

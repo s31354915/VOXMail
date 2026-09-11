@@ -3,7 +3,21 @@ services:
     image: "${VOXMAIL_IMAGE:-ghcr.io/s31354915/voxmail:latest}"
     pull_policy: always
     restart: unless-stopped
-    env_file: .env
+    init: true
+    stop_grace_period: 20s
+    mem_limit: "2g"
+    cpus: "2.0"
+    pids_limit: 256
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 8192
+    # Optional so `docker compose config` and image inspection work on a
+    # fresh checkout; startup still fails safely until the encryption key is
+    # supplied through .env or the shell environment.
+    env_file:
+      - path: .env
+        required: false
     environment:
       VOXMAIL_DATA_DIR: /data
       VOXMAIL_HTTP_ADDR: :8080

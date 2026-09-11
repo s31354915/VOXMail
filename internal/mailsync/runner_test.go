@@ -84,6 +84,41 @@ func TestSyncRequiresChannel(t *testing.T) {
 	}
 }
 
+func TestSyncChannelsPassesEveryChannel(t *testing.T) {
+	r := newRunner(fakeMbsync(t, 32, ""))
+	result, err := r.SyncChannels(context.Background(), "config", "one", "two")
+	if err != nil {
+		t.Fatalf("SyncChannels: %v", err)
+	}
+	if !result.Changed || result.Account != "one,two" {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestValidateUsesMbsyncDryRun(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell shim is unix-only")
+	}
+	dir := t.TempDir()
+	argsPath := filepath.Join(dir, "args")
+	shim := filepath.Join(dir, "mbsync")
+	content := "#!/bin/sh\nprintf '%s\\n' \"$@\" > '" + argsPath + "'\nexit 0\n"
+	if err := os.WriteFile(shim, []byte(content), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := (Runner{Binary: shim}).Validate(context.Background(), "voxmail.conf", "one", "two"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "--dry-run\n--config\nvoxmail.conf\n--ext-exit\none\ntwo\n"
+	if string(data) != want {
+		t.Fatalf("args = %q, want %q", data, want)
+	}
+}
+
 func TestSyncTimesOut(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell shim is unix-only")

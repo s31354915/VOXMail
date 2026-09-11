@@ -5,8 +5,17 @@
 The Go service renders a private mbsync configuration per account and invokes
 the installed `mbsync` binary. The policy uses UID state, mirrors mail into
 local Maildirs, creates local aliases for configured mappings, and uses
-`Remove None` and `Expunge None` for routine synchronization. The index stores
-metadata and attachment counts in SQLite; bodies remain in the Maildir.
+`Remove None` and `Expunge None` for routine synchronization. Authenticated
+IMAP mutations are used for read/unread, move, and Trash actions; the next
+mbsync run reconciles the cache. Sync runs are persisted in SQLite, with
+initial, incremental, and daily reconciliation classifications. Initial-cutoff
+and retention policies prune only local files after synchronization and never
+delete remote mail automatically.
+
+The index stores metadata and attachment counts in SQLite; bodies remain in the
+Maildir. Explicit folder roles are stored separately from display aliases, so
+unread totals only use the Inbox role and never guess that a folder is Spam or
+Trash from its name.
 
 ## SIP and media boundary
 
@@ -27,8 +36,9 @@ not used to make them. The bundled model SHA-256 is:
 d11e403a02bdf5a670c877b3dc56e0e1c8cece6fb30289586314dffdc0a78cb0
 ```
 
-The signed-in main menu is static because its six choices never change with
-the number of accounts. Account, folder, and contact prompts are dynamic.
+The signed-in main menu is static because its three choices never change with
+the number of accounts. Account, folder, contact, and attachment prompts are
+dynamic.
 
 At startup VOXMail compares prompt text, model name, and model digest. A
 matching manifest returns without touching Piper, so ordinary idle startup

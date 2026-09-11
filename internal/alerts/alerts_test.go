@@ -68,6 +68,9 @@ func (f *fakeBridge) Dial(_ context.Context, req calls.DialRequest) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.dials = append(f.dials, req)
+	if req.Done != nil {
+		req.Done <- true
+	}
 	return f.err
 }
 
@@ -129,9 +132,24 @@ func TestRoundDialsAndClaims(t *testing.T) {
 	if uri != "sip:+15551212@sip.example.com" {
 		t.Fatalf("unexpected uri %q", uri)
 	}
-	candidates, err := s.Store.PendingAlerts(context.Background())
-	if err != nil {
-		t.Fatal(err)
+	var candidates []store.AlertCandidate
+	var err error
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		candidates, err = s.Store.PendingAlerts(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		claimed := true
+		for _, c := range candidates {
+			if c.Folder == "INBOX" && c.MessageID == 1 {
+				claimed = false
+			}
+		}
+		if claimed {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 	for _, c := range candidates {
 		if c.Folder == "INBOX" && c.MessageID == 1 {

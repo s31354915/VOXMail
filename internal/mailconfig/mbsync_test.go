@@ -38,3 +38,34 @@ func TestGenerateRejectsEscapingFolderAlias(t *testing.T) {
 		t.Fatal("path escaping folder alias was accepted")
 	}
 }
+
+func TestChannelNamesMatchGeneratedMappedChannels(t *testing.T) {
+	account := Account{ID: "gmail/one", IMAPHost: "imap.example", IMAPUser: "u", MaildirRoot: "/data/mail/one", FolderMap: map[string]string{
+		"INBOX":             "Inbox",
+		"Archive":           "Old Mail",
+		"[Gmail]/Sent Mail": "Sent",
+	}}
+	text, err := Generate(account)
+	if err != nil {
+		t.Fatal(err)
+	}
+	channels := ChannelNames(account)
+	if len(channels) != 3 || channels[0] != "gmail_one" || channels[1] != "gmail_one-folder-1" || channels[2] != "gmail_one-folder-2" {
+		t.Fatalf("channels=%v", channels)
+	}
+	for _, channel := range channels {
+		if !strings.Contains(text, "Channel "+channel) {
+			t.Fatalf("generated config does not contain %q:\n%s", channel, text)
+		}
+	}
+}
+
+func TestGenerateUsesStartTLSWhenConfigured(t *testing.T) {
+	text, err := Generate(Account{ID: "one", IMAPHost: "imap.example", IMAPPort: 143, IMAPSecurity: "STARTTLS", IMAPUser: "u", MaildirRoot: "/data/mail/one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text, "SSLType STARTTLS") || !strings.Contains(text, "Port 143") {
+		t.Fatalf("STARTTLS configuration missing or incorrect:\n%s", text)
+	}
+}

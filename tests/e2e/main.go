@@ -393,6 +393,11 @@ func phase1(base string) {
 	bob2 := newSess(base)
 	admin.must("POST", "/api/v1/users", map[string]any{"username": bobUser, "password": bobPass, "pin": bobPIN, "role": "user"}, 201)
 	bob2.login(bobUser, bobPass, "")
+	admin.must("PUT", "/api/v1/admin/alerts", map[string]any{"available": false}, 200)
+	userSettings := bob2.must("GET", "/api/v1/settings", nil, 200)
+	check(!bodyContains(userSettings, `"alerts_enabled"`) && !bodyContains(userSettings, `"alert_phone"`), "disabled global alerts are hidden from ordinary-user settings")
+	bob2.must("GET", "/api/v1/alert-numbers", nil, 404)
+	admin.must("PUT", "/api/v1/admin/alerts", map[string]any{"available": true}, 200)
 	recreated := admin.must("POST", "/api/v1/accounts", acct("Jane Mail", "imap.example.com", 993, "j", "pw", &map[string]string{}, &[]string{}), 201)
 	recreatedID := ""
 	var rcreated map[string]string

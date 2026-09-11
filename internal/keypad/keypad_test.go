@@ -23,3 +23,13 @@ func TestBackspace(t *testing.T) {
 		t.Fatalf("got %q, want ab", m.Text)
 	}
 }
+
+func TestZeroKeyCanEnterSpace(t *testing.T) {
+	m := New(ModeText)
+	for _, key := range []byte("00#") {
+		m.Press(key)
+	}
+	if m.Text != " " {
+		t.Fatalf("got %q, want a space", m.Text)
+	}
+}

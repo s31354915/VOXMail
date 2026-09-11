@@ -1,7 +1,5 @@
 package keypad
 
-import "strings"
-
 // MultiTap implements VOXMail's deterministic DTMF text editor.
 type MultiTap struct {
 	Text       string
@@ -67,7 +65,7 @@ func (m *MultiTap) Press(key byte) (committed string, done bool) {
 }
 
 func (m *MultiTap) current() string {
-	values := strings.ReplaceAll(groups[m.PendingKey], " ", "")
+	values := groups[m.PendingKey]
 	return string(values[(m.Presses-1)%len(values)])
 }
 

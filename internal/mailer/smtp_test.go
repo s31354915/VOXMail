@@ -29,6 +29,21 @@ func TestBuildMessageBlocksHeaderInjection(t *testing.T) {
 	}
 }
 
+func TestBuildMessageWithAttachmentsUsesMIMEAndHidesBcc(t *testing.T) {
+	raw := string(BuildMessageWithAttachments(
+		"from@example.com", "Sender", []string{"to@example.com"}, []string{"cc@example.com"}, []string{"hidden@example.com"},
+		"Résumé", "hello", []Attachment{{Filename: "clip.wav", ContentType: "audio/wav", Data: []byte("audio")}},
+	))
+	if strings.Contains(raw, "hidden@example.com") {
+		t.Fatal("Bcc address was exposed in MIME headers")
+	}
+	for _, want := range []string{"multipart/mixed", "clip.wav", "Content-Transfer-Encoding: base64", "YXVkaW8="} {
+		if !strings.Contains(raw, want) {
+			t.Fatalf("MIME message missing %q: %s", want, raw)
+		}
+	}
+}
+
 func TestSendToLocalServer(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -83,7 +98,7 @@ func TestSendToLocalServer(t *testing.T) {
 		}
 	}()
 	port := ln.Addr().(*net.TCPAddr).Port
-	err = Send(Config{Host: "127.0.0.1", Port: port}, []string{"b@example.com"}, []byte("Subject: hi\r\n\r\nbody"))
+	err = Send(Config{Host: "127.0.0.1", Port: port, From: "a@example.com", Security: "plaintext", AllowPlaintext25: true, AllowPrivate: true}, []string{"b@example.com"}, []byte("Subject: hi\r\n\r\nbody"))
 	<-serverDone
 	if err != nil {
 		t.Fatalf("Send: %v", err)

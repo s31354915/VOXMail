@@ -32,6 +32,25 @@ func TestEnsureColumn(t *testing.T) {
 	}
 }
 
+func TestCreateUserRollsBackWhenSettingsInsertFails(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.DB.ExecContext(ctx, `CREATE TRIGGER reject_settings BEFORE INSERT ON settings BEGIN SELECT RAISE(ABORT, 'settings unavailable'); END`); err != nil {
+		t.Fatal(err)
+	}
+	err = db.CreateUser(ctx, User{ID: "atomic-user", Username: "atomic", PasswordHash: "hash", PINHash: "pin", Enabled: true})
+	if err == nil {
+		t.Fatal("CreateUser unexpectedly succeeded")
+	}
+	if _, lookupErr := db.UserByID(ctx, "atomic-user"); lookupErr == nil {
+		t.Fatal("user row survived failed settings insert")
+	}
+}
+
 func TestPendingAlertsAndMark(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(t.TempDir() + "/test.db")
@@ -85,6 +104,15 @@ func TestPendingAlertsAndMark(t *testing.T) {
 	if _, ok := seen["Junk"]; !ok {
 		t.Fatal("expected a Junk candidate (folder filtering happens in Go)")
 	}
+	if err := db.SetAlertsAvailable(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	if disabledPending, err := db.PendingAlerts(ctx); err != nil || len(disabledPending) != 0 {
+		t.Fatalf("global alert disable must suppress all candidates: %+v err=%v", disabledPending, err)
+	}
+	if err := db.SetAlertsAvailable(ctx, true); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.MarkAlertsNotified(ctx, []int64{pending[0].MessageID}); err != nil {
 		t.Fatal(err)
 	}
@@ -107,5 +135,59 @@ func TestPendingAlertsAndMark(t *testing.T) {
 		if c.AccountID == "a2" {
 			t.Fatalf("disabled account must not yield alerts, got %+v", pending)
 		}
+	}
+}
+
+func TestAlertClaimsSurviveAndReleaseLifecycle(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(t.TempDir() + "/claims.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	box, _ := secret.New("test-key-with-more-than-32-characters-123456")
+	u := User{ID: "claim-user", Username: "claim", PasswordHash: "x", PINHash: "y", Enabled: true}
+	if err := db.CreateUser(ctx, u); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.ExecContext(ctx, `UPDATE settings SET alerts_enabled=1 WHERE user_id='claim-user'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SaveAlertNumber(ctx, u.ID, "+15550001111", true); err != nil {
+		t.Fatal(err)
+	}
+	account := Account{ID: "claim-account", UserID: u.ID, CanonicalName: "Work", Email: "claim@example.com", SenderName: "Claim", IMAPHost: "imap.example.com", IMAPUser: "claim", IMAPPassword: "pw", SMTPHost: "smtp.example.com", SMTPUser: "claim", SMTPPassword: "pw", AlertFolders: `["INBOX"]`, CallAlertEnabled: true}
+	if err := db.SaveAccount(ctx, box, account); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.ExecContext(ctx, `INSERT INTO mail_messages(account_id,folder,path,is_read,alerted,updated_at) VALUES('claim-account','INBOX','/claim/1',0,0,'now')`); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := db.PendingAlerts(ctx)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("pending=%+v err=%v", pending, err)
+	}
+	ids, err := db.ClaimAlertMessages(ctx, u.ID, []int64{pending[0].MessageID})
+	if err != nil || len(ids) != 1 {
+		t.Fatalf("claimed=%v err=%v", ids, err)
+	}
+	if again, err := db.PendingAlerts(ctx); err != nil || len(again) != 0 {
+		t.Fatalf("claimed message remained pending: %+v err=%v", again, err)
+	}
+	if err := db.ReleaseAlertClaims(ctx, u.ID, ids); err != nil {
+		t.Fatal(err)
+	}
+	if again, err := db.PendingAlerts(ctx); err != nil || len(again) != 1 {
+		t.Fatalf("released message did not return: %+v err=%v", again, err)
+	}
+	ids, err = db.ClaimAlertMessages(ctx, u.ID, []int64{pending[0].MessageID})
+	if err != nil || len(ids) != 1 {
+		t.Fatalf("reclaim failed: %v %v", ids, err)
+	}
+	if err := db.MarkAlertMessagesNotified(ctx, u.ID, ids); err != nil {
+		t.Fatal(err)
+	}
+	if remaining, err := db.PendingAlerts(ctx); err != nil || len(remaining) != 0 {
+		t.Fatalf("announced message remained pending: %+v err=%v", remaining, err)
 	}
 }

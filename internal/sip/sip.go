@@ -8,6 +8,7 @@ package sip
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -42,6 +43,7 @@ type Baresip struct {
 	Log           *slog.Logger
 
 	mu        sync.Mutex
+	lifecycle sync.Mutex
 	cmd       *exec.Cmd
 	waitDone  chan struct{}
 	logHandle *os.File
@@ -54,13 +56,12 @@ type Baresip struct {
 // and starts, restarts, or stops baresip as needed. VOXMAIL_SIP_ACCOUNT, when
 // set, overrides the database settings for compatibility.
 func (b *Baresip) Apply(ctx context.Context) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.stopping = false
-	return b.applyLocked(ctx)
+	b.lifecycle.Lock()
+	defer b.lifecycle.Unlock()
+	return b.apply(ctx)
 }
 
-func (b *Baresip) applyLocked(ctx context.Context) error {
+func (b *Baresip) apply(ctx context.Context) error {
 	settings := b.loadSettings(ctx)
 	settings = envSettings(settings)
 	envAccount := strings.TrimSpace(os.Getenv("VOXMAIL_SIP_ACCOUNT"))
@@ -71,13 +72,16 @@ func (b *Baresip) applyLocked(ctx context.Context) error {
 		account = buildAccount(settings)
 	}
 	enabled := enableCalls || envAccount != "" || (settings.Enabled && account != "")
+	b.mu.Lock()
+	b.stopping = false
 	b.account = account
 	b.enabled = enabled
+	b.mu.Unlock()
 
 	if err := b.writeConfig(settings, account != ""); err != nil {
 		return err
 	}
-	return b.startLocked(ctx)
+	return b.start(ctx)
 }
 
 // envSettings lets deployment overlays supply SIP credentials without touching
@@ -139,11 +143,13 @@ func (b *Baresip) loadSettings(ctx context.Context) store.SIPSettings {
 
 // Stop disables baresip and terminates the current child process.
 func (b *Baresip) Stop() {
+	b.lifecycle.Lock()
+	defer b.lifecycle.Unlock()
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	b.stopping = true
 	b.enabled = false
-	b.stopLocked()
+	b.mu.Unlock()
+	b.stop()
 }
 
 // AccountLine returns the rendered accounts entry for the current settings,
@@ -218,10 +224,29 @@ sip_transports %s
 	return nil
 }
 
+// start stops any existing process without holding b.mu while waiting for its
+// exit, then starts the configured child. Waiting under b.mu deadlocks with
+// onExit, which must acquire the same mutex after cmd.Wait returns.
+func (b *Baresip) start(ctx context.Context) error {
+	if err := b.stop(); err != nil {
+		return err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.startLocked(ctx)
+}
+
+// startLocked starts a child and requires b.mu. It is retained as a narrow
+// low-level helper for tests and the respawn path; it never waits for an old
+// child to exit.
 func (b *Baresip) startLocked(ctx context.Context) error {
-	b.stopLocked()
 	if !b.enabled {
 		return nil
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 	}
 	binary := b.Binary
 	if binary == "" {
@@ -238,7 +263,9 @@ func (b *Baresip) startLocked(ctx context.Context) error {
 		}
 		logFile = handle
 	}
-	cmd := exec.CommandContext(ctx, binary, "-f", b.ConfigDir)
+	// Baresip is owned by this supervisor, not by the HTTP request that
+	// triggered Apply. Its lifetime is controlled by Stop and respawn.
+	cmd := exec.Command(binary, "-f", b.ConfigDir)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.Env = append(os.Environ(),
@@ -290,6 +317,8 @@ func (b *Baresip) onExit(cmd *exec.Cmd) {
 
 func (b *Baresip) respawn() {
 	time.Sleep(2 * time.Second)
+	b.lifecycle.Lock()
+	defer b.lifecycle.Unlock()
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.cmd != nil || b.stopping || !b.enabled {
@@ -298,30 +327,28 @@ func (b *Baresip) respawn() {
 	_ = b.startLocked(context.Background())
 }
 
-func (b *Baresip) stopLocked() {
+// stop terminates the current child and waits without holding b.mu. The
+// supervisor callback acquires b.mu when it observes the child exit.
+func (b *Baresip) stop() error {
+	b.mu.Lock()
 	cmd := b.cmd
+	waitDone := b.waitDone
+	b.mu.Unlock()
 	if cmd == nil || cmd.Process == nil {
-		b.cmd = nil
-		return
+		return nil
 	}
-	b.cmd = nil
-	_ = cmd.Process.Signal(syscall.SIGTERM)
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return err
+	}
 	select {
-	case <-b.waitDone:
+	case <-waitDone:
 	case <-time.After(5 * time.Second):
 		_ = cmd.Process.Kill()
-		if b.waitDone != nil {
-			<-b.waitDone
+		if waitDone != nil {
+			<-waitDone
 		}
 	}
-	if b.logHandle != nil {
-		_ = b.logHandle.Close()
-		b.logHandle = nil
-	}
-	b.waitDone = nil
-	if b.Log != nil {
-		b.Log.Info("baresip stopped")
-	}
+	return nil
 }
 
 // buildAccount renders a baresip accounts line from the database settings.

@@ -1,11 +1,71 @@
 package sip
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/voxmail/voxmail/internal/store"
 )
+
+func TestBaresipProcessOutlivesApplyContext(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "fake-baresip.sh")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nexec sleep 5\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	b := &Baresip{Binary: binary, ConfigDir: filepath.Join(dir, "config"), ControlSocket: filepath.Join(dir, "baresip.sock"), enabled: true}
+	ctx, cancel := context.WithCancel(context.Background())
+	b.mu.Lock()
+	if err := b.startLocked(ctx); err != nil {
+		b.mu.Unlock()
+		t.Fatalf("startLocked: %v", err)
+	}
+	cancel()
+	b.mu.Unlock()
+	time.Sleep(100 * time.Millisecond)
+	b.mu.Lock()
+	alive := b.cmd != nil && b.cmd.ProcessState == nil
+	b.mu.Unlock()
+	if !alive {
+		b.Stop()
+		t.Fatal("baresip process was tied to the Apply request context")
+	}
+	b.Stop()
+}
+
+func TestBaresipRespawnsAfterUnexpectedExit(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "fake-baresip-exit.sh")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nexec sh -c 'sleep 0.05; exit 1'\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	b := &Baresip{Binary: binary, ConfigDir: filepath.Join(dir, "config"), ControlSocket: filepath.Join(dir, "baresip.sock"), enabled: true}
+	b.mu.Lock()
+	if err := b.startLocked(context.Background()); err != nil {
+		b.mu.Unlock()
+		t.Fatalf("startLocked: %v", err)
+	}
+	first := b.cmd
+	b.mu.Unlock()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		b.mu.Lock()
+		respawned := b.cmd != nil && b.cmd != first
+		b.mu.Unlock()
+		if respawned {
+			b.Stop()
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	b.Stop()
+	t.Fatal("baresip supervisor did not respawn after an unexpected exit")
+}
 
 func TestBuildAccount(t *testing.T) {
 	account := buildAccount(store.SIPSettings{Username: "alice", Password: "s3cret", Domain: "sip.example.com", Port: 5060, Transport: "udp", RegInterval: 120})

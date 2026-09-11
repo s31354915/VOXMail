@@ -34,7 +34,18 @@ docker run -d --name "$NAME" \
   -e VOXMAIL_PROVISION_MODELS=0 \
   -p "127.0.0.1:$WEBPORT:8080/tcp" \
   -v "$VOLUME:/data" \
-  "$IMAGE" >>"$WORK/docker-run.log" 2>&1
+  --entrypoint /bin/sh "$IMAGE" -c '
+    set -eu
+    # Keep this suite offline and lightweight while satisfying the same
+    # readiness contract as production.  Speech execution itself is covered
+    # by the unit/integration tests; the throwaway files only prove startup
+    # wiring and model validation.
+    mkdir -p /data/voices /data/whisper
+    printf "e2e" > /data/voices/en_US-hfc_male-medium.onnx
+    printf "%s\\n" "{\"e2e\":true}" > /data/voices/en_US-hfc_male-medium.onnx.json
+    printf "e2e" > /data/whisper/ggml-base.en.bin
+    exec /usr/local/bin/voxmail-entrypoint
+  ' >>"$WORK/docker-run.log" 2>&1
 
 wait_ready() {
   for _ in $(seq 1 90); do

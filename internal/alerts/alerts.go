@@ -31,8 +31,9 @@ type Service struct {
 	MinDelay    time.Duration
 	MaxPerRound int
 
-	mu   sync.Mutex
-	last map[string]time.Time
+	mu       sync.Mutex
+	last     map[string]time.Time
+	inflight map[int64]bool
 }
 
 func (s *Service) Run(ctx context.Context) error {
@@ -46,6 +47,9 @@ func (s *Service) Run(ctx context.Context) error {
 	s.mu.Lock()
 	if s.last == nil {
 		s.last = make(map[string]time.Time)
+	}
+	if s.inflight == nil {
+		s.inflight = make(map[int64]bool)
 	}
 	s.mu.Unlock()
 	for {
@@ -74,7 +78,10 @@ func (s *Service) round(ctx context.Context) error {
 	}
 	byUser := make(map[string][]store.AlertCandidate)
 	for _, candidate := range candidates {
-		if alertFolderMatch(candidate) {
+		s.mu.Lock()
+		inflight := s.inflight[candidate.MessageID]
+		s.mu.Unlock()
+		if !inflight && alertFolderMatch(candidate) {
 			byUser[candidate.UserID] = append(byUser[candidate.UserID], candidate)
 		}
 	}
@@ -86,11 +93,15 @@ func (s *Service) round(ctx context.Context) error {
 	if max <= 0 {
 		max = 1
 	}
+	s.mu.Lock()
 	if s.last == nil {
 		s.last = make(map[string]time.Time)
 	}
+	if s.inflight == nil {
+		s.inflight = make(map[int64]bool)
+	}
+	s.mu.Unlock()
 	now := time.Now()
-	var claimed []int64
 	for userID, list := range byUser {
 		s.mu.Lock()
 		last := s.last[userID]
@@ -108,8 +119,42 @@ func (s *Service) round(ctx context.Context) error {
 			}
 			continue
 		}
-		err := s.Bridge.Dial(ctx, calls.DialRequest{URI: uri, UserID: userID, AccountID: list[0].AccountID, Text: alertText(list)})
+		ids := make([]int64, 0, len(list))
+		for _, candidate := range list {
+			ids = append(ids, candidate.MessageID)
+		}
+		claimed, claimErr := s.Store.ClaimAlertMessages(ctx, userID, ids)
+		if claimErr != nil {
+			if s.Log != nil {
+				s.Log.Warn("alert claim failed", "user_id", userID, "error", claimErr)
+			}
+			continue
+		}
+		if len(claimed) == 0 {
+			continue
+		}
+		claimedSet := make(map[int64]bool, len(claimed))
+		for _, id := range claimed {
+			claimedSet[id] = true
+		}
+		filtered := list[:0]
+		for _, candidate := range list {
+			if claimedSet[candidate.MessageID] {
+				filtered = append(filtered, candidate)
+			}
+		}
+		list = filtered
+		ids = claimed
+		done := make(chan bool, 1)
+		s.mu.Lock()
+		for _, id := range ids {
+			s.inflight[id] = true
+		}
+		s.mu.Unlock()
+		err := s.Bridge.Dial(ctx, calls.DialRequest{URI: uri, UserID: userID, AccountID: list[0].AccountID, Text: alertText(list), Done: done})
 		if err != nil {
+			s.clearInflight(ids)
+			_ = s.Store.ReleaseAlertClaims(context.Background(), userID, ids)
 			if s.Log != nil {
 				s.Log.Warn("alert dial failed", "user_id", userID, "error", err)
 			}
@@ -118,14 +163,36 @@ func (s *Service) round(ctx context.Context) error {
 		s.mu.Lock()
 		s.last[userID] = now
 		s.mu.Unlock()
-		for _, candidate := range list {
-			claimed = append(claimed, candidate.MessageID)
-		}
+		go s.finishAlert(ctx, userID, ids, done)
 		if s.Log != nil {
 			s.Log.Info("alert call placed", "user_id", userID, "uri", uri, "messages", len(list))
 		}
 	}
-	return s.Store.MarkAlertsNotified(ctx, claimed)
+	return nil
+}
+
+func (s *Service) clearInflight(ids []int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, id := range ids {
+		delete(s.inflight, id)
+	}
+}
+
+func (s *Service) finishAlert(ctx context.Context, userID string, ids []int64, done <-chan bool) {
+	success := false
+	select {
+	case success = <-done:
+	case <-ctx.Done():
+	}
+	s.clearInflight(ids)
+	if success {
+		if err := s.Store.MarkAlertMessagesNotified(context.Background(), userID, ids); err != nil && s.Log != nil {
+			s.Log.Warn("could not mark alert messages notified", "error", err)
+		}
+	} else if err := s.Store.ReleaseAlertClaims(context.Background(), userID, ids); err != nil && s.Log != nil {
+		s.Log.Warn("could not release failed alert claims", "error", err)
+	}
 }
 
 func (s *Service) targetDomain(ctx context.Context) string {
@@ -143,8 +210,8 @@ func (s *Service) TestAlert(ctx context.Context, userID string) error {
 	if s.Store == nil || s.Bridge == nil {
 		return fmt.Errorf("the call service is not running")
 	}
-	var phone string
-	if err := s.Store.DB.QueryRowContext(ctx, `SELECT COALESCE(alert_phone,'') FROM settings WHERE user_id = ?`, userID).Scan(&phone); err != nil {
+	phone, err := s.Store.ActiveAlertNumber(ctx, userID)
+	if err != nil {
 		return fmt.Errorf("alert settings are unavailable")
 	}
 	phone = strings.TrimSpace(phone)

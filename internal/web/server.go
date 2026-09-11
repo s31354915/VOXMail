@@ -5,13 +5,16 @@ import (
 	"crypto/rand"
 	"database/sql"
 	_ "embed"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/mail"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -20,7 +23,10 @@ import (
 	"time"
 
 	"github.com/voxmail/voxmail/internal/auth"
+	"github.com/voxmail/voxmail/internal/imapcheck"
+	"github.com/voxmail/voxmail/internal/mailer"
 	"github.com/voxmail/voxmail/internal/secret"
+	"github.com/voxmail/voxmail/internal/speech"
 	"github.com/voxmail/voxmail/internal/store"
 )
 
@@ -40,17 +46,59 @@ type AlertService interface {
 	TestAlert(context.Context, string) error
 }
 
+// VoiceActivator installs/warm-ups a trusted voice and refreshes the live
+// static prompt set before the voice preference is persisted.
+type VoiceActivator interface {
+	ActivateVoice(context.Context, string, int, int) error
+}
+
+// VoicePreviewer synthesizes a short, bounded sample for an already selected
+// voice. It is intentionally separate from VoiceActivator so tests and
+// deployments that do not run Piper can omit preview support.
+type VoicePreviewer interface {
+	PreviewVoice(context.Context, string, int) ([]byte, error)
+}
+
+// CallSessionInvalidator revokes live phone calls after a credential change.
+// It is optional so the web console remains testable without a running call
+// bridge.
+type CallSessionInvalidator interface {
+	InvalidateUserSessions(string)
+}
+
+type AccountSyncer interface {
+	RefreshAccount(context.Context, string, string) error
+}
+
 type Server struct {
-	Store    *store.Store
-	Secrets  *secret.Box
-	Log      *slog.Logger
-	Sessions *SessionStore
-	SIP      SIPController
-	Alerts   AlertService
-	DataRoot string
-	Ready    func(context.Context) error
-	loginMu  sync.Mutex
-	logins   map[string]loginState
+	Store     *store.Store
+	Secrets   *secret.Box
+	Log       *slog.Logger
+	Sessions  *SessionStore
+	SIP       SIPController
+	Alerts    AlertService
+	Voice     VoiceActivator
+	Preview   VoicePreviewer
+	Calls     CallSessionInvalidator
+	Sync      AccountSyncer
+	DataRoot  string
+	VoiceDir  string
+	Ready     func(context.Context) error
+	loginMu   sync.Mutex
+	logins    map[string]loginState
+	voiceMu   sync.Mutex
+	voiceJobs map[string]*voiceInstallJob
+}
+
+type voiceInstallJob struct {
+	ID        string
+	UserID    string
+	Voice     string
+	Stage     string
+	Status    string
+	Progress  int
+	Error     string
+	UpdatedAt time.Time
 }
 
 type loginState struct {
@@ -83,14 +131,24 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1", s.apiInfo)
 	mux.HandleFunc("POST /api/v1/setup", s.setup)
 	mux.HandleFunc("POST /api/v1/login", s.login)
+	mux.HandleFunc("POST /api/v1/recovery/request", s.requestRecovery)
+	mux.HandleFunc("POST /api/v1/recovery/confirm", s.confirmRecovery)
 	mux.HandleFunc("POST /api/v1/logout", s.logout)
+	mux.HandleFunc("POST /api/v1/security/password", s.changePassword)
+	mux.HandleFunc("POST /api/v1/security/pin", s.changePIN)
+	mux.HandleFunc("POST /api/v1/security/2fa/setup", s.setup2FA)
+	mux.HandleFunc("POST /api/v1/security/2fa/enable", s.enable2FA)
+	mux.HandleFunc("POST /api/v1/security/2fa/disable", s.disable2FA)
 	mux.HandleFunc("GET /api/v1/me", s.me)
 	mux.HandleFunc("GET /api/v1/users", s.users)
 	mux.HandleFunc("POST /api/v1/users", s.createUser)
 	mux.HandleFunc("DELETE /api/v1/users/{id}", s.deleteUser)
 	mux.HandleFunc("GET /api/v1/accounts", s.accounts)
 	mux.HandleFunc("POST /api/v1/accounts", s.saveAccount)
+	mux.HandleFunc("POST /api/v1/accounts/validate", s.validateAccount)
 	mux.HandleFunc("POST /api/v1/accounts/test", s.testAccount)
+	mux.HandleFunc("POST /api/v1/accounts/{id}/sync", s.syncAccount)
+	mux.HandleFunc("GET /api/v1/accounts/{id}/mutations", s.accountMutations)
 	mux.HandleFunc("DELETE /api/v1/accounts/{id}", s.deleteAccount)
 	mux.HandleFunc("GET /api/v1/contacts", s.contacts)
 	mux.HandleFunc("POST /api/v1/contacts", s.createContact)
@@ -101,6 +159,16 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/v1/whitelist/{id}", s.deleteWhitelist)
 	mux.HandleFunc("GET /api/v1/settings", s.settings)
 	mux.HandleFunc("PUT /api/v1/settings", s.saveSettings)
+	mux.HandleFunc("GET /api/v1/admin/alerts", s.adminAlerts)
+	mux.HandleFunc("PUT /api/v1/admin/alerts", s.saveAdminAlerts)
+	mux.HandleFunc("GET /api/v1/alert-numbers", s.alertNumbers)
+	mux.HandleFunc("POST /api/v1/alert-numbers", s.saveAlertNumber)
+	mux.HandleFunc("PUT /api/v1/alert-numbers/{id}/active", s.activateAlertNumber)
+	mux.HandleFunc("DELETE /api/v1/alert-numbers/{id}", s.deleteAlertNumber)
+	mux.HandleFunc("GET /api/v1/voices", s.voices)
+	mux.HandleFunc("POST /api/v1/voices/install", s.installVoice)
+	mux.HandleFunc("GET /api/v1/voices/jobs/{id}", s.voiceInstallStatus)
+	mux.HandleFunc("POST /api/v1/voices/preview", s.previewVoice)
 	mux.HandleFunc("POST /api/v1/alerts/test", s.testAlert)
 	mux.HandleFunc("GET /api/v1/sip", s.sipSettings)
 	mux.HandleFunc("PUT /api/v1/sip", s.saveSIP)
@@ -154,9 +222,10 @@ func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
 }
 
 type loginRequest struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
-	TOTP     string `json:"totp"`
+	Username   string `json:"username"`
+	Password   string `json:"password"`
+	TOTP       string `json:"totp"`
+	BackupCode string `json:"backup_code"`
 }
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
@@ -176,14 +245,220 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
-	if u.TOTPSecret != "" && !auth.TOTP(u.TOTPSecret, req.TOTP, time.Now().UTC()) {
-		s.loginFailure(loginKey)
-		writeError(w, http.StatusUnauthorized, "authenticator code required")
-		return
+	totpSecret := s.openTOTPSecret(u.TOTPSecret)
+	if totpSecret != "" && !auth.TOTP(totpSecret, req.TOTP, time.Now().UTC()) {
+		if !s.consumeBackupCode(r.Context(), u.ID, req.BackupCode) {
+			s.loginFailure(loginKey)
+			writeError(w, http.StatusUnauthorized, "authenticator or backup code required")
+			return
+		}
 	}
 	s.loginSuccess(loginKey)
+	_ = s.Store.Audit(r.Context(), u.ID, "login_succeeded", "")
 	s.issueSession(w, r, u.ID)
 	writeJSON(w, http.StatusOK, publicUser(u))
+}
+
+type recoveryRequest struct {
+	Email     string `json:"email"`
+	AccountID string `json:"account_id"`
+	Purpose   string `json:"purpose"`
+}
+
+// requestRecovery deliberately returns the same response whether the address
+// is known or not. Mailbox ownership is the alternate factor, so this path is
+// rate limited and never exposes account enumeration information.
+func (s *Server) requestRecovery(w http.ResponseWriter, r *http.Request) {
+	var req recoveryRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	req.Email = strings.TrimSpace(req.Email)
+	if req.Purpose != "reset_password" && req.Purpose != "bypass_2fa" {
+		writeError(w, http.StatusBadRequest, "invalid recovery purpose")
+		return
+	}
+	requested := map[string]string{"status": "If the address is configured, a recovery code will be sent."}
+	if _, err := mail.ParseAddress(req.Email); err != nil {
+		writeJSON(w, http.StatusAccepted, requested)
+		return
+	}
+	accounts, err := s.Store.ListAllAccounts(r.Context())
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	var account store.Account
+	for _, candidate := range accounts {
+		if req.AccountID != "" && candidate.ID != req.AccountID {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(candidate.Email), req.Email) {
+			account = candidate
+			break
+		}
+	}
+	if account.ID == "" {
+		writeJSON(w, http.StatusAccepted, requested)
+		return
+	}
+	var recent int
+	_ = s.Store.DB.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM recovery_tokens WHERE user_id=? AND created_at >= ?`, account.UserID, time.Now().Add(-15*time.Minute).UTC().Format(time.RFC3339Nano)).Scan(&recent)
+	if recent >= 5 {
+		writeJSON(w, http.StatusAccepted, requested)
+		return
+	}
+	code, err := recoveryCode()
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	hash, err := auth.Hash(code)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	now := time.Now().UTC()
+	if _, err := s.Store.DB.ExecContext(r.Context(), `UPDATE recovery_tokens SET used_at=? WHERE user_id=? AND purpose=? AND used_at IS NULL`, now.Format(time.RFC3339Nano), account.UserID, req.Purpose); err != nil {
+		serverError(w, err)
+		return
+	}
+	if _, err := s.Store.DB.ExecContext(r.Context(), `INSERT INTO recovery_tokens(user_id,email,token_hash,purpose,expires_at,created_at) VALUES(?,?,?,?,?,?)`, account.UserID, strings.ToLower(req.Email), hash, req.Purpose, now.Add(10*time.Minute).Format(time.RFC3339Nano), now.Format(time.RFC3339Nano)); err != nil {
+		serverError(w, err)
+		return
+	}
+	if s.Secrets == nil {
+		err = errors.New("secret store is unavailable")
+	}
+	var password string
+	if err == nil {
+		password, err = s.Secrets.Open(account.SMTPPassword)
+	}
+	if err == nil {
+		body := fmt.Sprintf("Your VOXMail recovery code is %s. It expires in 10 minutes. If you did not request this, ignore this message.", code)
+		raw := mailer.BuildMessageWithAttachments(account.Email, account.SenderName, []string{account.Email}, nil, nil, "VOXMail recovery code", body, nil)
+		if raw != nil {
+			err = mailer.Send(mailer.Config{Host: account.SMTPHost, Port: account.SMTPPort, Security: account.SMTPSecurity, Username: account.SMTPUser, Password: password, From: account.Email}, []string{account.Email}, raw)
+		}
+	}
+	if err != nil {
+		// A failed delivery must not leave a valid recovery token behind.
+		_, _ = s.Store.DB.ExecContext(context.Background(), `UPDATE recovery_tokens SET used_at=? WHERE token_hash=?`, time.Now().UTC().Format(time.RFC3339Nano), hash)
+		if s.Log != nil {
+			s.Log.Warn("recovery code delivery failed", "error", err)
+		}
+	} else {
+		_ = s.Store.Audit(r.Context(), account.UserID, "recovery_requested", req.Purpose)
+	}
+	writeJSON(w, http.StatusAccepted, requested)
+}
+
+type recoveryConfirmRequest struct {
+	Email       string `json:"email"`
+	Purpose     string `json:"purpose"`
+	Code        string `json:"code"`
+	NewPassword string `json:"new_password"`
+}
+
+func (s *Server) confirmRecovery(w http.ResponseWriter, r *http.Request) {
+	var req recoveryConfirmRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	req.Email = strings.TrimSpace(req.Email)
+	if req.Purpose != "reset_password" && req.Purpose != "bypass_2fa" {
+		writeError(w, http.StatusBadRequest, "invalid recovery purpose")
+		return
+	}
+	if req.Purpose == "reset_password" && len(req.NewPassword) < 12 {
+		writeError(w, http.StatusBadRequest, "password must be at least 12 characters")
+		return
+	}
+	if len(strings.TrimSpace(req.Code)) < 6 {
+		writeError(w, http.StatusUnauthorized, "invalid or expired recovery code")
+		return
+	}
+	tx, err := s.Store.DB.BeginTx(r.Context(), nil)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(r.Context(), `SELECT id,user_id,token_hash,expires_at,attempts FROM recovery_tokens WHERE lower(email)=lower(?) AND purpose=? AND used_at IS NULL ORDER BY id DESC LIMIT 5`, req.Email, req.Purpose)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	var tokenID int64
+	var userID string
+	for rows.Next() {
+		var id, attempts int64
+		var candidateUser, tokenHash, expires string
+		if err := rows.Scan(&id, &candidateUser, &tokenHash, &expires, &attempts); err != nil {
+			rows.Close()
+			serverError(w, err)
+			return
+		}
+		if attempts >= 5 {
+			continue
+		}
+		_, _ = tx.ExecContext(r.Context(), `UPDATE recovery_tokens SET attempts=attempts+1 WHERE id=?`, id)
+		if parsed, parseErr := time.Parse(time.RFC3339Nano, expires); parseErr != nil || time.Now().UTC().After(parsed) {
+			_, _ = tx.ExecContext(r.Context(), `UPDATE recovery_tokens SET used_at=? WHERE id=?`, time.Now().UTC().Format(time.RFC3339Nano), id)
+			continue
+		}
+		if auth.Check(tokenHash, strings.TrimSpace(req.Code)) {
+			tokenID, userID = id, candidateUser
+			break
+		}
+	}
+	rows.Close()
+	if tokenID == 0 {
+		_ = tx.Commit()
+		writeError(w, http.StatusUnauthorized, "invalid or expired recovery code")
+		return
+	}
+	if _, err := tx.ExecContext(r.Context(), `UPDATE recovery_tokens SET used_at=? WHERE id=? AND used_at IS NULL`, time.Now().UTC().Format(time.RFC3339Nano), tokenID); err != nil {
+		serverError(w, err)
+		return
+	}
+	if req.Purpose == "reset_password" {
+		hash, hashErr := auth.Hash(req.NewPassword)
+		if hashErr != nil {
+			serverError(w, hashErr)
+			return
+		}
+		if _, err := tx.ExecContext(r.Context(), `UPDATE users SET password_hash=? WHERE id=?`, hash, userID); err != nil {
+			serverError(w, err)
+			return
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		serverError(w, err)
+		return
+	}
+	if req.Purpose == "reset_password" {
+		s.Sessions.DeleteUser(userID)
+		_ = s.Store.Audit(r.Context(), userID, "password_recovered", "mailbox OTP")
+		writeJSON(w, http.StatusOK, map[string]string{"status": "password_reset"})
+		return
+	}
+	u, err := s.Store.UserByID(r.Context(), userID)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	s.issueSession(w, r, userID)
+	_ = s.Store.Audit(r.Context(), userID, "two_factor_bypassed", "mailbox OTP")
+	writeJSON(w, http.StatusOK, map[string]any{"status": "signed_in", "user": publicUser(u)})
+}
+
+func recoveryCode() (string, error) {
+	var data [4]byte
+	if _, err := rand.Read(data[:]); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%06d", binary.BigEndian.Uint32(data[:])%1000000), nil
 }
 
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
@@ -192,6 +467,304 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	}
 	http.SetCookie(w, &http.Cookie{Name: "voxmail_session", MaxAge: -1, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "signed_out"})
+}
+
+type passwordChangeRequest struct {
+	Current string `json:"current_password"`
+	New     string `json:"new_password"`
+}
+
+func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
+	u, ok := s.require(w, r, true)
+	if !ok {
+		return
+	}
+	var req passwordChangeRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if !auth.Check(u.PasswordHash, req.Current) {
+		writeError(w, http.StatusUnauthorized, "current password is incorrect")
+		return
+	}
+	if len(req.New) < 12 {
+		writeError(w, http.StatusBadRequest, "password must be at least 12 characters")
+		return
+	}
+	hash, err := auth.Hash(req.New)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	if _, err := s.Store.DB.ExecContext(r.Context(), `UPDATE users SET password_hash=? WHERE id=?`, hash, u.ID); err != nil {
+		serverError(w, err)
+		return
+	}
+	_ = s.Store.Audit(r.Context(), u.ID, "password_changed", "")
+	s.Sessions.DeleteUser(u.ID)
+	s.issueSession(w, r, u.ID)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "changed"})
+}
+
+type pinChangeRequest struct {
+	CurrentPassword string `json:"current_password"`
+	NewPIN          string `json:"new_pin"`
+}
+
+func (s *Server) changePIN(w http.ResponseWriter, r *http.Request) {
+	u, ok := s.require(w, r, true)
+	if !ok {
+		return
+	}
+	var req pinChangeRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if !auth.Check(u.PasswordHash, req.CurrentPassword) {
+		writeError(w, http.StatusUnauthorized, "current password is incorrect")
+		return
+	}
+	if err := validatePIN(req.NewPIN); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	hash, err := auth.Hash(req.NewPIN)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	if _, err := s.Store.DB.ExecContext(r.Context(), `UPDATE users SET pin_hash=? WHERE id=?`, hash, u.ID); err != nil {
+		serverError(w, err)
+		return
+	}
+	if s.Calls != nil {
+		s.Calls.InvalidateUserSessions(u.ID)
+	}
+	_ = s.Store.Audit(r.Context(), u.ID, "pin_changed", "")
+	writeJSON(w, http.StatusOK, map[string]string{"status": "changed"})
+}
+
+type twoFARequest struct {
+	CurrentPassword string `json:"current_password"`
+	Secret          string `json:"secret"`
+	Code            string `json:"code"`
+}
+
+func (s *Server) setup2FA(w http.ResponseWriter, r *http.Request) {
+	u, ok := s.require(w, r, true)
+	if !ok {
+		return
+	}
+	var req struct {
+		CurrentPassword string `json:"current_password"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	if !auth.Check(u.PasswordHash, req.CurrentPassword) {
+		writeError(w, http.StatusUnauthorized, "current password is incorrect")
+		return
+	}
+	secretValue, err := auth.GenerateTOTPSecret()
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	label := url.QueryEscape("VOXMail:" + u.Username)
+	issuer := url.QueryEscape("VOXMail")
+	uri := "otpauth://totp/" + label + "?secret=" + secretValue + "&issuer=" + issuer
+	writeJSON(w, http.StatusOK, map[string]string{"secret": secretValue, "provisioning_uri": uri})
+}
+
+func (s *Server) enable2FA(w http.ResponseWriter, r *http.Request) {
+	u, ok := s.require(w, r, true)
+	if !ok {
+		return
+	}
+	var req twoFARequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if s.Secrets == nil || !auth.Check(u.PasswordHash, req.CurrentPassword) || !auth.TOTP(req.Secret, req.Code, time.Now().UTC()) {
+		writeError(w, http.StatusUnauthorized, "password or authenticator code is incorrect")
+		return
+	}
+	codes := make([]string, 0, 10)
+	hashes := make([]string, 0, 10)
+	for i := 0; i < 10; i++ {
+		code, err := auth.RandomToken(5)
+		if err != nil {
+			serverError(w, err)
+			return
+		}
+		hash, err := auth.Hash(code)
+		if err != nil {
+			serverError(w, err)
+			return
+		}
+		codes = append(codes, code)
+		hashes = append(hashes, hash)
+	}
+	sealed, err := s.Secrets.Seal(strings.TrimSpace(req.Secret))
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	tx, err := s.Store.DB.BeginTx(r.Context(), nil)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(r.Context(), `UPDATE users SET totp_secret=?,backup_codes='' WHERE id=?`, sealed, u.ID); err != nil {
+		serverError(w, err)
+		return
+	}
+	if _, err := tx.ExecContext(r.Context(), `DELETE FROM totp_backup_codes WHERE user_id=?`, u.ID); err != nil {
+		serverError(w, err)
+		return
+	}
+	created := time.Now().UTC().Format(time.RFC3339Nano)
+	for _, hash := range hashes {
+		if _, err := tx.ExecContext(r.Context(), `INSERT INTO totp_backup_codes(user_id,code_hash,created_at) VALUES(?,?,?)`, u.ID, hash, created); err != nil {
+			serverError(w, err)
+			return
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		serverError(w, err)
+		return
+	}
+	_ = s.Store.Audit(r.Context(), u.ID, "two_factor_enabled", "")
+	writeJSON(w, http.StatusOK, map[string]any{"status": "enabled", "backup_codes": codes})
+}
+
+func (s *Server) disable2FA(w http.ResponseWriter, r *http.Request) {
+	u, ok := s.require(w, r, true)
+	if !ok {
+		return
+	}
+	var req twoFARequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if u.TOTPSecret == "" || !auth.Check(u.PasswordHash, req.CurrentPassword) || !auth.TOTP(s.openTOTPSecret(u.TOTPSecret), req.Code, time.Now().UTC()) {
+		writeError(w, http.StatusUnauthorized, "password or authenticator code is incorrect")
+		return
+	}
+	tx, err := s.Store.DB.BeginTx(r.Context(), nil)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(r.Context(), `UPDATE users SET totp_secret='',backup_codes='' WHERE id=?`, u.ID); err != nil {
+		serverError(w, err)
+		return
+	}
+	if _, err := tx.ExecContext(r.Context(), `DELETE FROM totp_backup_codes WHERE user_id=?`, u.ID); err != nil {
+		serverError(w, err)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		serverError(w, err)
+		return
+	}
+	_ = s.Store.Audit(r.Context(), u.ID, "two_factor_disabled", "")
+	writeJSON(w, http.StatusOK, map[string]string{"status": "disabled"})
+}
+
+func (s *Server) openTOTPSecret(value string) string {
+	if value == "" {
+		return ""
+	}
+	if s.Secrets != nil {
+		if plain, err := s.Secrets.Open(value); err == nil {
+			return plain
+		}
+	}
+	// Accept legacy plaintext secrets so an upgrade does not lock users out;
+	// newly enabled secrets are always sealed above.
+	return value
+}
+
+func (s *Server) consumeBackupCode(ctx context.Context, userID, candidate string) bool {
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "" {
+		return false
+	}
+	tx, err := s.Store.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return false
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT id,code_hash FROM totp_backup_codes WHERE user_id=? AND used_at IS NULL ORDER BY id`, userID)
+	if err != nil {
+		return false
+	}
+	var matchedID int64
+	for rows.Next() {
+		var id int64
+		var hash string
+		if scanErr := rows.Scan(&id, &hash); scanErr != nil {
+			rows.Close()
+			return false
+		}
+		if auth.Check(hash, candidate) {
+			matchedID = id
+			break
+		}
+	}
+	rows.Close()
+	if matchedID != 0 {
+		result, updateErr := tx.ExecContext(ctx, `UPDATE totp_backup_codes SET used_at=? WHERE id=? AND user_id=? AND used_at IS NULL`, time.Now().UTC().Format(time.RFC3339Nano), matchedID, userID)
+		if updateErr != nil {
+			return false
+		}
+		if count, _ := result.RowsAffected(); count != 1 {
+			return false
+		}
+	} else {
+		// One-time compatibility path for databases created before the
+		// normalized backup-code table existed. Successful use migrates the
+		// remaining legacy hashes into the table before deleting the old blob.
+		var raw string
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(backup_codes,'') FROM users WHERE id=?`, userID).Scan(&raw); err != nil {
+			return false
+		}
+		var hashes []string
+		if json.Unmarshal([]byte(raw), &hashes) != nil {
+			return false
+		}
+		legacyIndex := -1
+		for i, hash := range hashes {
+			if auth.Check(hash, candidate) {
+				legacyIndex = i
+				break
+			}
+		}
+		if legacyIndex < 0 {
+			return false
+		}
+		hashes = append(hashes[:legacyIndex], hashes[legacyIndex+1:]...)
+		for _, hash := range hashes {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO totp_backup_codes(user_id,code_hash,created_at) VALUES(?,?,?)`, userID, hash, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+				return false
+			}
+		}
+		updated, err := json.Marshal(hashes)
+		if err != nil {
+			return false
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE users SET backup_codes=? WHERE id=?`, string(updated), userID); err != nil {
+			return false
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false
+	}
+	_ = s.Store.Audit(ctx, userID, "backup_code_used", "")
+	return true
 }
 
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {
@@ -275,49 +848,58 @@ func (s *Server) deleteUser(w http.ResponseWriter, r *http.Request) {
 }
 
 type accountRequest struct {
-	ID                  string            `json:"id"`
-	CanonicalName       string            `json:"canonical_name"`
-	Email               string            `json:"email"`
-	SenderName          string            `json:"sender_name"`
-	IMAPHost            string            `json:"imap_host"`
-	IMAPUser            string            `json:"imap_user"`
-	IMAPPassword        string            `json:"imap_password"`
-	SMTPHost            string            `json:"smtp_host"`
-	SMTPUser            string            `json:"smtp_user"`
-	SMTPPassword        string            `json:"smtp_password"`
-	IMAPPort            int               `json:"imap_port"`
-	SMTPPort            int               `json:"smtp_port"`
-	SyncIntervalMinutes int               `json:"sync_interval_minutes"`
-	DisplayOrder        int               `json:"display_order"`
-	FolderMap           map[string]string `json:"folder_map"`
-	AlertFolders        []string          `json:"alert_folders"`
-	InitialCutoff       *string           `json:"initial_cutoff,omitempty"`
-	RetentionDays       *int              `json:"retention_days,omitempty"`
-	CallAlertEnabled    bool              `json:"call_alert_enabled"`
+	ID                            string            `json:"id"`
+	CanonicalName                 string            `json:"canonical_name"`
+	Email                         string            `json:"email"`
+	SenderName                    string            `json:"sender_name"`
+	IMAPHost                      string            `json:"imap_host"`
+	IMAPUser                      string            `json:"imap_user"`
+	IMAPPassword                  string            `json:"imap_password"`
+	IMAPSecurity                  string            `json:"imap_security"`
+	SMTPHost                      string            `json:"smtp_host"`
+	SMTPUser                      string            `json:"smtp_user"`
+	SMTPPassword                  string            `json:"smtp_password"`
+	SMTPSecurity                  string            `json:"smtp_security"`
+	IMAPPort                      int               `json:"imap_port"`
+	SMTPPort                      int               `json:"smtp_port"`
+	SyncIntervalMinutes           int               `json:"sync_interval_minutes"`
+	ReconciliationIntervalMinutes int               `json:"reconciliation_interval_minutes"`
+	DisplayOrder                  int               `json:"display_order"`
+	FolderMap                     map[string]string `json:"folder_map"`
+	FolderRoles                   map[string]string `json:"folder_roles"`
+	AlertFolders                  []string          `json:"alert_folders"`
+	InitialCutoff                 *string           `json:"initial_cutoff,omitempty"`
+	RetentionDays                 *int              `json:"retention_days,omitempty"`
+	CallAlertEnabled              bool              `json:"call_alert_enabled"`
 }
 
 type accountView struct {
-	ID                  string            `json:"id"`
-	CanonicalName       string            `json:"canonical_name"`
-	Email               string            `json:"email"`
-	SenderName          string            `json:"sender_name"`
-	IMAPHost            string            `json:"imap_host"`
-	IMAPPort            int               `json:"imap_port"`
-	IMAPUser            string            `json:"imap_user"`
-	SMTPHost            string            `json:"smtp_host"`
-	SMTPPort            int               `json:"smtp_port"`
-	SMTPUser            string            `json:"smtp_user"`
-	FolderMap           map[string]string `json:"folder_map"`
-	AlertFolders        []string          `json:"alert_folders"`
-	SyncIntervalMinutes int               `json:"sync_interval_minutes"`
-	DisplayOrder        int               `json:"display_order"`
-	InitialCutoff       *string           `json:"initial_cutoff,omitempty"`
-	RetentionDays       *int              `json:"retention_days,omitempty"`
-	CallAlertEnabled    bool              `json:"call_alert_enabled"`
+	ID                            string            `json:"id"`
+	CanonicalName                 string            `json:"canonical_name"`
+	Email                         string            `json:"email"`
+	SenderName                    string            `json:"sender_name"`
+	IMAPHost                      string            `json:"imap_host"`
+	IMAPPort                      int               `json:"imap_port"`
+	IMAPSecurity                  string            `json:"imap_security"`
+	IMAPUser                      string            `json:"imap_user"`
+	SMTPHost                      string            `json:"smtp_host"`
+	SMTPPort                      int               `json:"smtp_port"`
+	SMTPSecurity                  string            `json:"smtp_security"`
+	SMTPUser                      string            `json:"smtp_user"`
+	FolderMap                     map[string]string `json:"folder_map"`
+	FolderRoles                   map[string]string `json:"folder_roles"`
+	AlertFolders                  []string          `json:"alert_folders"`
+	SyncIntervalMinutes           int               `json:"sync_interval_minutes"`
+	ReconciliationIntervalMinutes int               `json:"reconciliation_interval_minutes"`
+	DisplayOrder                  int               `json:"display_order"`
+	InitialCutoff                 *string           `json:"initial_cutoff,omitempty"`
+	RetentionDays                 *int              `json:"retention_days,omitempty"`
+	CallAlertEnabled              bool              `json:"call_alert_enabled"`
+	LastSync                      *store.SyncRun    `json:"last_sync,omitempty"`
 }
 
 func accountJSON(a store.Account) accountView {
-	v := accountView{ID: a.ID, CanonicalName: a.CanonicalName, Email: a.Email, SenderName: a.SenderName, IMAPHost: a.IMAPHost, IMAPPort: a.IMAPPort, IMAPUser: a.IMAPUser, SMTPHost: a.SMTPHost, SMTPPort: a.SMTPPort, SMTPUser: a.SMTPUser, SyncIntervalMinutes: a.SyncIntervalMinutes, DisplayOrder: a.DisplayOrder, InitialCutoff: a.InitialCutoff, RetentionDays: a.RetentionDays, CallAlertEnabled: a.CallAlertEnabled}
+	v := accountView{ID: a.ID, CanonicalName: a.CanonicalName, Email: a.Email, SenderName: a.SenderName, IMAPHost: a.IMAPHost, IMAPPort: a.IMAPPort, IMAPSecurity: a.IMAPSecurity, IMAPUser: a.IMAPUser, SMTPHost: a.SMTPHost, SMTPPort: a.SMTPPort, SMTPSecurity: a.SMTPSecurity, SMTPUser: a.SMTPUser, SyncIntervalMinutes: a.SyncIntervalMinutes, ReconciliationIntervalMinutes: a.ReconciliationIntervalMinutes, DisplayOrder: a.DisplayOrder, InitialCutoff: a.InitialCutoff, RetentionDays: a.RetentionDays, CallAlertEnabled: a.CallAlertEnabled}
 	if err := json.Unmarshal([]byte(a.FolderMap), &v.FolderMap); err != nil || v.FolderMap == nil {
 		v.FolderMap = map[string]string{}
 	}
@@ -339,7 +921,17 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]accountView, 0, len(accounts))
 	for _, account := range accounts {
-		out = append(out, accountJSON(account))
+		view := accountJSON(account)
+		view.FolderRoles = make(map[string]string)
+		if roles, err := s.Store.ListFolderRoles(r.Context(), u.ID, account.ID); err == nil {
+			for _, role := range roles {
+				view.FolderRoles[role.Role] = role.RemotePath
+			}
+		}
+		if run, err := s.Store.LatestSyncRun(r.Context(), account.ID, false); err == nil {
+			view.LastSync = &run
+		}
+		out = append(out, view)
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -353,6 +945,15 @@ func (s *Server) saveAccount(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
+	alertsAvailable, err := s.Store.AlertsAvailable(r.Context())
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	if !alertsAvailable && u.Role != "admin" {
+		req.CallAlertEnabled = false
+		req.AlertFolders = nil
+	}
 	if req.CanonicalName == "" || req.Email == "" || req.IMAPHost == "" || req.IMAPUser == "" || req.SMTPHost == "" || req.SMTPUser == "" {
 		writeError(w, http.StatusBadRequest, "canonical name, email, IMAP, and SMTP fields are required")
 		return
@@ -361,11 +962,11 @@ func (s *Server) saveAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "email address is invalid")
 		return
 	}
-	if req.IMAPPort < 0 || req.IMAPPort > 65535 || req.SMTPPort < 0 || req.SMTPPort > 65535 {
-		writeError(w, http.StatusBadRequest, "mail ports must be between 1 and 65535")
+	if req.IMAPPort < 0 || req.IMAPPort > 65535 || req.SMTPPort < 0 || req.SMTPPort > 65535 || req.SMTPPort == 25 {
+		writeError(w, http.StatusBadRequest, "mail ports must be between 1 and 65535; SMTP port 25 requires an explicit plaintext policy")
 		return
 	}
-	if req.DisplayOrder < 0 || req.SyncIntervalMinutes < 0 || (req.RetentionDays != nil && *req.RetentionDays < 1) {
+	if req.DisplayOrder < 0 || req.SyncIntervalMinutes < 0 || req.ReconciliationIntervalMinutes < 0 || (req.RetentionDays != nil && *req.RetentionDays < 1) {
 		writeError(w, http.StatusBadRequest, "order, sync interval, and retention values are invalid")
 		return
 	}
@@ -373,6 +974,27 @@ func (s *Server) saveAccount(w http.ResponseWriter, r *http.Request) {
 		if _, err := time.Parse(time.RFC3339, strings.TrimSpace(*req.InitialCutoff)); err != nil {
 			writeError(w, http.StatusBadRequest, "initial cutoff must be RFC3339")
 			return
+		}
+	}
+	if req.FolderMap == nil {
+		req.FolderMap = make(map[string]string)
+	}
+	for role, remote := range req.FolderRoles {
+		role = strings.ToLower(strings.TrimSpace(role))
+		remote = strings.TrimSpace(remote)
+		if role != "inbox" && role != "sent" && role != "drafts" && role != "spam" && role != "trash" && role != "archive" {
+			writeError(w, http.StatusBadRequest, "invalid folder role")
+			return
+		}
+		if remote == "" {
+			continue
+		}
+		if req.FolderMap[remote] == "" {
+			name := role
+			if len(name) > 0 {
+				name = strings.ToUpper(name[:1]) + name[1:]
+			}
+			req.FolderMap[remote] = name
 		}
 	}
 	if err := validateFolderMap(req.FolderMap); err != nil {
@@ -385,6 +1007,7 @@ func (s *Server) saveAccount(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	req.AlertFolders = normalizeAlertFolders(req.AlertFolders, req.FolderMap)
 	if req.ID != "" {
 		accounts, err := s.Store.ListAccounts(r.Context(), u.ID)
 		if err != nil {
@@ -412,8 +1035,22 @@ func (s *Server) saveAccount(w http.ResponseWriter, r *http.Request) {
 	if req.SMTPPort == 0 {
 		req.SMTPPort = 465
 	}
+	var securityErr error
+	req.IMAPSecurity, securityErr = normalizeMailSecurity(req.IMAPSecurity, req.IMAPPort)
+	if securityErr != nil {
+		writeError(w, http.StatusBadRequest, "invalid IMAP security mode")
+		return
+	}
+	req.SMTPSecurity, securityErr = normalizeMailSecurity(req.SMTPSecurity, req.SMTPPort)
+	if securityErr != nil {
+		writeError(w, http.StatusBadRequest, "invalid SMTP security mode")
+		return
+	}
 	if req.SyncIntervalMinutes < 1 {
 		req.SyncIntervalMinutes = 5
+	}
+	if req.ReconciliationIntervalMinutes < 1 {
+		req.ReconciliationIntervalMinutes = 1440
 	}
 	folder, _ := json.Marshal(req.FolderMap)
 	alerts, _ := json.Marshal(req.AlertFolders)
@@ -421,18 +1058,92 @@ func (s *Server) saveAccount(w http.ResponseWriter, r *http.Request) {
 	if id == "" {
 		id = newID()
 	}
-	a := store.Account{ID: id, UserID: u.ID, CanonicalName: req.CanonicalName, Email: req.Email, SenderName: req.SenderName, IMAPHost: req.IMAPHost, IMAPPort: req.IMAPPort, IMAPUser: req.IMAPUser, IMAPPassword: req.IMAPPassword, SMTPHost: req.SMTPHost, SMTPPort: req.SMTPPort, SMTPUser: req.SMTPUser, SMTPPassword: req.SMTPPassword, FolderMap: string(folder), AlertFolders: string(alerts), SyncIntervalMinutes: req.SyncIntervalMinutes, DisplayOrder: req.DisplayOrder, InitialCutoff: req.InitialCutoff, RetentionDays: req.RetentionDays, CallAlertEnabled: req.CallAlertEnabled}
+	a := store.Account{ID: id, UserID: u.ID, CanonicalName: req.CanonicalName, Email: req.Email, SenderName: req.SenderName, IMAPHost: req.IMAPHost, IMAPPort: req.IMAPPort, IMAPSecurity: req.IMAPSecurity, IMAPUser: req.IMAPUser, IMAPPassword: req.IMAPPassword, SMTPHost: req.SMTPHost, SMTPPort: req.SMTPPort, SMTPSecurity: req.SMTPSecurity, SMTPUser: req.SMTPUser, SMTPPassword: req.SMTPPassword, FolderMap: string(folder), AlertFolders: string(alerts), SyncIntervalMinutes: req.SyncIntervalMinutes, ReconciliationIntervalMinutes: req.ReconciliationIntervalMinutes, DisplayOrder: req.DisplayOrder, InitialCutoff: req.InitialCutoff, RetentionDays: req.RetentionDays, CallAlertEnabled: req.CallAlertEnabled}
 	if err := s.Store.SaveAccount(r.Context(), s.Secrets, a); err != nil {
 		serverError(w, err)
 		return
 	}
+	if req.FolderRoles != nil {
+		if err := s.Store.SaveFolderRoles(r.Context(), u.ID, id, req.FolderRoles, req.FolderMap); err != nil {
+			serverError(w, err)
+			return
+		}
+	}
+	_ = s.Store.Audit(r.Context(), u.ID, "account_saved", id)
 	writeJSON(w, http.StatusCreated, map[string]string{"id": id})
+}
+
+// validateAccount authenticates a new account without persisting credentials.
+// The browser wizard calls this before POST /accounts so folder roles can be
+// chosen only after the provider has been reached and its folders discovered.
+func (s *Server) validateAccount(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.require(w, r, true); !ok {
+		return
+	}
+	var req accountRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if strings.TrimSpace(req.IMAPPassword) == "" || strings.TrimSpace(req.SMTPPassword) == "" {
+		writeError(w, http.StatusBadRequest, "IMAP and SMTP passwords are required for validation")
+		return
+	}
+	if req.IMAPHost == "" || req.IMAPUser == "" || req.SMTPHost == "" || req.SMTPUser == "" {
+		writeError(w, http.StatusBadRequest, "IMAP and SMTP hosts and usernames are required")
+		return
+	}
+	if req.IMAPPort == 0 {
+		req.IMAPPort = 993
+	}
+	if req.SMTPPort == 0 {
+		req.SMTPPort = 465
+	}
+	var err error
+	if req.IMAPSecurity, err = normalizeMailSecurity(req.IMAPSecurity, req.IMAPPort); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid IMAP security mode")
+		return
+	}
+	if req.SMTPSecurity, err = normalizeMailSecurity(req.SMTPSecurity, req.SMTPPort); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid SMTP security mode")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	folders, err := s.checkAccountCredentials(ctx, req)
+	if err != nil {
+		if s.log() != nil {
+			s.log().Warn("new account validation failed", "imap_host", req.IMAPHost, "smtp_host", req.SMTPHost, "error", err)
+		}
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "authenticated", "folders": folders})
+}
+
+func (s *Server) checkAccountCredentials(ctx context.Context, req accountRequest) ([]string, error) {
+	imapAddress, err := ssrfSafeAddress(ctx, req.IMAPHost, req.IMAPPort)
+	if err != nil {
+		return nil, fmt.Errorf("IMAP host is not reachable by policy")
+	}
+	folders, err := imapcheck.Check(ctx, imapcheck.Config{Host: req.IMAPHost, Address: imapAddress, Port: req.IMAPPort, Security: req.IMAPSecurity, Username: req.IMAPUser, Password: req.IMAPPassword})
+	if err != nil {
+		return nil, err
+	}
+	smtpAddress, err := ssrfSafeAddress(ctx, req.SMTPHost, req.SMTPPort)
+	if err != nil {
+		return nil, fmt.Errorf("SMTP host is not reachable by policy")
+	}
+	if err := mailer.Check(ctx, mailer.Config{Host: req.SMTPHost, Address: smtpAddress, Port: req.SMTPPort, Security: req.SMTPSecurity, Username: req.SMTPUser, Password: req.SMTPPassword}); err != nil {
+		return nil, err
+	}
+	return folders, nil
 }
 
 func (s *Server) deleteAccount(w http.ResponseWriter, r *http.Request) {
 	u, ok := s.require(w, r, true)
 	if ok {
-		if err := s.Store.DeleteAccount(r.Context(), u.ID, r.PathValue("id")); err != nil {
+		accountID := r.PathValue("id")
+		if err := s.Store.DeleteAccount(r.Context(), u.ID, accountID); err != nil {
 			serverError(w, err)
 			return
 		}
@@ -445,8 +1156,79 @@ func (s *Server) deleteAccount(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+		_ = s.Store.Audit(r.Context(), u.ID, "account_deleted", accountID)
 		w.WriteHeader(http.StatusNoContent)
 	}
+}
+
+func (s *Server) syncAccount(w http.ResponseWriter, r *http.Request) {
+	u, ok := s.require(w, r, true)
+	if !ok {
+		return
+	}
+	if s.Sync == nil {
+		writeError(w, http.StatusServiceUnavailable, "mail synchronization is not running")
+		return
+	}
+	accountID := r.PathValue("id")
+	accounts, err := s.Store.ListAccounts(r.Context(), u.ID)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	found := false
+	for _, account := range accounts {
+		if account.ID == accountID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, "account not found")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+	defer cancel()
+	if err := s.Sync.RefreshAccount(ctx, u.ID, accountID); err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	_ = s.Store.Audit(r.Context(), u.ID, "account_sync_requested", accountID)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "synchronized"})
+}
+
+func (s *Server) accountMutations(w http.ResponseWriter, r *http.Request) {
+	u, ok := s.require(w, r, false)
+	if !ok {
+		return
+	}
+	accountID := strings.TrimSpace(r.PathValue("id"))
+	if accountID == "" {
+		writeError(w, http.StatusBadRequest, "account id is required")
+		return
+	}
+	accounts, err := s.Store.ListAccounts(r.Context(), u.ID)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	found := false
+	for _, account := range accounts {
+		if account.ID == accountID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, "account not found")
+		return
+	}
+	mutations, err := s.Store.ListMessageMutations(r.Context(), u.ID, accountID, 50)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, mutations)
 }
 
 type testAccountRequest struct {
@@ -482,26 +1264,77 @@ func (s *Server) testAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "account not found")
 		return
 	}
-	port := account.IMAPPort
-	if port == 0 {
-		port = 993
+	if s.Secrets == nil {
+		writeError(w, http.StatusServiceUnavailable, "mail secret storage is unavailable")
+		return
+	}
+	imapPassword, err := s.Secrets.Open(account.IMAPPassword)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "stored IMAP credentials are unavailable")
+		return
+	}
+	smtpPassword, err := s.Secrets.Open(account.SMTPPassword)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "stored SMTP credentials are unavailable")
+		return
+	}
+	imapPort := account.IMAPPort
+	if imapPort == 0 {
+		imapPort = 993
+	}
+	smtpPort := account.SMTPPort
+	if smtpPort == 0 {
+		smtpPort = 465
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	if err := ssrfSafeDial(ctx, account.IMAPHost, port); err != nil {
-		writeError(w, http.StatusBadGateway, "connection failed")
+	imapAddress, err := ssrfSafeAddress(ctx, account.IMAPHost, imapPort)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "IMAP host is not reachable by policy")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "reachable"})
+	folders, err := imapcheck.Check(ctx, imapcheck.Config{Host: account.IMAPHost, Address: imapAddress, Port: imapPort, Security: account.IMAPSecurity, Username: account.IMAPUser, Password: imapPassword})
+	if err != nil {
+		if s.log() != nil {
+			s.log().Warn("authenticated IMAP test failed", "account_id", account.ID, "error", err)
+		}
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	smtpAddress, err := ssrfSafeAddress(ctx, account.SMTPHost, smtpPort)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "SMTP host is not reachable by policy")
+		return
+	}
+	if err := mailer.Check(ctx, mailer.Config{Host: account.SMTPHost, Address: smtpAddress, Port: smtpPort, Security: account.SMTPSecurity, Username: account.SMTPUser, Password: smtpPassword}); err != nil {
+		if s.log() != nil {
+			s.log().Warn("authenticated SMTP test failed", "account_id", account.ID, "error", err)
+		}
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "authenticated", "folders": folders})
 }
 
 // ssrfSafeDial resolves host and connects to a validated, globally routable
 // address so the glance test can never be redirected at loopback, private,
 // link-local, metadata, or CGNAT ranges.
 func ssrfSafeDial(ctx context.Context, host string, port int) error {
-	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	address, err := ssrfSafeAddress(ctx, host, port)
 	if err != nil {
 		return err
+	}
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", address)
+	if err != nil {
+		return err
+	}
+	return conn.Close()
+}
+
+func ssrfSafeAddress(ctx context.Context, host string, port int) (string, error) {
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return "", err
 	}
 	var dialErr error
 	for _, resolved := range ips {
@@ -515,16 +1348,17 @@ func ssrfSafeDial(ctx context.Context, host string, port int) error {
 		}
 		conn, dialErr := net.DialTimeout("tcp", net.JoinHostPort(resolved.IP.String(), strconv.Itoa(port)), timeout)
 		if dialErr == nil {
-			return conn.Close()
+			_ = conn.Close()
+			return net.JoinHostPort(resolved.IP.String(), strconv.Itoa(port)), nil
 		}
 	}
 	if len(ips) == 0 {
-		return errors.New("no addresses resolved")
+		return "", errors.New("no addresses resolved")
 	}
 	if dialErr != nil {
-		return dialErr
+		return "", dialErr
 	}
-	return errors.New("host resolves only to blocked addresses")
+	return "", errors.New("host resolves only to blocked addresses")
 }
 
 func ssrfBlocked(ip net.IP) bool {
@@ -654,6 +1488,7 @@ func (s *Server) addWhitelist(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "phone already belongs to a user")
 		return
 	}
+	_ = s.Store.Audit(r.Context(), u.ID, "caller_whitelist_added", e.Phone)
 	writeJSON(w, http.StatusCreated, e)
 }
 func (s *Server) deleteWhitelist(w http.ResponseWriter, r *http.Request) {
@@ -670,6 +1505,7 @@ func (s *Server) deleteWhitelist(w http.ResponseWriter, r *http.Request) {
 		serverError(w, err)
 		return
 	}
+	_ = s.Store.Audit(r.Context(), u.ID, "caller_whitelist_deleted", fmt.Sprint(id))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -687,7 +1523,48 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 		serverError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"tts_voice": voice, "menu_speed": menu, "email_speed": email, "alerts_enabled": enabled != 0, "alert_phone": phone})
+	available, err := s.Store.AlertsAvailable(r.Context())
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	result := map[string]any{"tts_voice": voice, "menu_speed": menu, "email_speed": email, "alerts_available": available}
+	if available || u.Role == "admin" {
+		result["alerts_enabled"] = enabled != 0
+		result["alert_phone"] = phone
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) adminAlerts(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	available, err := s.Store.AlertsAvailable(r.Context())
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"available": available})
+}
+
+func (s *Server) saveAdminAlerts(w http.ResponseWriter, r *http.Request) {
+	u, ok := s.requireAdmin(w, r)
+	if !ok {
+		return
+	}
+	var body struct {
+		Available bool `json:"available"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	if err := s.Store.SetAlertsAvailable(r.Context(), body.Available); err != nil {
+		serverError(w, err)
+		return
+	}
+	_ = s.Store.Audit(r.Context(), u.ID, "global_alert_availability_changed", fmt.Sprintf("available=%t", body.Available))
+	writeJSON(w, http.StatusOK, body)
 }
 func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
 	u, ok := s.require(w, r, true)
@@ -704,6 +1581,15 @@ func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &body) {
 		return
 	}
+	alertsAvailable, err := s.Store.AlertsAvailable(r.Context())
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	if !alertsAvailable && u.Role != "admin" {
+		body.AlertsEnabled = false
+		body.AlertPhone = nil
+	}
 	if body.TTSVoice == "" {
 		body.TTSVoice = "en_US-hfc_male-medium"
 	}
@@ -718,6 +1604,24 @@ func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid voice model")
 		return
 	}
+	if !s.voiceAvailable(body.TTSVoice) {
+		writeError(w, http.StatusBadRequest, "voice model is not installed; an administrator must install it first")
+		return
+	}
+	if s.Voice != nil {
+		voiceCtx, cancel := context.WithTimeout(r.Context(), 30*time.Minute)
+		err := s.Voice.ActivateVoice(voiceCtx, body.TTSVoice, body.MenuSpeed, body.EmailSpeed)
+		cancel()
+		if err != nil {
+			writeError(w, http.StatusBadGateway, "voice installation or prompt generation failed")
+			return
+		}
+	}
+	// Selecting a trusted voice is configuration, not proof that the model is
+	// already present.  The model may be installed immediately through the
+	// console or provisioned asynchronously by deployment tooling; rejecting
+	// the setting here made a valid selection impossible on a fresh volume.
+	// Calls still fail closed with a clear speech error until the model exists.
 	if body.AlertPhone != nil {
 		phone := normalizePhone(*body.AlertPhone)
 		if phone == "" {
@@ -726,16 +1630,291 @@ func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
 			body.AlertPhone = &phone
 		}
 	}
-	_, err := s.Store.DB.ExecContext(r.Context(), `INSERT INTO settings(user_id,tts_voice,menu_speed,email_speed,alerts_enabled,alert_phone) VALUES(?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET tts_voice=excluded.tts_voice,menu_speed=excluded.menu_speed,email_speed=excluded.email_speed,alerts_enabled=excluded.alerts_enabled,alert_phone=excluded.alert_phone`, u.ID, body.TTSVoice, body.MenuSpeed, body.EmailSpeed, body.AlertsEnabled, body.AlertPhone)
+	_, err = s.Store.DB.ExecContext(r.Context(), `INSERT INTO settings(user_id,tts_voice,menu_speed,email_speed,alerts_enabled,alert_phone) VALUES(?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET tts_voice=excluded.tts_voice,menu_speed=excluded.menu_speed,email_speed=excluded.email_speed,alerts_enabled=excluded.alerts_enabled,alert_phone=excluded.alert_phone`, u.ID, body.TTSVoice, body.MenuSpeed, body.EmailSpeed, body.AlertsEnabled, body.AlertPhone)
 	if err != nil {
 		serverError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, body)
+	if body.AlertPhone == nil {
+		if err := s.Store.ClearAlertNumbers(r.Context(), u.ID); err != nil {
+			serverError(w, err)
+			return
+		}
+	} else if err := s.Store.SaveAlertNumber(r.Context(), u.ID, *body.AlertPhone, true); err != nil {
+		serverError(w, err)
+		return
+	}
+	result := map[string]any{
+		"tts_voice":   body.TTSVoice,
+		"menu_speed":  body.MenuSpeed,
+		"email_speed": body.EmailSpeed,
+	}
+	if alertsAvailable || u.Role == "admin" {
+		result["alerts_enabled"] = body.AlertsEnabled
+		result["alert_phone"] = body.AlertPhone
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) alertNumbers(w http.ResponseWriter, r *http.Request) {
+	u, ok := s.requireAlerts(w, r, false)
+	if !ok {
+		return
+	}
+	numbers, err := s.Store.ListAlertNumbers(r.Context(), u.ID)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	// Migrate the legacy single-number setting into the durable list on first
+	// read, preserving existing deployments without exposing two sources of
+	// truth to the browser.
+	if len(numbers) == 0 {
+		if legacy, legacyErr := s.Store.ActiveAlertNumber(r.Context(), u.ID); legacyErr == nil && legacy != "" {
+			if saveErr := s.Store.SaveAlertNumber(r.Context(), u.ID, legacy, true); saveErr == nil {
+				numbers, _ = s.Store.ListAlertNumbers(r.Context(), u.ID)
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, numbers)
+}
+
+func (s *Server) saveAlertNumber(w http.ResponseWriter, r *http.Request) {
+	u, ok := s.requireAlerts(w, r, true)
+	if !ok {
+		return
+	}
+	var body struct {
+		Number string `json:"number"`
+		Active bool   `json:"active"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	body.Number = normalizePhone(body.Number)
+	if body.Number == "" {
+		writeError(w, http.StatusBadRequest, "a valid alert number is required")
+		return
+	}
+	if err := s.Store.SaveAlertNumber(r.Context(), u.ID, body.Number, body.Active); err != nil {
+		serverError(w, err)
+		return
+	}
+	_ = s.Store.Audit(r.Context(), u.ID, "alert_number_saved", body.Number)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "saved"})
+}
+
+func (s *Server) activateAlertNumber(w http.ResponseWriter, r *http.Request) {
+	u, ok := s.requireAlerts(w, r, true)
+	if !ok {
+		return
+	}
+	id := parseID(r.PathValue("id"))
+	if id < 1 {
+		writeError(w, http.StatusBadRequest, "invalid alert number id")
+		return
+	}
+	if err := s.Store.SetActiveAlertNumber(r.Context(), u.ID, id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "alert number not found")
+		} else {
+			serverError(w, err)
+		}
+		return
+	}
+	_ = s.Store.Audit(r.Context(), u.ID, "alert_number_activated", fmt.Sprint(id))
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) deleteAlertNumber(w http.ResponseWriter, r *http.Request) {
+	u, ok := s.requireAlerts(w, r, true)
+	if !ok {
+		return
+	}
+	id := parseID(r.PathValue("id"))
+	if id < 1 {
+		writeError(w, http.StatusBadRequest, "invalid alert number id")
+		return
+	}
+	if err := s.Store.DeleteAlertNumber(r.Context(), u.ID, id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "alert number not found")
+		} else {
+			serverError(w, err)
+		}
+		return
+	}
+	_ = s.Store.Audit(r.Context(), u.ID, "alert_number_deleted", fmt.Sprint(id))
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) voices(w http.ResponseWriter, r *http.Request) {
+	u, ok := s.require(w, r, false)
+	if !ok {
+		return
+	}
+	result := make([]map[string]any, 0)
+	installed := speech.InstalledVoiceNames(s.VoiceDir)
+	if u.Role != "admin" {
+		for _, name := range installed {
+			result = append(result, map[string]any{"voice": name, "installed": true, "downloadable": false})
+		}
+		writeJSON(w, http.StatusOK, result)
+		return
+	}
+	seen := make(map[string]bool, len(installed))
+	for _, name := range installed {
+		seen[name] = true
+	}
+	for _, voice := range speech.TrustedVoiceCatalog() {
+		result = append(result, map[string]any{"voice": voice.Voice, "installed": seen[voice.Voice], "downloadable": true})
+		seen[voice.Voice] = true
+	}
+	for _, name := range installed {
+		if _, trusted := speech.FindTrustedVoice(name); trusted {
+			continue
+		}
+		result = append(result, map[string]any{"voice": name, "installed": true, "downloadable": false})
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) installVoice(w http.ResponseWriter, r *http.Request) {
+	u, ok := s.requireAdmin(w, r)
+	if !ok {
+		return
+	}
+	if s.VoiceDir == "" {
+		writeError(w, http.StatusServiceUnavailable, "voice directory is not configured")
+		return
+	}
+	var body struct {
+		Voice string `json:"voice"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	if _, ok := speech.FindTrustedVoice(body.Voice); !ok {
+		writeError(w, http.StatusBadRequest, "voice model is not in the trusted catalog")
+		return
+	}
+	job := &voiceInstallJob{ID: newID(), UserID: u.ID, Voice: body.Voice, Stage: "queued", Status: "queued", Progress: 0, UpdatedAt: time.Now().UTC()}
+	s.voiceMu.Lock()
+	if s.voiceJobs == nil {
+		s.voiceJobs = make(map[string]*voiceInstallJob)
+	}
+	s.voiceJobs[job.ID] = job
+	s.voiceMu.Unlock()
+	var menuSpeed, emailSpeed int = 3, 2
+	_ = s.Store.DB.QueryRowContext(r.Context(), `SELECT menu_speed,email_speed FROM settings WHERE user_id=?`, u.ID).Scan(&menuSpeed, &emailSpeed)
+	go s.runVoiceInstall(job.ID, u.ID, body.Voice, menuSpeed, emailSpeed)
+	writeJSON(w, http.StatusAccepted, map[string]string{"job_id": job.ID, "status": "queued"})
+}
+
+func (s *Server) updateVoiceJob(id, stage, status string, progress int, jobErr error) {
+	s.voiceMu.Lock()
+	defer s.voiceMu.Unlock()
+	job := s.voiceJobs[id]
+	if job == nil {
+		return
+	}
+	job.Stage, job.Status, job.Progress, job.UpdatedAt = stage, status, progress, time.Now().UTC()
+	if jobErr != nil {
+		job.Error = "voice installation failed"
+	}
+}
+
+func (s *Server) runVoiceInstall(id, userID, voice string, menuSpeed, emailSpeed int) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+	s.updateVoiceJob(id, "installing", "running", 10, nil)
+	var err error
+	if s.Voice != nil {
+		s.updateVoiceJob(id, "activating", "running", 35, nil)
+		err = s.Voice.ActivateVoice(ctx, voice, menuSpeed, emailSpeed)
+	} else {
+		err = speech.InstallVoice(ctx, s.VoiceDir, voice)
+	}
+	if err != nil {
+		s.updateVoiceJob(id, "failed", "failed", 100, err)
+		return
+	}
+	s.updateVoiceJob(id, "complete", "complete", 100, nil)
+	_ = s.Store.Audit(context.Background(), userID, "voice_installed", voice)
+}
+
+func (s *Server) voiceInstallStatus(w http.ResponseWriter, r *http.Request) {
+	u, ok := s.require(w, r, false)
+	if !ok {
+		return
+	}
+	id := r.PathValue("id")
+	s.voiceMu.Lock()
+	job := s.voiceJobs[id]
+	if job == nil || (job.UserID != u.ID && u.Role != "admin") {
+		s.voiceMu.Unlock()
+		writeError(w, http.StatusNotFound, "voice installation job not found")
+		return
+	}
+	copy := *job
+	s.voiceMu.Unlock()
+	result := map[string]any{"job_id": copy.ID, "voice": copy.Voice, "stage": copy.Stage, "status": copy.Status, "progress": copy.Progress, "updated_at": copy.UpdatedAt}
+	if copy.Error != "" {
+		result["error"] = copy.Error
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) voiceAvailable(name string) bool {
+	if s.VoiceDir == "" {
+		_, ok := speech.FindTrustedVoice(name)
+		return ok
+	}
+	return speech.IsInstalledVoice(s.VoiceDir, name)
+}
+
+func (s *Server) previewVoice(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.require(w, r, true); !ok {
+		return
+	}
+	if s.Preview == nil {
+		writeError(w, http.StatusServiceUnavailable, "voice preview is unavailable")
+		return
+	}
+	var body struct {
+		Voice string `json:"voice"`
+		Speed int    `json:"speed"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	body.Voice = strings.TrimSpace(body.Voice)
+	if !s.voiceAvailable(body.Voice) {
+		writeError(w, http.StatusBadRequest, "voice model is not installed")
+		return
+	}
+	if body.Speed < 1 || body.Speed > 5 {
+		body.Speed = 3
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	defer cancel()
+	audio, err := s.Preview.PreviewVoice(ctx, body.Voice, body.Speed)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "voice preview failed")
+		return
+	}
+	if len(audio) == 0 || len(audio) > 16<<20 {
+		writeError(w, http.StatusBadGateway, "voice preview output is invalid")
+		return
+	}
+	w.Header().Set("Content-Type", "audio/wav")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(audio)
 }
 
 func (s *Server) testAlert(w http.ResponseWriter, r *http.Request) {
-	u, ok := s.require(w, r, true)
+	u, ok := s.requireAlerts(w, r, true)
 	if !ok {
 		return
 	}
@@ -882,7 +2061,7 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.Ready != nil {
 		if err := s.Ready(ctx); err != nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not_ready", "reason": "bridge unavailable"})
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not_ready", "reason": err.Error()})
 			return
 		}
 	}
@@ -934,6 +2113,27 @@ func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) (store.Use
 	}
 	return u, true
 }
+
+// requireAlerts keeps the alert API unavailable when the administrator has
+// disabled the feature for the deployment. The separate admin availability
+// endpoint remains usable so the administrator can turn it back on.
+func (s *Server) requireAlerts(w http.ResponseWriter, r *http.Request, write bool) (store.User, bool) {
+	u, ok := s.require(w, r, write)
+	if !ok {
+		return store.User{}, false
+	}
+	available, err := s.Store.AlertsAvailable(r.Context())
+	if err != nil {
+		serverError(w, err)
+		return store.User{}, false
+	}
+	if !available {
+		writeError(w, http.StatusNotFound, "alert controls are disabled by the administrator")
+		return store.User{}, false
+	}
+	return u, true
+}
+
 func (s *Server) issueSession(w http.ResponseWriter, r *http.Request, userID string) {
 	token := newID()
 	csrf := newID()
@@ -970,6 +2170,16 @@ func (s *SessionStore) Delete(token string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.byToken, token)
+}
+
+func (s *SessionStore) DeleteUser(userID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for token, session := range s.byToken {
+		if session.UserID == userID {
+			delete(s.byToken, token)
+		}
+	}
 }
 func (s *SessionStore) reapLocked() {
 	if len(s.byToken) < 256 || time.Since(s.lastReap) < time.Minute {
@@ -1039,6 +2249,24 @@ func validateCredentials(username, password, pin string) error {
 	if len(password) < 12 {
 		return errors.New("password must be at least 12 characters")
 	}
+	return validatePIN(pin)
+}
+
+func normalizeMailSecurity(value string, port int) (string, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		if port == 993 || port == 465 {
+			return "implicit_tls", nil
+		}
+		return "starttls", nil
+	}
+	if value != "implicit_tls" && value != "starttls" {
+		return "", errors.New("security must use implicit TLS or STARTTLS")
+	}
+	return value, nil
+}
+
+func validatePIN(pin string) error {
 	if len(pin) < 4 || len(pin) > 12 {
 		return errors.New("PIN must be 4-12 digits")
 	}
@@ -1064,6 +2292,46 @@ func validateFolderMap(mapping map[string]string) error {
 	}
 	return nil
 }
+
+// normalizeAlertFolders stores local Maildir folder names because indexed
+// messages and alert candidates use local names. An empty selection means the
+// documented default: the mapped Inbox, or Inbox when no mapping exists.
+func normalizeAlertFolders(folders []string, mapping map[string]string) []string {
+	if len(folders) == 0 {
+		if inbox := mappedInboxFolder(mapping); inbox != "" {
+			return []string{inbox}
+		}
+		return []string{"Inbox"}
+	}
+	seen := make(map[string]struct{}, len(folders))
+	out := make([]string, 0, len(folders))
+	for _, folder := range folders {
+		folder = strings.TrimSpace(folder)
+		if local := mapping[folder]; local != "" {
+			folder = local
+		}
+		if folder == "" {
+			continue
+		}
+		if _, ok := seen[strings.ToLower(folder)]; ok {
+			continue
+		}
+		seen[strings.ToLower(folder)] = struct{}{}
+		out = append(out, folder)
+	}
+	if len(out) == 0 {
+		return []string{mappedInboxFolder(mapping)}
+	}
+	return out
+}
+
+func mappedInboxFolder(mapping map[string]string) string {
+	if local := mapping["INBOX"]; local != "" {
+		return local
+	}
+	return "Inbox"
+}
+
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	d := json.NewDecoder(r.Body)
@@ -1090,7 +2358,7 @@ func withSecurityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
-		w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; frame-src 'none'; media-src 'none'; object-src 'none'")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; frame-src 'none'; media-src 'self' blob:; object-src 'none'")
 		next.ServeHTTP(w, r)
 	})
 }

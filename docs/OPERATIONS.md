@@ -60,6 +60,13 @@ docker compose ps
 docker compose logs --tail 100 voxmail
 ```
 
+The Compose service has conservative defaults of 2 GiB memory, 2 CPUs, 256
+processes, and 4096/8192 open files. Increase these limits deliberately when
+running larger Whisper/Piper models or allowing more simultaneous calls; do
+not remove the process and file-descriptor limits without replacing them with
+equivalent host controls. The container has a 20-second graceful-stop window
+so active sync and calls can clean up before Docker restarts it.
+
 The manually triggered GitHub Action builds native amd64 and arm64 images,
 combines them on GHCR, and advances `latest` for non-`latest` releases. It
 does not run automatically. See the root README for the exact workflow inputs
@@ -74,8 +81,11 @@ curl -fsS http://127.0.0.1:8080/readyz
 ```
 
 `healthz` confirms the HTTP process responds. `readyz` additionally checks
-SQLite. The browser shows **First-run setup** only while the database contains
-no users; after setup, sign in normally.
+SQLite, the mail-sync worker, and—when SIP calls are enabled—the baresip bridge
+and configured Piper/Whisper model files. A temporary `not_ready` response
+after startup is expected while the workers initialize. The browser shows
+**First-run setup** only while the database contains no users; after setup,
+sign in normally.
 
 ## Data and backups
 
@@ -92,6 +102,28 @@ All application state is under `/data`:
 Stop the service or use a filesystem-consistent volume snapshot before copying
 SQLite and Maildirs. Store the encryption key separately from the data archive
 but back it up; without it encrypted account passwords cannot be recovered.
+
+For a simple offline backup:
+
+```sh
+docker compose stop voxmail
+docker run --rm -v voxmail-data:/source:ro -v "$PWD/backups:/backup" \
+  busybox tar czf /backup/voxmail-$(date -u +%Y%m%dT%H%M%SZ).tar.gz -C /source .
+docker compose start voxmail
+```
+
+To restore, stop the service, move the existing named volume out of service,
+extract the selected archive into a fresh `voxmail-data` volume, restore the
+same `VOXMAIL_ENCRYPTION_KEY`, and start the pinned image. Test `/readyz`, sign
+in, and confirm an account sync before deleting the old volume. Keep at least
+one prior archive until the restored deployment has been verified.
+
+For rollback, set `VOXMAIL_IMAGE` to the previous immutable release tag or
+digest, run `docker compose pull`, then
+`docker compose up -d --force-recreate`. Database migrations are designed to
+be forward-compatible, so take a volume backup before upgrading and restore
+the backup rather than downgrading a database if a release explicitly says
+its schema is not backward-compatible.
 
 ## mbsync safety model
 

@@ -35,7 +35,12 @@ func Scan(root string) ([]MaildirMessage, error) {
 		if parseErr != nil {
 			return nil
 		}
-		folder := filepath.Base(filepath.Dir(filepath.Dir(path)))
+		folderPath := filepath.Dir(filepath.Dir(path))
+		folder, relErr := filepath.Rel(root, folderPath)
+		if relErr != nil || folder == "." || strings.HasPrefix(folder, ".."+string(filepath.Separator)) {
+			return nil
+		}
+		folder = filepath.ToSlash(folder)
 		name := filepath.Base(path)
 		read := false
 		if marker := strings.Index(name, ":2,"); marker >= 0 {
