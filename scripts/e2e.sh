@@ -105,10 +105,14 @@ docker run -d --name "$NAME" \
   --label "com.voxmail.e2e.run=$RUN_ID" \
   "$IMAGE" >>"$WORK/docker-run.log" 2>&1
 
-if [ -z "$WEBPORT" ]; then
+discover_webport() {
   mapped_port="$(docker port "$NAME" 8080/tcp | sed -n '1{s/.*://p}')"
   test -n "$mapped_port" || { echo "could not discover the mapped web port" >&2; exit 1; }
   WEBPORT="$mapped_port"
+}
+
+if [ -z "$WEBPORT" ]; then
+  discover_webport
 fi
 echo "web console mapped to 127.0.0.1:$WEBPORT"
 
@@ -172,6 +176,12 @@ fi
 
 echo "== phase 2: restart the container and verify persistence"
 docker restart "$NAME" >/dev/null
+# Docker may allocate a new host port for an ephemeral -p binding when the
+# container is restarted. Refresh the port before probing readiness.
+if [ -z "${VOXMAIL_E2E_WEB_PORT:-}" ]; then
+  discover_webport
+  echo "web console remapped to 127.0.0.1:$WEBPORT"
+fi
 wait_ready
 VOXMAIL_URL="http://127.0.0.1:$WEBPORT" go run "$ROOT/tests/e2e" -after-restart
 
