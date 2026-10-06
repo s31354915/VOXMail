@@ -506,7 +506,7 @@ func (s *Service) greet(sess *session) {
 			s.Log.Warn("static greeting unavailable; falling back to synthesis", "error", err)
 		}
 	}
-	s.prompt(sess, "Welcome to VOXMail. Enter your PIN, then press pound.")
+	s.prompt(sess, speech.StaticWelcomeText)
 }
 
 func (s *Service) prompt(sess *session, text string) error {

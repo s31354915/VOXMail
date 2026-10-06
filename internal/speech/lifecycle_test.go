@@ -211,7 +211,7 @@ func TestPrepareStaticPromptsRejectsManifestPathTraversal(t *testing.T) {
 	if err := os.WriteFile(outside, []byte("must remain"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	malicious, err := json.Marshal(StaticPromptManifest{Version: 2, VoiceModel: "voice", PromptSHA256: promptDigest(StaticPromptTexts()), WelcomeText: StaticWelcomeText, MainText: StaticMainText, Assets: map[string]string{"welcome": "../outside.wav"}})
+	malicious, err := json.Marshal(StaticPromptManifest{Version: staticPromptManifestVersion, VoiceModel: "voice", PromptSHA256: promptDigest(StaticPromptTexts()), WelcomeText: StaticWelcomeText, MainText: StaticMainText, Assets: map[string]string{"welcome": "../outside.wav"}})
 	if err != nil {
 		t.Fatal(err)
 	}

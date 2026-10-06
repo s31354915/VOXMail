@@ -131,7 +131,17 @@ func (p *PromptPlayer) dynamicPromptPath(userID string, runtime *speech.Runtime,
 		return "", false
 	}
 	voice := strings.TrimSuffix(filepath.Base(runtime.Piper.Model), filepath.Ext(runtime.Piper.Model))
-	key := strings.Join([]string{userID, voice, fmt.Sprint(runtime.Speed), checksum, text}, "\x00")
+	// Include both the normalized text and its policy version. Existing prompt
+	// files were generated from raw uppercase tokens and must not survive this
+	// pronunciation fix merely because the source prompt is unchanged.
+	key := strings.Join([]string{
+		userID,
+		voice,
+		fmt.Sprint(runtime.Speed),
+		checksum,
+		fmt.Sprint(speech.SpeechNormalizationVersion),
+		speech.NormalizeForSpeech(text),
+	}, "\x00")
 	name := fmt.Sprintf("%x.wav", sha256.Sum256([]byte(key)))
 	return filepath.Join(p.Dir, "dynamic", name), true
 }

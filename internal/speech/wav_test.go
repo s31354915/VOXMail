@@ -96,6 +96,31 @@ func TestPiperSynthesisWaitsForProcessAndPublishesAtomically(t *testing.T) {
 	}
 }
 
+func TestPiperSynthesisNormalizesTextBeforeLaunchingPiper(t *testing.T) {
+	root := t.TempDir()
+	seen := filepath.Join(root, "input.txt")
+	piper := writeFakePiper(t, "cat > "+shellQuote(seen)+"\n"+partialWAVBody+"\nprintf '\\000\\000' >> \"$out\"")
+	model := filepath.Join(root, "model.onnx")
+	if err := os.WriteFile(model, []byte("model"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(root, "published.wav")
+	if err := (Piper{Binary: piper, Model: model}).Synthesize(context.Background(), "Welcome to VOXMail. Enter your PIN.", output); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(seen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(data), "Welcome to Vox Mail. Enter your pin.\n"; got != want {
+		t.Fatalf("Piper received %q, want %q", got, want)
+	}
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
+
 func TestPiperSynthesisRejectsMidWriteExitAndPreservesPreviousOutput(t *testing.T) {
 	piper := writeFakePiper(t, partialWAVBody+"\nexit 0")
 	model := filepath.Join(t.TempDir(), "model.onnx")

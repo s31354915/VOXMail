@@ -135,6 +135,7 @@ func synthesizePiper(ctx context.Context, p Piper, text, output string) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	text = NormalizeForSpeech(text)
 	if text == "" {
 		return fmt.Errorf("cannot synthesize empty text")
 	}

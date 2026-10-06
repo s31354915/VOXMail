@@ -58,6 +58,14 @@ The signed-in main menu is static because its three choices never change with
 the number of accounts. Account, folder, contact, and attachment prompts are
 dynamic.
 
+Every Piper invocation passes through the same speech normalizer. It rewrites
+brand and ordinary-word tokens such as `VOXMail` and `PIN` to `Vox Mail` and
+`pin`, while preserving deliberate initialisms such as `SMTP` as spoken
+letters. The normalization version is included in dynamic prompt cache keys,
+and the static-prompt manifest version and digest include the normalized text,
+so a deployment cannot reuse recordings made with the old pronunciation.
+The bundled fallback WAVs are regenerated with that same pronunciation policy.
+
 At startup VOXMail compares prompt text, model name, and model digest. A
 matching manifest returns without touching Piper, so ordinary idle startup
 does not warm speech resources. If the configured model exists but differs,

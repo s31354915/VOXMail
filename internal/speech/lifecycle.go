@@ -18,9 +18,10 @@ import (
 )
 
 const (
-	BundledPromptVoice = "en_US-hfc_male-medium"
-	StaticWelcomeText  = "Welcome to VOXMail. Please enter your PIN, then press pound."
-	StaticMainText     = "You are signed in. Press 1 for email, 2 for settings, or 3 for information and instructions."
+	BundledPromptVoice          = "en_US-hfc_male-medium"
+	StaticWelcomeText           = "Welcome to VOXMail. Please enter your PIN, then press pound."
+	StaticMainText              = "You are signed in. Press 1 for email, 2 for settings, or 3 for information and instructions."
+	staticPromptManifestVersion = 3
 )
 
 type StaticPromptManifest struct {
@@ -60,7 +61,7 @@ func promptDigest(texts map[string]string) string {
 	for _, key := range keys {
 		_, _ = io.WriteString(hash, key)
 		_, _ = io.WriteString(hash, "\x00")
-		_, _ = io.WriteString(hash, texts[key])
+		_, _ = io.WriteString(hash, NormalizeForSpeech(texts[key]))
 		_, _ = io.WriteString(hash, "\x00")
 	}
 	return fmt.Sprintf("%x", hash.Sum(nil))
@@ -113,7 +114,7 @@ func PrepareStaticPrompts(ctx context.Context, p Piper, greetingPath, mainPath, 
 	texts := StaticPromptTexts()
 	digest := promptDigest(texts)
 	current, manifestErr := ReadStaticPromptManifest(manifestPath)
-	if manifestErr == nil && safeStaticAssets(current.Assets) && current.Version >= 2 && current.PromptSHA256 == digest && current.WelcomeText == StaticWelcomeText && current.MainText == StaticMainText {
+	if manifestErr == nil && safeStaticAssets(current.Assets) && current.Version >= staticPromptManifestVersion && current.PromptSHA256 == digest && current.WelcomeText == StaticWelcomeText && current.MainText == StaticMainText {
 		voice := filepath.Base(p.Model)
 		voice = strings.TrimSuffix(voice, filepath.Ext(voice))
 		if voice == current.VoiceModel {
@@ -145,7 +146,7 @@ func PrepareStaticPrompts(ctx context.Context, p Piper, greetingPath, mainPath, 
 		return current, err
 	}
 	voice := strings.TrimSuffix(filepath.Base(p.Model), filepath.Ext(p.Model))
-	manifest := StaticPromptManifest{Version: 2, VoiceModel: voice, ModelSHA256: modelDigest, PromptSHA256: promptDigest(texts), WelcomeText: StaticWelcomeText, MainText: StaticMainText, Assets: make(map[string]string, len(texts))}
+	manifest := StaticPromptManifest{Version: staticPromptManifestVersion, VoiceModel: voice, ModelSHA256: modelDigest, PromptSHA256: digest, WelcomeText: StaticWelcomeText, MainText: StaticMainText, Assets: make(map[string]string, len(texts))}
 	if err := os.MkdirAll(filepath.Dir(greetingPath), 0700); err != nil {
 		return current, err
 	}
@@ -669,7 +670,7 @@ func PrepareGreeting(ctx context.Context, p Piper, path string) error {
 	tmpPath := tmp.Name()
 	_ = tmp.Close()
 	defer os.Remove(tmpPath)
-	if err := p.Synthesize(ctx, "Welcome to VOXMail. Please enter your PIN, then press pound.", tmpPath); err != nil {
+	if err := p.Synthesize(ctx, StaticWelcomeText, tmpPath); err != nil {
 		return err
 	}
 	return os.Rename(tmpPath, path)
