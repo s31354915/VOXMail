@@ -1,6 +1,9 @@
 package ivr
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestEveryDefinedStateHasNavigationContract(t *testing.T) {
 	for _, spec := range States() {
@@ -23,6 +26,15 @@ func TestStateSpecAcceptsOnlyFixedKeys(t *testing.T) {
 	}
 	if !Accepts("recording", "0") || Accepts("recording", "1") {
 		t.Fatal("recording stop contract is wrong")
+	}
+	if !Accepts("move_menu", "0") || Accepts("contacts", "0") {
+		t.Fatal("pagination/contact key contract is wrong")
+	}
+	if prompt, ok := Prompt("list"); !ok || !strings.Contains(prompt, "6 to forward") {
+		t.Fatalf("message-list prompt omitted forwarding: %q", prompt)
+	}
+	if prompt, ok := Prompt("info"); !ok || !strings.Contains(prompt, "Press 1 or star to repeat") {
+		t.Fatalf("info prompt omitted its numeric repeat key: %q", prompt)
 	}
 	if !Accepts("body", "9") {
 		t.Fatal("editor state should defer validation to keypad input")
@@ -66,7 +78,7 @@ func TestEveryStateHasTableDrivenInputNavigationAndCancellationTrace(t *testing.
 		"recipient_input": "1", "subject_method": "1", "subject": "1",
 		"body_method": "1", "body": "1", "review": "1",
 		"forward_options": "1", "audio_recording": "0", "recording": "0",
-		"recording_subject": "0", "settings": "1", "contacts": "0", "info": "1",
+		"recording_subject": "0", "settings": "1", "contacts": "1", "info": "1",
 	}
 	for _, spec := range States() {
 		valid, ok := validKeys[spec.State]

@@ -557,7 +557,21 @@ func (s *Service) refreshAccount(sess *session, accountID string) {
 			s.prompt(sess, "The account refresh failed. Please try again later.")
 			return
 		}
-		s.prompt(sess, "The account refresh finished. Press 1 to listen to mail, 2 to send an email, or pound to return.")
+		s.mu.Lock()
+		var refreshed store.Account
+		for _, candidate := range sess.Accounts {
+			if candidate.ID == accountID {
+				refreshed = candidate
+				break
+			}
+		}
+		currentState := string(stateLocked(sess))
+		s.mu.Unlock()
+		if currentState == "account_menu" && refreshed.ID != "" {
+			s.prompt(sess, "The account refresh finished. "+s.accountMenuPrompt(sess, refreshed))
+		} else {
+			s.prompt(sess, "The account refresh finished.")
+		}
 	})
 }
 
@@ -878,7 +892,11 @@ func folderPromptFor(account store.Account, folders []string, prefix string, pag
 	if prefix != "" {
 		where = mappedFolder(account, prefix)
 	}
-	return "Folders in " + where + " for " + account.CanonicalName + ". " + strings.Join(parts, ". ") + "." + next + " Press 0 for Inbox at the root, or pound to go back."
+	rootOption := ""
+	if prefix == "" {
+		rootOption = " Press 0 for Inbox at the root."
+	}
+	return "Folders in " + where + " for " + account.CanonicalName + ". " + strings.Join(parts, ". ") + "." + next + rootOption + " Press pound to go back."
 }
 
 func contactPrompt(contacts []store.Contact, page int) string {

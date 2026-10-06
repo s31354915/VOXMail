@@ -153,7 +153,7 @@ func (s *Service) startAudioAttachment(sess *session) {
 	sess.RecordCancel = cancel
 	offset := info.Size()
 	s.mu.Unlock()
-	s.prompt(sess, "Speak after the tone. Press 0 when finished. The recording is limited to 30 seconds.")
+	s.prompt(sess, fmt.Sprintf("Speak after the tone. Press 0 when finished. The recording is limited to %d seconds.", int(s.Recorder.audioWindow()/time.Second)))
 	s.startTask(func() {
 		data, recordErr := s.Recorder.RecordAudio(ctx, sess.RxPath, offset)
 		cancel()
@@ -180,7 +180,7 @@ func (s *Service) startAudioAttachment(sess *session) {
 			s.prompt(sess, "The audio attachment could not be recorded. Returning to review.")
 			return
 		}
-		s.prompt(sess, "Audio attachment added. Press 1 to send, 2 to save as draft, 3 to cancel, or 5 to record another attachment.")
+		s.prompt(sess, "Audio attachment added. "+menuPrompt("review"))
 	})
 }
 func (s *Service) startComposeLocked(sess *session, mode string) {

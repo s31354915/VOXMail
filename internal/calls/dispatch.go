@@ -275,7 +275,7 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 			s.mu.Lock()
 			transitionLocked(sess, "info")
 			s.mu.Unlock()
-			s.prompt(sess, "VOXMail reads synchronized email over the phone. Press star to repeat, or pound to return.")
+			s.prompt(sess, menuPrompt("info"))
 		}
 	case "accounts":
 		if key == "0" {
@@ -317,7 +317,7 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 		s.handleSettingsMenu(sess, key)
 	case "info":
 		if key == "1" {
-			s.prompt(sess, "Press pound to go back. Star repeats the current information.")
+			s.prompt(sess, menuPrompt("info"))
 		}
 	case "list":
 		s.mu.Lock()

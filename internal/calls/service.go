@@ -609,19 +609,19 @@ func menuPrompt(state string) string {
 	case "main":
 		return "Press 1 for email, 2 for settings, or 3 for information and instructions."
 	case "accounts":
-		return "Press 0 for all unread mail, choose an account, or press pound to go back."
+		return "Press 0 for all unread mail, choose an account, press 9 for more if available, or press pound to go back."
 	case "account_menu":
-		return "Press 1 to listen to mail, 2 to send an email, 3 to refresh, or 4 for account settings."
+		return "Press 1 to listen to mail, 2 to send an email, 3 to refresh, or 4 for account settings when available."
 	case "folders":
-		return "Choose a folder, press 0 for Inbox at the root, or press pound to go back."
+		return "Choose a folder. If you are at the root, press 0 for Inbox. Press pound to go back."
 	case "folder_action":
 		return "Press 1 to listen to messages here, or 2 to open nested folders."
 	case "contacts":
-		return "Choose a contact or press pound to go back."
+		return "Choose a contact, press 9 for more if available, or press pound to go back."
 	case "settings":
-		return "Press 1 for voice settings, 2 to toggle call alerts, 3 for contacts, or pound to go back."
+		return "Press 1 for voice settings, 2 to toggle call alerts when available, 3 for contacts, or pound to go back."
 	case "list":
-		return "Press 1 to read, 2 for next, 3 for previous, 4 to delete, 5 to reply, or pound to go back."
+		return "Press 1 to read, 2 for next, 3 for previous, 4 to delete, 5 to reply, 6 to forward, or pound to go back."
 	case "read":
 		return "Press 1 to listen, 2 to mark read or unread, 3 to reply, 4 to reply all, 5 to forward, 6 to delete, 7 to move, 8 for attachments, 9 for more options, 0 for next, or pound to return."
 	case "more_options":
@@ -647,16 +647,16 @@ func menuPrompt(state string) string {
 	case "body":
 		return "Enter the message using multi tap, then press pound."
 	case "attachment_menu":
-		return "Choose an attachment, press 0 for more, or pound to return."
+		return "Choose an attachment, press 0 for more if available, or pound to return."
 	case "attachment_playback":
-		return "Playing the attachment. Press pound to stop."
+		return "Playing the attachment. Press any key to stop."
 	case "move_menu":
-		return "Choose a destination folder, or press pound to return."
+		return "Choose a destination folder, press 0 for more if available, or pound to return."
 	case "forward_options":
 		return "Forward the original message with its attachments? Press 1 for yes or 2 for no."
 	}
 	return "Press pound to go back or star to repeat."
 }
 func listPrompt(m store.MailSummary, cursor, total int) string {
-	return fmt.Sprintf("Message %d of %d. From %s. Subject %s. Press 1 to read.", cursor+1, total, m.Sender, m.Subject)
+	return fmt.Sprintf("Message %d of %d. From %s. Subject %s. %s", cursor+1, total, m.Sender, m.Subject, menuPrompt("list"))
 }

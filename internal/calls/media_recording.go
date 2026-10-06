@@ -32,6 +32,13 @@ type VoiceRecorder struct {
 	Window  time.Duration
 }
 
+func (r *VoiceRecorder) audioWindow() time.Duration {
+	if r == nil || r.Window <= 0 || r.Window > 60*time.Second {
+		return 30 * time.Second
+	}
+	return r.Window
+}
+
 func (r *VoiceRecorder) RecordAndTranscribe(ctx context.Context, rawPath string, offset int64) (string, error) {
 	return r.recordAndTranscribe(ctx, rawPath, offset, nil)
 }
@@ -133,10 +140,7 @@ func (r *VoiceRecorder) RecordAudio(ctx context.Context, rawPath string, offset 
 	if r == nil || rawPath == "" {
 		return nil, fmt.Errorf("voice recorder is not configured")
 	}
-	window := r.Window
-	if window <= 0 || window > 60*time.Second {
-		window = 30 * time.Second
-	}
+	window := r.audioWindow()
 	timer := time.NewTimer(window)
 	select {
 	case <-timer.C:

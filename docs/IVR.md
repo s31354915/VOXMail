@@ -6,8 +6,8 @@ repeats a prompt outside an editor.
 
 ## Call flow
 
-1. An allowed caller hears the prerecorded welcome: “Welcome to VOXMail.
-   Please enter your PIN, then press pound.”
+1. An allowed caller hears the prerecorded welcome: “Welcome to Vox Mail.
+   Please enter your pin, then press pound.”
 2. Enter the numeric PIN and press `#`.
 3. The signed-in menu has three choices:
    - `1` — Email. The next menu offers `0` for all unread Inbox mail and
@@ -86,9 +86,11 @@ arrives afterward.
 New compose asks for recipient, subject, and body, then reads a review prompt:
 
 - `1` sends;
-- `2` edits the body;
-- `3` records the body by voice;
-- `#` returns to the body.
+- `2` saves a draft;
+- `3` cancels composition;
+- `4` edits the message;
+- `5` records an audio attachment;
+- `#` goes back.
 
 Reply seeds the sender and `Re:` subject. Forward asks whether to include the
 original raw message and attachments, then seeds the recipient and `Fwd:`
@@ -104,13 +106,18 @@ the local draft remains canonical and the remote copy is only an initial
 snapshot. A remote failure does not prevent the local save and is not retried
 automatically, which avoids duplicate remote drafts after a timeout or restart.
 
-## Voice composition
+## Voice composition and audio attachments
 
-At review, press `5` to record an audio attachment. The bounded capture
-is converted to 16 kHz mono WAV, sent through Whisper, and removed after
-transcription. Recognized text is placed into the reviewable draft. On failure
-the draft returns to keypad editing. Temporary files are private and are
-removed on success, failure, or timeout.
+At the subject or body method prompt, press `2` to speak instead of using the
+keypad. The bounded capture is converted to 16 kHz mono WAV, sent through
+Whisper, and removed after transcription. Recognized text is placed into the
+subject or body. On failure the draft returns to keypad editing. Temporary
+files are private and are removed on success, failure, or timeout.
+
+At review, press `5` to record an audio attachment. The bounded capture is
+stored as a WAV attachment; it is not transcribed. When recording finishes,
+the call returns to the full review menu, including send, save, cancel, edit,
+and another-attachment options.
 
 ## Settings
 
