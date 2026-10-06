@@ -320,7 +320,7 @@ func TestVoiceSaveControlIsOutsideAlertOnlyContainer(t *testing.T) {
 
 func TestBrowserFormsDeclareExplicitSubmitControls(t *testing.T) {
 	html := string(indexHTML)
-	for _, required := range []string{`id="auth"`, `id="auth-loading"`, `id="recovery-tools"`, `renderAuthState`, `data-setup-available="unknown"`} {
+	for _, required := range []string{`id="auth"`, `id="auth-loading"`, `id="recovery-tools"`, `renderAuthState`, `data-setup-available="unknown"`, `aria-label="Move '+esc(a.canonical_name)+' up"`, `aria-label="Move '+esc(c.name)+' down"`} {
 		if !strings.Contains(html, required) {
 			t.Fatalf("auth state contract missing %q", required)
 		}
