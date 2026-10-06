@@ -182,9 +182,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          digest="$(docker buildx imagetools inspect \
-            "${IMAGE}:${TAG}-${{ matrix.arch }}" | \
-            awk '$1 == "Digest:" { print $2; exit }')"
+          image_ref="${IMAGE}:${TAG}-${{ matrix.arch }}"
+          digest=""
+          for attempt in $(seq 1 12); do
+            if inspect="$(docker buildx imagetools inspect "$image_ref" 2>&1)"; then
+              digest="$(printf '%s\n' "$inspect" | awk '$1 == "Digest:" { print $2; exit }')"
+              if [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                break
+              fi
+              echo "registry digest was not present for $image_ref (attempt ${attempt}/12)" >&2
+            else
+              echo "registry inspection failed for $image_ref (attempt ${attempt}/12):" >&2
+              printf '%s\n' "$inspect" >&2
+            fi
+            if [ "$attempt" -lt 12 ]; then
+              sleep 5
+            fi
+          done
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           printf '%s\n' "$digest" > digest
 
