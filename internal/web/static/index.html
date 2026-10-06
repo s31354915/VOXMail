@@ -18,8 +18,8 @@
 <body><main>
   <header><h1>VOXMail</h1><p>Private telephone email, managed from one console.</p></header>
   <section id="auth"><div class="grid">
-    <form id="setup"><h2>First-run setup</h2><input name="username" placeholder="admin username" required minlength="3"><input name="password" type="password" placeholder="password (12–72 bytes)" required minlength="12" maxlength="72"><input name="pin" inputmode="numeric" placeholder="telephone PIN" required><button type="submit" class="primary">Create administrator</button></form>
-    <form id="login"><h2>Sign in</h2><input name="username" placeholder="username" required><input name="password" type="password" placeholder="password" required><input name="totp" inputmode="numeric" placeholder="2FA code (if enabled)"><input name="backup_code" placeholder="backup code (instead of TOTP)"><button type="submit" class="primary">Sign in</button></form>
+    <form id="setup" method="post"><h2>First-run setup</h2><input name="username" placeholder="admin username" required minlength="3"><input name="password" type="password" placeholder="password (12–72 bytes)" required minlength="12" maxlength="72"><input name="pin" inputmode="numeric" placeholder="telephone PIN" required><button type="submit" class="primary">Create administrator</button></form>
+    <form id="login" method="post"><h2>Sign in</h2><input name="username" placeholder="username" required><input name="password" type="password" placeholder="password" required><input name="totp" inputmode="numeric" placeholder="2FA code (if enabled)"><input name="backup_code" placeholder="backup code (instead of TOTP)"><button type="submit" class="primary">Sign in</button></form>
     <form id="recovery-request"><h2>Mailbox recovery</h2><input name="email" type="email" placeholder="configured mailbox address" required><select name="purpose"><option value="reset_password">Reset password</option><option value="bypass_2fa">Sign in once without TOTP</option></select><button type="submit">Send recovery code</button></form>
     <form id="recovery-confirm"><input name="email" type="email" placeholder="mailbox address" required><input name="purpose" value="reset_password" placeholder="reset_password or bypass_2fa" required><input name="code" inputmode="numeric" placeholder="6-digit code" required><input name="new_password" type="password" placeholder="new password (reset only)"><button type="submit">Confirm recovery</button></form>
   </div><div class="status" id="auth-status"></div></section>
@@ -72,7 +72,7 @@
     </div></section>
     </section>
   <footer><p>IMAP synchronization is performed by <code>mbsync</code>; routine sync never expunges remote mail.</p></footer>
-  <script>
+  <script data-cfasync="false">
   let csrf='';let accounts=[];let contacts=[];let alertsAvailable=true;
   const $=s=>document.querySelector(s);const esc=v=>String(v??'').replace(/[<>&"']/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c]));
   const status=(msg,error=false)=>{$('#app-status').textContent=msg;$('#app-status').className='status'+(error?' error':'')};

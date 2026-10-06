@@ -26,7 +26,7 @@ import (
 //go:embed static/index.html
 var indexHTML []byte
 
-var contentSecurityPolicy = fmt.Sprintf("default-src 'none'; script-src 'sha256-%s'; style-src 'sha256-%s'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; frame-src 'none'; media-src 'self' blob:; object-src 'none'", embeddedAssetHash("<script>", "</script>"), embeddedAssetHash("<style>", "</style>"))
+var contentSecurityPolicy = fmt.Sprintf("default-src 'none'; script-src 'sha256-%s'; style-src 'sha256-%s'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; frame-src 'none'; media-src 'self' blob:; object-src 'none'", embeddedAssetHash("<script", "</script>"), embeddedAssetHash("<style", "</style>"))
 
 func embeddedAssetHash(open, close string) string {
 	html := string(indexHTML)
@@ -34,7 +34,11 @@ func embeddedAssetHash(open, close string) string {
 	if start < 0 {
 		return ""
 	}
-	start += len(open)
+	tagEnd := strings.Index(html[start:], ">")
+	if tagEnd < 0 {
+		return ""
+	}
+	start += tagEnd + 1
 	end := strings.Index(html[start:], close)
 	if end < 0 {
 		return ""

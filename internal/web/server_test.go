@@ -222,7 +222,11 @@ func TestContentSecurityPolicyHashesEmbeddedAssets(t *testing.T) {
 		if start < 0 {
 			t.Fatalf("missing embedded asset %q", open)
 		}
-		start += len(open)
+		tagEnd := strings.Index(html[start:], ">")
+		if tagEnd < 0 {
+			t.Fatalf("unclosed embedded asset tag %q", open)
+		}
+		start += tagEnd + 1
 		end := strings.Index(html[start:], close)
 		if end < 0 {
 			t.Fatalf("unclosed embedded asset %q", open)
@@ -230,8 +234,8 @@ func TestContentSecurityPolicyHashesEmbeddedAssets(t *testing.T) {
 		digest := sha256.Sum256([]byte(html[start : start+end]))
 		return base64.StdEncoding.EncodeToString(digest[:])
 	}
-	scriptHash := assetHash("<script>", "</script>")
-	styleHash := assetHash("<style>", "</style>")
+	scriptHash := assetHash("<script", "</script>")
+	styleHash := assetHash("<style", "</style>")
 	recorder := httptest.NewRecorder()
 	withSecurityHeaders(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
 	policy := recorder.Header().Get("Content-Security-Policy")
@@ -306,6 +310,9 @@ func TestBrowserFormsDeclareExplicitSubmitControls(t *testing.T) {
 		markup := html[start : start+end]
 		if !strings.Contains(markup, `<button type="submit"`) {
 			t.Fatalf("form %q does not declare an explicit submit button", id)
+		}
+		if (id == "setup" || id == "login") && !strings.Contains(markup, `method="post"`) {
+			t.Fatalf("auth form %q must use POST as a safe no-JavaScript fallback", id)
 		}
 	}
 }
