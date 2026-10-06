@@ -89,18 +89,49 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          checks="$(gh api --paginate \
-            "repos/${GITHUB_REPOSITORY}/commits/${SOURCE_SHA}/check-runs" \
-            --jq '.check_runs[] | [.name, .status, .conclusion] | @tsv')"
-          for required in \
-            'Go unit tests and static checks' \
-            'End-to-end container tests'; do
-            if ! printf '%s\n' "$checks" | awk -F '\t' -v wanted="$required" \
-              '$1 == wanted || $1 == ("CI / " wanted) { if ($2 == "completed" && $3 == "success") found = 1 } END { exit !found }'; then
-              echo "successful check not found for ${SOURCE_SHA}: ${required}" >&2
+          required_checks=(
+            'Go unit tests and static checks'
+            'End-to-end container tests'
+          )
+          for attempt in $(seq 1 60); do
+            checks="$(gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/commits/${SOURCE_SHA}/check-runs" \
+              --jq '.check_runs[] | [.name, .status, .conclusion] | @tsv')"
+            pending=0
+            failed=0
+            all_success=1
+            for required in "${required_checks[@]}"; do
+              if printf '%s\n' "$checks" | awk -F '\t' -v wanted="$required" \
+                '$1 == wanted || $1 == ("CI / " wanted) { if ($2 == "completed" && $3 == "success") found = 1 } END { exit !found }'; then
+                continue
+              fi
+              all_success=0
+              if printf '%s\n' "$checks" | awk -F '\t' -v wanted="$required" \
+                '$1 == wanted || $1 == ("CI / " wanted) { if ($2 == "queued" || $2 == "in_progress") found = 1 } END { exit !found }'; then
+                pending=1
+              elif printf '%s\n' "$checks" | awk -F '\t' -v wanted="$required" \
+                '$1 == wanted || $1 == ("CI / " wanted) { if ($2 == "completed") found = 1 } END { exit !found }'; then
+                failed=1
+              else
+                # GitHub may not have created the check run yet.
+                pending=1
+              fi
+            done
+            if [ "$all_success" -eq 1 ]; then
+              exit 0
+            fi
+            if [ "$failed" -eq 1 ]; then
+              echo "required CI check failed for ${SOURCE_SHA}" >&2
               printf '%s\n' "$checks" >&2
               exit 1
             fi
+            if [ "$attempt" -eq 60 ]; then
+              echo "timed out waiting for successful CI checks for ${SOURCE_SHA}" >&2
+              printf '%s\n' "$checks" >&2
+              exit 1
+            fi
+            echo "waiting for CI checks for ${SOURCE_SHA} (attempt ${attempt}/60)"
+            sleep 15
           done
 
   build-native:
