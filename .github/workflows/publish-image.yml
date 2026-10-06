@@ -180,6 +180,9 @@ jobs:
 
       - name: Scan architecture image for fixed high/critical vulnerabilities
         uses: aquasecurity/trivy-action@v0.36.0
+        env:
+          TRIVY_IMAGE_SRC: remote
+          TRIVY_PLATFORM: linux/${{ matrix.arch }}
         with:
           image-ref: ${{ env.IMAGE }}:${{ env.TAG }}-${{ matrix.arch }}
           format: table
