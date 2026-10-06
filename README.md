@@ -146,7 +146,7 @@ cleanup behavior.
 
 ## Local development
 
-Requirements are Go 1.23 or newer, a C toolchain for the native shim tests,
+Requirements are Go 1.25 or newer, a C toolchain for the native shim tests,
 and the usual Docker/Compose tools for image and packaged-runtime checks.
 
 ```sh

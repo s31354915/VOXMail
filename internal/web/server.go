@@ -326,9 +326,20 @@ func (s *Server) apiInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"name": "VOXMail", "api_version": "v1", "setup_available": setupAvailable})
 }
-func (s *Server) index(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write(indexHTML)
+	setupState := "unknown"
+	if s.Store != nil {
+		count, err := s.Store.UserCount(r.Context())
+		if err == nil {
+			setupState = "false"
+			if count == 0 {
+				setupState = "true"
+			}
+		}
+	}
+	html := strings.Replace(string(indexHTML), `data-setup-available="unknown"`, `data-setup-available="`+setupState+`"`, 1)
+	_, _ = io.WriteString(w, html)
 }
 
 func validateCredentials(username, password, pin string) error {

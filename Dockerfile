@@ -3,10 +3,10 @@
 # intentionally pinned by build arguments. BuildKit cache mounts keep the git
 # sources and build trees across rebuilds so CI and local iterations are fast;
 # the images themselves stay lean.
-# Base manifest digests resolved 2026-09-28. Keep the human-readable tag next
+# Base manifest digests resolved 2026-10-06. Keep the human-readable tag next
 # to the digest so refreshes can be reviewed as a deliberate distribution
 # change; update both only through the documented image-pinning procedure.
-FROM debian:bookworm@sha256:f37a335e82bca302e955fa39f9dfe28f1be618f016f8a2b56318e5a5111afc26 AS baresip-build
+FROM debian:bookworm@sha256:2c037a04925515fdd6ea85ea14a682d0e79931f5e9f5d07b6dbfc6ba12f9e858 AS baresip-build
 # v4.11.0 tags resolved on 2026-09-24; callers may override with another
 # immutable commit or a reviewed tag when intentionally updating the native stack.
 ARG BARESIP_REF=3d30821f099925d24167f8a99e93ba4d1be98599
@@ -55,7 +55,7 @@ RUN --mount=type=cache,id=bare-baresip-source-${BARESIP_REF}-${TARGETARCH},targe
     find /build/baresip -name '*.so' -path '*/app_modules/*' -exec cp {} /out/modules/ \;; \
     printf 'requested=%s\ncommit=%s\narchitecture=%s\n' "${BARESIP_REF}" "$(git -C /src/baresip rev-parse HEAD)" "${TARGETARCH}" > /out/provenance/baresip.txt
 
-FROM debian:bookworm@sha256:f37a335e82bca302e955fa39f9dfe28f1be618f016f8a2b56318e5a5111afc26 AS whisper-build
+FROM debian:bookworm@sha256:2c037a04925515fdd6ea85ea14a682d0e79931f5e9f5d07b6dbfc6ba12f9e858 AS whisper-build
 # v1.7.1 tag resolved on 2026-09-24; callers may override with another
 # immutable commit or a reviewed tag when intentionally updating whisper.cpp.
 ARG WHISPER_REF=ebca09a3d1033417b0c630bbbe607b0f185b1488
@@ -80,7 +80,7 @@ RUN --mount=type=cache,id=whisper-source-${WHISPER_REF}-${TARGETARCH},target=/sr
     fi; \
     printf 'requested=%s\ncommit=%s\narchitecture=%s\n' "${WHISPER_REF}" "$(git -C /src/whisper.cpp rev-parse HEAD)" "${TARGETARCH}" > /out/provenance/whisper.txt
 
-FROM golang:1.23-bookworm@sha256:167053a2bb901972bf2c1611f8f52c44d5fe7e762e5cab213708d82c421614db AS build
+FROM golang:1.26.6-bookworm@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36 AS build
 ARG TARGETARCH
 ARG VOXMAIL_REVISION=unknown
 WORKDIR /src
@@ -101,15 +101,16 @@ RUN --mount=type=cache,id=gobuild-${TARGETARCH},target=/root/.cache/go-build,sha
     printf 'piper_tts=1.3.0\npiper_model_sha256=%s\npiper_config_sha256=%s\nwhisper_model_sha256=%s\n' \
       "${piper_model_sha}" "${piper_config_sha}" "${whisper_model_sha}" > /out/provenance/models.txt
 
-FROM python:3.11-slim-bookworm@sha256:a36c24f9cbdf4fd0f52d67f0823eeac19c2028c637cecc392d97f980d4fec56b
+FROM python:3.11-slim-bookworm@sha256:0a310eeecf4e1f5a0743f9a6520c90c88d089c903ca5fd283f501e3a805f5f89b
 ARG VOXMAIL_REVISION=unknown
 LABEL org.opencontainers.image.revision="${VOXMAIL_REVISION}"
 ENV VOXMAIL_DATA_DIR=/data \
     VOXMAIL_HTTP_ADDR=:8080 \
     VOXMAIL_MAX_CALLS=10
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get upgrade -y --no-install-recommends && apt-get install -y --no-install-recommends \
     ca-certificates ffmpeg isync curl openssl libsqlite3-0 libssl3 libstdc++6 \
-    && rm -rf /var/lib/apt/lists/* && pip install --no-cache-dir piper-tts==1.3.0
+    && rm -rf /var/lib/apt/lists/* && pip install --no-cache-dir piper-tts==1.3.0 \
+    && pip install --no-cache-dir --upgrade 'jaraco.context>=6.1.0' 'wheel>=0.46.2'
 COPY --from=build /out/voxmail /usr/local/bin/voxmail
 COPY --from=build /out/voxmail-secret /usr/local/bin/voxmail-secret
 COPY --from=build /out/voxmail-connect /usr/local/bin/voxmail-connect

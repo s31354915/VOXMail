@@ -87,7 +87,7 @@ owner, and include a short expiry date; do not add a permanent blanket ignore.
 
 ### Reproducible image updates
 
-The Dockerfile pins the Debian Bookworm, Go 1.23 Bookworm, and Python 3.11
+The Dockerfile pins the Debian Bookworm, Go 1.26 Bookworm, and Python 3.11
 slim Bookworm base manifests by digest. The tag remains beside each digest as
 the human-readable compatibility label. Native dependency sources are pinned
 separately by immutable commit arguments, and the build writes those resolved

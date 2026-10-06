@@ -246,6 +246,32 @@ func TestContentSecurityPolicyHashesEmbeddedAssets(t *testing.T) {
 	}
 }
 
+func TestIndexAdvertisesCurrentSetupState(t *testing.T) {
+	db, err := store.Open(t.TempDir() + "/index.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	h := (&Server{Store: db}).Handler()
+
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `data-setup-available="true"`) {
+		t.Fatalf("empty installation index status=%d body has setup state=%v", recorder.Code, strings.Contains(recorder.Body.String(), `data-setup-available="true"`))
+	}
+
+	if err := db.CreateBootstrapUser(context.Background(), store.User{ID: "admin", Username: "admin", PasswordHash: "hash", PINHash: "hash", Role: "admin", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	request = httptest.NewRequest(http.MethodGet, "/", nil)
+	recorder = httptest.NewRecorder()
+	h.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `data-setup-available="false"`) {
+		t.Fatalf("configured installation index status=%d body has login state=%v", recorder.Code, strings.Contains(recorder.Body.String(), `data-setup-available="false"`))
+	}
+}
+
 func TestAPIErrorHasStableCodeAndRequestID(t *testing.T) {
 	db, err := store.Open(t.TempDir() + "/errors.db")
 	if err != nil {
@@ -294,6 +320,11 @@ func TestVoiceSaveControlIsOutsideAlertOnlyContainer(t *testing.T) {
 
 func TestBrowserFormsDeclareExplicitSubmitControls(t *testing.T) {
 	html := string(indexHTML)
+	for _, required := range []string{`id="auth"`, `id="auth-loading"`, `id="recovery-tools"`, `renderAuthState`, `data-setup-available="unknown"`} {
+		if !strings.Contains(html, required) {
+			t.Fatalf("auth state contract missing %q", required)
+		}
+	}
 	for _, id := range []string{
 		"setup", "login", "recovery-request", "recovery-confirm", "account-form",
 		"contact-form", "phone-form", "settings-form", "alert-number-form",
