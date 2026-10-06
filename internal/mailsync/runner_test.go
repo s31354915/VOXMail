@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -77,6 +78,21 @@ func TestSyncErrorExitNotChanged(t *testing.T) {
 	}
 }
 
+func TestSyncChangeAndErrorBitsRemainAnError(t *testing.T) {
+	for _, exitCode := range []int{33, 65, 97} {
+		t.Run(strconv.Itoa(exitCode), func(t *testing.T) {
+			r := newRunner(fakeMbsync(t, exitCode, ""))
+			result, err := r.Sync(context.Background(), "config", "home")
+			if err == nil {
+				t.Fatalf("exit %d should surface an error", exitCode)
+			}
+			if !result.Changed {
+				t.Fatalf("exit %d should retain its change bits", exitCode)
+			}
+		})
+	}
+}
+
 func TestSyncRequiresChannel(t *testing.T) {
 	r := newRunner(fakeMbsync(t, 0, ""))
 	if _, err := r.Sync(context.Background(), "config", ""); err == nil {
@@ -134,11 +150,59 @@ func TestSyncTimesOut(t *testing.T) {
 	}
 }
 
+func TestSyncSignalExitIsFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell shim is unix-only")
+	}
+	dir := t.TempDir()
+	shim := filepath.Join(dir, "mbsync")
+	if err := os.WriteFile(shim, []byte("#!/bin/sh\nkill -TERM $$\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	result, err := (Runner{Binary: shim}).Sync(context.Background(), "config", "home")
+	if err == nil {
+		t.Fatal("signal termination was reported as success")
+	}
+	if result.Changed {
+		t.Fatal("signal termination was reported as a change")
+	}
+}
+
+func TestSyncBoundsSubprocessOutput(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell shim is unix-only")
+	}
+	dir := t.TempDir()
+	shim := filepath.Join(dir, "mbsync")
+	if err := os.WriteFile(shim, []byte("#!/bin/sh\nprintf '%02097152d' 0\nexit 1\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	result, err := (Runner{Binary: shim}).Sync(context.Background(), "config", "home")
+	if err == nil {
+		t.Fatal("expected non-zero mbsync status")
+	}
+	if len(result.Output) > maxMbsyncOutput+64 {
+		t.Fatalf("captured output=%d bytes, cap=%d", len(result.Output), maxMbsyncOutput)
+	}
+	if !strings.Contains(string(result.Output), "output truncated") {
+		t.Fatalf("truncation marker missing; captured %d bytes", len(result.Output))
+	}
+}
+
 func TestSyncDefaultBinaryAndTimeout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell shim is unix-only")
+	}
+	dir := t.TempDir()
+	shim := filepath.Join(dir, "mbsync")
+	if err := os.WriteFile(shim, []byte("#!/bin/sh\nexit 3\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	started := time.Now()
-	_, err := (Runner{}).Sync(context.Background(), filepath.Join(t.TempDir(), "missing-mbsync-config"), "home")
-	// With the default binary, the wrong config path must produce an error
-	// that mentions mbsync, fast.
+	_, err := (Runner{}).Sync(context.Background(), "config", "home")
+	// The default binary name must be resolved from PATH and a non-zero exit
+	// must be reported without depending on whether the host has real mbsync.
 	if err == nil {
 		t.Fatal("Sync with defaults unexpectedly succeeded")
 	}

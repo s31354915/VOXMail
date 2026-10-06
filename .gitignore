@@ -9,3 +9,5 @@ b.pid
 # Runtime-only draft attachment files created when tests use the default
 # working-directory data root.
 /internal/calls/drafts/
+# Browser test dependencies are installed locally, never committed.
+/tests/browser/node_modules/

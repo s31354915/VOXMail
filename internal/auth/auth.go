@@ -6,6 +6,7 @@ import (
 	"crypto/sha1"
 	"encoding/base32"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -13,7 +14,14 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+const MaxPasswordBytes = 72
+
+var ErrPasswordTooLong = errors.New("password exceeds bcrypt's 72-byte limit")
+
 func Hash(value string) (string, error) {
+	if len([]byte(value)) > MaxPasswordBytes {
+		return "", ErrPasswordTooLong
+	}
 	b, err := bcrypt.GenerateFromPassword([]byte(value), bcrypt.DefaultCost)
 	return string(b), err
 }
@@ -31,16 +39,29 @@ func RandomToken(size int) (string, error) {
 }
 
 func TOTP(secret, code string, now time.Time) bool {
+	_, ok := TOTPWithStep(secret, code, now)
+	return ok
+}
+
+// TOTPWithStep validates a code in the same three-step clock-skew window as
+// TOTP and returns the accepted Unix time-step. Callers that need replay
+// resistance can persist that step atomically per account.
+func TOTPWithStep(secret, code string, now time.Time) (int64, bool) {
 	code = strings.TrimSpace(code)
 	if len(code) != 6 {
-		return false
+		return 0, false
 	}
+	step := now.Unix() / 30
 	for offset := int64(-1); offset <= 1; offset++ {
-		if generateTOTP(secret, now.Add(time.Duration(offset)*30*time.Second)) == code {
-			return true
+		candidate := step + offset
+		if candidate < 0 {
+			continue
+		}
+		if generateTOTPAtStep(secret, candidate) == code {
+			return candidate, true
 		}
 	}
-	return false
+	return 0, false
 }
 
 func GenerateTOTPSecret() (string, error) {
@@ -52,9 +73,20 @@ func generateTOTP(secret string, now time.Time) string {
 	if err != nil {
 		return ""
 	}
-	counter := uint64(now.Unix() / 30)
+	return generateTOTPAtStepWithKey(key, now.Unix()/30)
+}
+
+func generateTOTPAtStep(secret string, step int64) string {
+	key, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(strings.ToUpper(strings.TrimSpace(secret)))
+	if err != nil || step < 0 {
+		return ""
+	}
+	return generateTOTPAtStepWithKey(key, step)
+}
+
+func generateTOTPAtStepWithKey(key []byte, step int64) string {
 	message := make([]byte, 8)
-	binary.BigEndian.PutUint64(message, counter)
+	binary.BigEndian.PutUint64(message, uint64(step))
 	h := hmac.New(sha1.New, key)
 	_, _ = h.Write(message)
 	sum := h.Sum(nil)

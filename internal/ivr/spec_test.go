@@ -51,3 +51,54 @@ func TestAccountAlertStatesHaveNavigationContracts(t *testing.T) {
 		t.Fatalf("account alert folders contract is wrong: %+v", folders)
 	}
 }
+
+func TestEveryStateHasTableDrivenInputNavigationAndCancellationTrace(t *testing.T) {
+	validKeys := map[State]string{
+		"closed": "",
+		"pin":    "1", "main": "1", "accounts": "0", "account_menu": "1",
+		"draft_menu": "1", "draft_list": "1", "draft_edit": "1",
+		"recipient_edit": "1", "attachment_edit": "1", "account_settings": "1",
+		"account_alert_folders": "1", "folders": "0", "folder_action": "1",
+		"list": "1", "read": "0", "attachment_menu": "0",
+		"attachment_playback": "0", "move_menu": "1", "more_options": "1",
+		"contact_name": "1", "contact_confirm": "1", "field_confirm": "1",
+		"confirm_delete": "1", "compose": "1", "recipient_menu": "1",
+		"recipient_input": "1", "subject_method": "1", "subject": "1",
+		"body_method": "1", "body": "1", "review": "1",
+		"forward_options": "1", "audio_recording": "0", "recording": "0",
+		"recording_subject": "0", "settings": "1", "contacts": "0", "info": "1",
+	}
+	for _, spec := range States() {
+		valid, ok := validKeys[spec.State]
+		if !ok {
+			t.Fatalf("state %q has no trace fixture", spec.State)
+		}
+		if spec.State != StateClosed && !Accepts(spec.State, valid) {
+			t.Errorf("state %q rejected valid trace key %q", spec.State, valid)
+		}
+		if (spec.Valid != nil || spec.State == StateClosed) && Accepts(spec.State, "X") {
+			t.Errorf("state %q accepted invalid trace key", spec.State)
+		}
+		first, firstOK := Prompt(spec.State)
+		second, secondOK := Prompt(spec.State)
+		if !firstOK || !secondOK || first != second || !spec.Repeatable {
+			t.Errorf("state %q repeat trace is not stable", spec.State)
+		}
+		if spec.Back != "" {
+			if back, ok := Back(spec.State); !ok || back != spec.Back {
+				t.Errorf("state %q back=%q,%v, want %q,true", spec.State, back, ok, spec.Back)
+			}
+		}
+		timeout, ok := Spec(spec.Timeout)
+		if !ok || timeout.State != spec.Timeout {
+			t.Errorf("state %q timeout target=%q is not declared", spec.State, spec.Timeout)
+		}
+		flow := NewSession("trace-" + string(spec.State))
+		flow.State = spec.State
+		flow.Authenticated = true
+		flow.Close()
+		if flow.State != StateClosed || flow.Authenticated {
+			t.Errorf("state %q cancellation did not revoke terminal session", spec.State)
+		}
+	}
+}

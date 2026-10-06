@@ -2,6 +2,8 @@ package ivr
 
 import "fmt"
 
+const DefaultHistoryLimit = 64
+
 type State string
 
 const (
@@ -23,15 +25,26 @@ type Session struct {
 	PINFailures   int
 	MaxPINTries   int
 	Authenticated bool
+	HistoryLimit  int
 }
 
 func NewSession(callID string) *Session {
-	return &Session{CallID: callID, State: StateWelcome, MaxPINTries: 3}
+	return &Session{CallID: callID, State: StateWelcome, MaxPINTries: 3, HistoryLimit: DefaultHistoryLimit}
 }
 
 func (s *Session) Enter(next State) {
 	if s.State != next {
 		s.Previous = append(s.Previous, s.State)
+		limit := s.HistoryLimit
+		if limit <= 0 {
+			limit = DefaultHistoryLimit
+			s.HistoryLimit = limit
+		}
+		if len(s.Previous) > limit {
+			offset := len(s.Previous) - limit
+			copy(s.Previous, s.Previous[offset:])
+			s.Previous = s.Previous[:limit]
+		}
 		s.State = next
 	}
 }
@@ -52,4 +65,16 @@ func (s *Session) FailPIN() bool {
 		return true
 	}
 	return false
+}
+
+// Close makes a formal IVR session terminal and revokes its authenticated
+// state. It is idempotent so shutdown, timeout, and credential revocation can
+// share the same transition safely.
+func (s *Session) Close() {
+	if s == nil {
+		return
+	}
+	s.State = StateClosed
+	s.Authenticated = false
+	s.Previous = nil
 }

@@ -24,7 +24,7 @@ func main() {
 	if err != nil {
 		fail(err.Error())
 	}
-	db, err := store.Open(cfg.DBPath)
+	db, err := store.OpenReadOnly(cfg.DBPath)
 	if err != nil {
 		fail(err.Error())
 	}

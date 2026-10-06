@@ -1,11 +1,19 @@
 package keypad
 
+import "unicode/utf8"
+
 // MultiTap implements VOXMail's deterministic DTMF text editor.
 type MultiTap struct {
 	Text       string
 	PendingKey byte
 	Presses    int
 	Mode       Mode
+	// MaxRunes bounds the committed field. A zero value preserves the
+	// historical unbounded behavior for generic callers.
+	MaxRunes int
+	// Overflowed reports input rejected at the configured boundary. It is
+	// cleared when a backspace makes room or when a new editor is created.
+	Overflowed bool
 }
 
 type Mode int
@@ -30,6 +38,16 @@ var groups = map[byte]string{
 
 func New(mode Mode) *MultiTap { return &MultiTap{Mode: mode} }
 
+// NewWithLimit creates an editor with a maximum committed Unicode-rune count.
+// Limits are applied at commit boundaries so a pending multi-tap character is
+// never silently written past the field boundary.
+func NewWithLimit(mode Mode, maxRunes int) *MultiTap {
+	if maxRunes < 0 {
+		maxRunes = 0
+	}
+	return &MultiTap{Mode: mode, MaxRunes: maxRunes}
+}
+
 // Press consumes one DTMF key. It returns committed text, if any, and whether
 // the field is complete. A single star commits; two stars backspace.
 func (m *MultiTap) Press(key byte) (committed string, done bool) {
@@ -37,17 +55,19 @@ func (m *MultiTap) Press(key byte) (committed string, done bool) {
 	case '*':
 		if m.PendingKey == 0 {
 			m.Text = backspace(m.Text)
+			m.Overflowed = false
 			return "", false
 		}
-		committed = m.current()
-		m.Text += committed
+		committed = m.appendCurrent()
 		m.PendingKey, m.Presses = 0, 0
 		return committed, false
 	case '#':
 		if m.PendingKey != 0 {
-			committed = m.current()
-			m.Text += committed
+			committed = m.appendCurrent()
 			m.PendingKey, m.Presses = 0, 0
+		}
+		if m.MaxRunes > 0 && utf8.RuneCountInString(m.Text) > m.MaxRunes {
+			m.Overflowed = true
 		}
 		return committed, true
 	}
@@ -56,12 +76,33 @@ func (m *MultiTap) Press(key byte) (committed string, done bool) {
 	}
 	if m.PendingKey != key {
 		if m.PendingKey != 0 {
-			m.Text += m.current()
+			if m.appendCurrent() == "" && m.Overflowed {
+				m.PendingKey, m.Presses = 0, 0
+				return "", false
+			}
 		}
 		m.PendingKey, m.Presses = key, 0
 	}
+	if m.MaxRunes > 0 && utf8.RuneCountInString(m.Text) >= m.MaxRunes {
+		m.Overflowed = true
+		m.PendingKey, m.Presses = 0, 0
+		return "", false
+	}
 	m.Presses++
 	return "", false
+}
+
+func (m *MultiTap) appendCurrent() string {
+	if m.PendingKey == 0 {
+		return ""
+	}
+	committed := m.current()
+	if m.MaxRunes > 0 && utf8.RuneCountInString(m.Text)+utf8.RuneCountInString(committed) > m.MaxRunes {
+		m.Overflowed = true
+		return ""
+	}
+	m.Text += committed
+	return committed
 }
 
 func (m *MultiTap) current() string {

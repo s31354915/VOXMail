@@ -22,8 +22,8 @@ Each account supports:
 - account-level call-alert enablement and alert folders.
 
 Leaving either password blank while editing preserves the encrypted secret.
-New accounts require both passwords. **Test IMAP host** is available after an
-account is saved and only checks that account's configured host and port.
+New accounts require both passwords. **Test IMAP and SMTP** is available after
+an account is saved and checks only that account's configured hosts and ports.
 
 The account table provides Edit, Test, Delete, and up/down ordering controls.
 The **Test IMAP and SMTP** action authenticates both services over verified TLS
@@ -41,6 +41,16 @@ Archive=Old Mail
 Aliases must be relative, non-empty, and unique locally. Keep alert-folder
 names aligned with the remote names or local aliases produced by sync.
 
+### Draft synchronization policy
+
+Drafts are stored locally as the canonical editable copy. The first local save
+may append an initial snapshot to the account's mapped remote Drafts folder.
+Because IMAP APPEND creates a new message rather than updating an existing
+one, later saves for the same local draft ID never append another remote copy;
+they update only the local draft. If the first remote append fails, the local
+save still succeeds and VOXMail does not retry that append automatically, so a
+network timeout cannot create duplicates after a later save or restart.
+
 ## Contacts and callers
 
 Contacts have name, email, and display order. Create, edit, delete, and use
@@ -57,7 +67,7 @@ The **SIP connection** panel (administrators only) manages the deployment-wide
 provider credentials for the embedded call client:
 
 - domain/registrar, SIP username, and password (blank keeps the existing one);
-- SIP port for registration and inbound calls, default **5060**;
+- local SIP bind port and registrar port, each defaulting to **5060**;
 - transport (`udp`, `tcp`, or `tls`) and registration interval in seconds.
 
 Saving persists the settings and restarts the call client so the change takes
@@ -94,7 +104,14 @@ setup/enable/disable, and one-time backup codes. Mailbox recovery sends a
 short-lived, rate-limited, single-use OTP to a configured mailbox for either a
 password reset or one authenticated web session that bypasses TOTP. Recovery
 requests intentionally return the same response for known and unknown
-addresses.
+addresses. The `bypass_2fa` option treats control of that mailbox as an
+alternate authentication factor: anyone who can read the mailbox can obtain a
+session without the authenticator app. This is especially important for
+administrators, because an administrator mailbox compromise becomes a console
+account compromise. Deployments with stronger assurance requirements should
+disable or separately restrict mailbox recovery before exposing the console.
+Web passwords are 12–72 bytes because the current bcrypt verifier rejects
+longer inputs.
 
 ## Users
 

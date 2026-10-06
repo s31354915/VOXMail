@@ -4,13 +4,30 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Image tag to publish
+        description: Release or prerelease tag to publish
         required: true
         default: latest
         type: string
+      source_ref:
+        description: Branch, tag, or commit to test and publish exactly
+        required: true
+        default: main
+        type: string
+      promote_latest:
+        description: Move the production latest alias to this non-latest release
+        required: true
+        default: false
+        type: boolean
+
+# A single group also serializes latest promotion across different release
+# tags; otherwise two valid publications could race while moving the alias.
+concurrency:
+  group: voxmail-publish-${{ github.repository }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
+  checks: read
   packages: write
 
 env:
@@ -18,8 +35,77 @@ env:
   TAG: ${{ inputs.tag }}
 
 jobs:
+  verify:
+    name: Verify exact source commit
+    runs-on: ubuntu-24.04
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - name: Validate release inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+            echo "invalid image tag: $TAG" >&2
+            exit 1
+          fi
+          test -n "${{ inputs.source_ref }}"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+
+      - id: source
+        name: Record source revision
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+          cache: true
+
+      - name: Vet exact source
+        run: go vet ./...
+
+      - name: Test exact source
+        run: go test -race -count=1 ./...
+
+      - name: Compile E2E harness
+        run: go build ./tests/e2e
+
+      - name: Check Dockerfile exact source
+        run: docker build --check -f Dockerfile .
+
+  require-ci:
+    name: Require CI checks for exact source
+    needs: verify
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_SHA: ${{ needs.verify.outputs.source_sha }}
+    steps:
+      - name: Require successful repository CI checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          checks="$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/commits/${SOURCE_SHA}/check-runs" \
+            --jq '.check_runs[] | [.name, .status, .conclusion] | @tsv')"
+          for required in \
+            'Go unit tests and static checks' \
+            'End-to-end container tests'; do
+            if ! printf '%s\n' "$checks" | awk -F '\t' -v wanted="$required" \
+              '$1 == wanted || $1 == ("CI / " wanted) { if ($2 == "completed" && $3 == "success") found = 1 } END { exit !found }'; then
+              echo "successful check not found for ${SOURCE_SHA}: ${required}" >&2
+              printf '%s\n' "$checks" >&2
+              exit 1
+            fi
+          done
+
   build-native:
     name: Build ${{ matrix.arch }} natively
+    needs: [verify, require-ci]
     strategy:
       fail-fast: false
       matrix:
@@ -31,24 +117,59 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.source_sha }}
+
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+
+      - name: Build, attest, and push architecture image
+        uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/${{ matrix.arch }}
+          pull: true
           push: true
           tags: ${{ env.IMAGE }}:${{ env.TAG }}-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.revision=${{ needs.verify.outputs.source_sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ env.TAG }}
+          build-args: |
+            VOXMAIL_REVISION=${{ needs.verify.outputs.source_sha }}
+          provenance: mode=max
+          sbom: true
           cache-from: type=gha,scope=voxmail-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=voxmail-${{ matrix.arch }}
 
-  publish-manifest:
-    name: Publish multi-architecture manifest
+      - name: Capture registry digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest="$(docker buildx imagetools inspect \
+            "${IMAGE}:${TAG}-${{ matrix.arch }}" | \
+            awk '$1 == "Digest:" { print $2; exit }')"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf '%s\n' "$digest" > digest
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voxmail-digest-${{ matrix.arch }}
+          path: digest
+          retention-days: 14
+
+  scan-native:
+    name: Scan ${{ matrix.arch }} image
     needs: build-native
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
     runs-on: ubuntu-24.04
     steps:
       - uses: docker/login-action@v3
@@ -56,20 +177,75 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Scan architecture image for fixed high/critical vulnerabilities
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ env.TAG }}-${{ matrix.arch }}
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          vuln-type: os,library
+          exit-code: '1'
+
+  publish-manifest:
+    name: Publish multi-architecture manifest
+    needs: [verify, require-ci, build-native, scan-native]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: voxmail-digest-amd64
+          path: digests/amd64
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: voxmail-digest-arm64
+          path: digests/arm64
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: docker/setup-buildx-action@v3
-      - name: Combine native images in GHCR
+
+      - name: Combine captured architecture digests
+        shell: bash
         run: |
+          set -euo pipefail
+          amd64_digest="$(cat digests/amd64/digest)"
+          arm64_digest="$(cat digests/arm64/digest)"
+          for digest in "$amd64_digest" "$arm64_digest"; do
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          done
           docker buildx imagetools create \
             --tag "${IMAGE}:${TAG}" \
-            "${IMAGE}:${TAG}-amd64" \
-            "${IMAGE}:${TAG}-arm64"
-      - name: Inspect published manifest
-        run: docker buildx imagetools inspect "${IMAGE}:${TAG}"
-      - name: Move latest alias to this release
-        if: inputs.tag != 'latest'
+            "${IMAGE}@${amd64_digest}" \
+            "${IMAGE}@${arm64_digest}"
+
+      - name: Inspect published manifest and record release identity
+        shell: bash
         run: |
+          set -euo pipefail
+          docker buildx imagetools inspect "${IMAGE}:${TAG}"
+          {
+            echo "## Published VOXMail image"
+            echo
+            echo "- source revision: \`${{ needs.verify.outputs.source_sha }}\`"
+            echo "- image: \`${IMAGE}:${TAG}\`"
+            echo "- amd64 digest: \`$(cat digests/amd64/digest)\`"
+            echo "- arm64 digest: \`$(cat digests/arm64/digest)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Promote production latest alias
+        if: ${{ inputs.promote_latest && inputs.tag != 'latest' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           docker buildx imagetools create \
             --tag "${IMAGE}:latest" \
-            "${IMAGE}:${TAG}-amd64" \
-            "${IMAGE}:${TAG}-arm64"
+            "${IMAGE}@$(cat digests/amd64/digest)" \
+            "${IMAGE}@$(cat digests/arm64/digest)"
           docker buildx imagetools inspect "${IMAGE}:latest"

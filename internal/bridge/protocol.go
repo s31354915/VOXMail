@@ -15,6 +15,8 @@ import (
 
 const ProtocolVersion = 2
 
+const maxFrameBytes = 64 << 10
+
 type Message struct {
 	Version   int    `json:"version"`
 	Type      string `json:"type"`
@@ -35,23 +37,68 @@ type Message struct {
 
 func Encode(w io.Writer, message Message) error {
 	message.Version = ProtocolVersion
-	return json.NewEncoder(w).Encode(message)
+	frame, err := json.Marshal(message)
+	if err != nil {
+		return err
+	}
+	frame = append(frame, '\n')
+	if len(frame) > maxFrameBytes {
+		return fmt.Errorf("bridge frame exceeds %d bytes", maxFrameBytes)
+	}
+	return writeAll(w, frame)
 }
 
-func Decode(r *bufio.Reader) (Message, error) {
+func Decode(r io.Reader) (Message, error) {
+	if r == nil {
+		return Message{}, io.ErrUnexpectedEOF
+	}
+	reader := bufio.NewReaderSize(r, maxFrameBytes+1)
 	var message Message
-	if err := json.NewDecoder(r).Decode(&message); err != nil {
+	frame := make([]byte, 0, maxFrameBytes)
+	for {
+		if len(frame) >= maxFrameBytes {
+			return Message{}, fmt.Errorf("bridge frame exceeds %d bytes", maxFrameBytes)
+		}
+		part, err := reader.ReadByte()
+		if err == nil {
+			frame = append(frame, part)
+			if part == '\n' {
+				break
+			}
+			continue
+		}
+		return Message{}, err
+	}
+	if err := json.Unmarshal(frame, &message); err != nil {
 		return Message{}, err
 	}
 	if message.Version != ProtocolVersion {
 		return Message{}, fmt.Errorf("unsupported bridge protocol version %d", message.Version)
 	}
+	if message.Type == "" {
+		return Message{}, fmt.Errorf("bridge message type is required")
+	}
 	return message, nil
 }
 
+func writeAll(w io.Writer, frame []byte) error {
+	for len(frame) > 0 {
+		n, err := w.Write(frame)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		frame = frame[n:]
+	}
+	return nil
+}
+
 type Client struct {
-	conn net.Conn
-	mu   sync.Mutex
+	conn      net.Conn
+	writeMu   chan struct{}
+	writeOnce sync.Once
 }
 
 func Dial(path string) (*Client, error) {
@@ -59,14 +106,19 @@ func Dial(path string) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{conn: conn}, nil
+	return NewClient(conn), nil
 }
 
 // NewClient wraps an existing connection as a bridge client so a long-lived
 // connection can be shared for event reception and command sending.
 func NewClient(conn net.Conn) *Client { return &Client{conn: conn} }
 
-func (c *Client) Close() error { return c.conn.Close() }
+func (c *Client) Close() error {
+	if c == nil || c.conn == nil {
+		return nil
+	}
+	return c.conn.Close()
+}
 
 // Dial requests an outgoing call. The remote callee is identified by uri, for
 // example "sip:+15551212@sip.example.com". It returns when the request has
@@ -110,6 +162,12 @@ func (c *Client) Send(message Message) error {
 // and deadlines. A disconnected or wedged baresip socket must not block an
 // HTTP request or the alert worker indefinitely.
 func (c *Client) SendContext(ctx context.Context, message Message) error {
+	if c == nil || c.conn == nil {
+		return net.ErrClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -121,27 +179,35 @@ func (c *Client) SendContext(ctx context.Context, message Message) error {
 		return err
 	}
 	frame = append(frame, '\n')
+	if len(frame) > maxFrameBytes {
+		return fmt.Errorf("bridge frame exceeds %d bytes", maxFrameBytes)
+	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.writeOnce.Do(func() { c.writeMu = make(chan struct{}, 1) })
+	select {
+	case c.writeMu <- struct{}{}:
+		defer func() { <-c.writeMu }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	// Closing the transport is the only portable way to interrupt a blocked
+	// net.Conn write when the caller cancels without a deadline. The caller
+	// must reconnect after that point; a partially written JSON frame cannot be
+	// safely reused.
+	stopClose := context.AfterFunc(ctx, func() { _ = c.conn.Close() })
+	defer stopClose()
 	if deadline, ok := ctx.Deadline(); ok {
 		if err := c.conn.SetWriteDeadline(deadline); err != nil {
 			return err
 		}
 		defer c.conn.SetWriteDeadline(time.Time{})
 	}
-	for len(frame) > 0 {
-		n, err := c.conn.Write(frame)
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return io.ErrShortWrite
-		}
-		frame = frame[n:]
+	if err := writeAll(c.conn, frame); err != nil {
+		_ = c.conn.Close()
+		return err
 	}
 	return nil
 }

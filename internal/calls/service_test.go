@@ -2,10 +2,12 @@ package calls
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"net"
+	"net/mail"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +19,8 @@ import (
 	"github.com/voxmail/voxmail/internal/ivr"
 	"github.com/voxmail/voxmail/internal/keypad"
 	"github.com/voxmail/voxmail/internal/mailer"
+	"github.com/voxmail/voxmail/internal/phone"
+	"github.com/voxmail/voxmail/internal/secret"
 	"github.com/voxmail/voxmail/internal/store"
 )
 
@@ -81,6 +85,117 @@ func TestPromptFIFOOpenRespectsCancellation(t *testing.T) {
 	}
 }
 
+func TestPCMWindowBytesPreservesWholeSamples(t *testing.T) {
+	for _, test := range []struct {
+		window time.Duration
+		want   int64
+	}{
+		{window: 500 * time.Millisecond, want: 8000},
+		{window: 15 * time.Second, want: 240000},
+		{window: 1501 * time.Millisecond, want: 24016},
+	} {
+		if got := pcmWindowBytes(test.window); got != test.want || got%mediaBytesPerSample != 0 {
+			t.Errorf("pcmWindowBytes(%s)=%d, want even %d", test.window, got, test.want)
+		}
+	}
+}
+
+func TestServiceTaskShutdownClosesAdmissionBeforeWaiting(t *testing.T) {
+	svc := &Service{}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	svc.startTask(func() {
+		close(started)
+		<-release
+	})
+	<-started
+
+	svc.StopTasks()
+	late := make(chan struct{}, 1)
+	svc.startTask(func() { late <- struct{}{} })
+	close(release)
+	svc.Wait()
+
+	select {
+	case <-late:
+		t.Fatal("task admitted after shutdown began")
+	default:
+	}
+}
+
+func TestBeginSIPApplyRejectsActiveCallsAndReleasesIdempotently(t *testing.T) {
+	svc := &Service{sessions: make(map[string]*session), pending: make(map[string]DialRequest)}
+	svc.sessions["call-1"] = &session{CallID: "call-1"}
+	if _, err := svc.BeginSIPApply(context.Background()); err == nil {
+		t.Fatal("active call did not block SIP apply")
+	}
+	delete(svc.sessions, "call-1")
+	svc.pending["request-1"] = DialRequest{RequestID: "request-1"}
+	if _, err := svc.BeginSIPApply(context.Background()); err == nil {
+		t.Fatal("pending outgoing call did not block SIP apply")
+	}
+	delete(svc.pending, "request-1")
+	release, err := svc.BeginSIPApply(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if svc.ActiveCalls() != 0 {
+		t.Fatalf("active calls while gated=%d", svc.ActiveCalls())
+	}
+	release()
+	release()
+	svc.mu.Lock()
+	gated := svc.sipApplying
+	svc.mu.Unlock()
+	if gated {
+		t.Fatal("idempotent release left SIP apply gate active")
+	}
+}
+
+func TestAlertOutcomeProgressionIsOrderedAndTerminal(t *testing.T) {
+	svc := &Service{}
+	var got []AlertOutcome
+	sess := &session{AlertOutcome: func(outcome AlertOutcome) { got = append(got, outcome) }}
+	for _, outcome := range []AlertOutcome{AlertAccepted, AlertRinging, AlertAnswered, AlertPlaybackCompleted, AlertFailed, AlertRinging} {
+		svc.reportAlertOutcome(sess, outcome)
+	}
+	want := []AlertOutcome{AlertAccepted, AlertRinging, AlertAnswered, AlertPlaybackCompleted}
+	if len(got) != len(want) {
+		t.Fatalf("outcomes=%v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("outcomes=%v, want %v", got, want)
+		}
+	}
+
+	got = nil
+	sess = &session{AlertOutcome: func(outcome AlertOutcome) { got = append(got, outcome) }}
+	svc.reportAlertOutcome(sess, AlertAccepted)
+	svc.reportAlertOutcome(sess, AlertFailed)
+	svc.reportAlertOutcome(sess, AlertFailed)
+	if want := []AlertOutcome{AlertAccepted, AlertFailed}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("failed outcomes=%v, want %v", got, want)
+	}
+}
+
+func TestServiceDelayedTaskCancelsWithParent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	svc := &Service{ctx: ctx}
+	fired := make(chan struct{}, 1)
+	svc.startDelayedTask(time.Hour, func() { fired <- struct{}{} })
+	cancel()
+	svc.StopTasks()
+	svc.Wait()
+
+	select {
+	case <-fired:
+		t.Fatal("delayed task fired after parent cancellation")
+	default:
+	}
+}
+
 func TestPlayMediaStreamsPCMToCallFIFO(t *testing.T) {
 	dir := t.TempDir()
 	fifo := filepath.Join(dir, "call-tx.pcm")
@@ -136,6 +251,22 @@ func newTestService(t *testing.T) (*Service, *store.Store) {
 	t.Cleanup(func() { db.Close() })
 	svc := &Service{Store: db, MaxCalls: 1, sessions: make(map[string]*session), pinLock: make(map[string]time.Time)}
 	return svc, db
+}
+
+func TestResolveIMAPEndpointUsesPinnedResolver(t *testing.T) {
+	svc := &Service{IMAPEndpointResolver: func(_ context.Context, host string, port int) (string, error) {
+		if host != "imap.example.com" || port != 993 {
+			t.Fatalf("resolver received host=%q port=%d", host, port)
+		}
+		return "198.51.100.8:993", nil
+	}}
+	got, err := svc.resolveIMAPEndpoint(context.Background(), "imap.example.com", 993)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "198.51.100.8:993" {
+		t.Fatalf("resolved address=%q, want pinned address", got)
+	}
 }
 
 func admitAndRead(t *testing.T, svc *Service, message bridge.Message) bridge.Message {
@@ -257,6 +388,63 @@ func TestInvalidateUserSessionsHangsUpAndRemovesMatchingCalls(t *testing.T) {
 	}
 }
 
+func TestInvalidateUserSessionsForDeletionCancelsRecordingRemoteAndAlertWork(t *testing.T) {
+	svc, _ := newTestService(t)
+	svc.pending = make(map[string]DialRequest)
+	eventCtx, eventCancel := context.WithCancel(context.Background())
+	recordCanceled := make(chan struct{})
+	attachmentCanceled := make(chan struct{})
+	alertDone := make(chan bool, 1)
+	pendingDone := make(chan bool, 1)
+	svc.sessions["deleting-call"] = &session{
+		CallID:           "deleting-call",
+		UserID:           "delete-user",
+		State:            "audio_recording",
+		AlertDone:        alertDone,
+		eventCtx:         eventCtx,
+		eventCancel:      eventCancel,
+		RecordCancel:     func() { close(recordCanceled) },
+		AttachmentCancel: func() { close(attachmentCanceled) },
+	}
+	svc.pending["pending-alert"] = DialRequest{RequestID: "pending-alert", UserID: "delete-user", Done: pendingDone}
+
+	svc.InvalidateUserSessionsForDeletion("delete-user")
+	select {
+	case <-eventCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("remote/event work was not canceled")
+	}
+	select {
+	case <-recordCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("recording was not canceled")
+	}
+	select {
+	case <-attachmentCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("attachment playback was not canceled")
+	}
+	select {
+	case success := <-alertDone:
+		if success {
+			t.Fatal("deleted alert call was reported successful")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("active alert call was not completed as failed")
+	}
+	select {
+	case success := <-pendingDone:
+		if success {
+			t.Fatal("pending deleted-user alert was reported successful")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pending alert was not canceled")
+	}
+	if len(svc.sessions) != 0 || len(svc.pending) != 0 {
+		t.Fatalf("deleted-user work survived: sessions=%d pending=%d", len(svc.sessions), len(svc.pending))
+	}
+}
+
 func TestMenuBackUsesIVRNavigationContracts(t *testing.T) {
 	svc, _ := newTestService(t)
 	cases := []struct {
@@ -299,6 +487,32 @@ func TestFormalIVRFlowTracksTransitionsAndBack(t *testing.T) {
 	if firstBack != "accounts" || secondBack != "main" {
 		t.Fatalf("flow back states=%q,%q, want accounts,main", firstBack, secondBack)
 	}
+}
+
+func TestFormalIVRFlowStateIsAuthoritative(t *testing.T) {
+	svc, _ := newTestService(t)
+	sess := &session{CallID: "authoritative-flow", State: "main", Flow: ivr.NewSession("authoritative-flow")}
+	sess.Flow.State = ivr.State("accounts")
+	svc.mu.Lock()
+	if got := stateLocked(sess); got != ivr.State("accounts") {
+		svc.mu.Unlock()
+		t.Fatalf("state helper returned %q, want accounts", got)
+	}
+	if sess.State != "accounts" {
+		svc.mu.Unlock()
+		t.Fatalf("legacy state mirror=%q, want accounts", sess.State)
+	}
+	sess.State = "stale-legacy-value"
+	if got := stateLocked(sess); got != ivr.State("accounts") {
+		svc.mu.Unlock()
+		t.Fatalf("legacy state overrode formal flow: got %q", got)
+	}
+	transitionLocked(sess, "account_menu")
+	if sess.Flow.State != ivr.State("account_menu") || sess.State != "account_menu" {
+		svc.mu.Unlock()
+		t.Fatalf("transition diverged: flow=%q mirror=%q", sess.Flow.State, sess.State)
+	}
+	svc.mu.Unlock()
 }
 
 func TestAdmitUnauthorizedHangsUp(t *testing.T) {
@@ -404,6 +618,67 @@ func TestOutgoingCallsMatchRequestIDNotQueueOrder(t *testing.T) {
 	}
 }
 
+func TestDuplicateOutgoingEventsAreIdempotent(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	svc.ctx = ctx
+	defer func() {
+		cancel()
+		svc.StopTasks()
+		svc.Wait()
+	}()
+	svc.pending = map[string]DialRequest{
+		"req-a": {RequestID: "req-a", URI: "sip:a@example.com", UserID: "user-a", Text: "a"},
+		"req-b": {RequestID: "req-b", URI: "sip:b@example.com", UserID: "user-b", Text: "b"},
+	}
+	message := bridge.Message{Type: "call_outgoing", CallID: "call-a", RequestID: "req-a"}
+	if err := svc.startOutgoing(nil, message); err != nil {
+		t.Fatalf("first call_outgoing: %v", err)
+	}
+	if err := svc.startOutgoing(nil, bridge.Message{Type: "call_outgoing", CallID: "call-a", RequestID: "req-b"}); err != nil {
+		t.Fatalf("duplicate call_outgoing: %v", err)
+	}
+	svc.mu.Lock()
+	sess := svc.sessions["call-a"]
+	_, pendingOther := svc.pending["req-b"]
+	remaining := len(svc.pending)
+	svc.mu.Unlock()
+	if sess == nil || sess.UserID != "user-a" || sess.AlertText != "a" {
+		t.Fatalf("duplicate replaced the original session: %+v", sess)
+	}
+	if !pendingOther || remaining != 1 {
+		t.Fatalf("duplicate consumed another pending request: pending=%d present=%v", remaining, pendingOther)
+	}
+}
+
+func TestLateOutgoingEventIsRejectedWithoutCreatingSession(t *testing.T) {
+	svc, _ := newTestService(t)
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	done := make(chan error, 1)
+	go func() {
+		done <- svc.startOutgoing(server, bridge.Message{Type: "call_outgoing", CallID: "late-call", RequestID: "expired-request"})
+	}()
+	client.SetReadDeadline(time.Now().Add(time.Second))
+	message, err := bridge.Decode(bufio.NewReader(client))
+	if err != nil {
+		t.Fatalf("decode late-event rejection: %v", err)
+	}
+	if message.Type != "hangup" || message.CallID != "late-call" || message.Code != 603 {
+		t.Fatalf("late-event rejection=%+v", message)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("late-event rejection write: %v", err)
+	}
+	svc.mu.Lock()
+	_, exists := svc.sessions["late-call"]
+	svc.mu.Unlock()
+	if exists {
+		t.Fatal("late outgoing event created an unknown session")
+	}
+}
+
 func TestExpiredOutgoingRequestSignalsFailure(t *testing.T) {
 	svc, _ := newTestService(t)
 	done := make(chan bool, 1)
@@ -437,8 +712,8 @@ func TestNormalizePhone(t *testing.T) {
 		"":                             "",
 	}
 	for input, want := range cases {
-		if got := normalizePhone(input); got != want {
-			t.Errorf("normalizePhone(%q) = %q, want %q", input, got, want)
+		if got := phone.Normalize(input); got != want {
+			t.Errorf("phone.Normalize(%q) = %q, want %q", input, got, want)
 		}
 	}
 }
@@ -519,12 +794,20 @@ func TestSaveDraftAppendsRemoteDraftWithAllAttachments(t *testing.T) {
 	var gotAccount store.Account
 	var gotFolder string
 	var gotRaw []byte
+	remoteAppends := 0
 	svc.DraftAppender = func(_ context.Context, account store.Account, folder string, raw []byte) error {
+		remoteAppends++
 		gotAccount, gotFolder, gotRaw = account, folder, append([]byte(nil), raw...)
 		return nil
 	}
 	sess := &session{UserID: "draft-user", ActiveAccount: "draft-account", Draft: draft{To: "recipient@example.com", Subject: "subject", Body: "body", Attachments: []mailer.Attachment{{Filename: "one.wav", ContentType: "audio/wav", Data: []byte("one")}, {Filename: "two.mp4", ContentType: "video/mp4", Data: []byte("two")}}}}
 	svc.saveDraft(sess)
+	if sess.Draft.ID == "" {
+		t.Fatal("first save did not assign a durable draft ID")
+	}
+	if remoteAppends != 1 {
+		t.Fatalf("remote appends after first save=%d, want 1", remoteAppends)
+	}
 	if gotAccount.ID != "draft-account" || gotFolder != "Drafts" {
 		t.Fatalf("remote draft target account=%q folder=%q", gotAccount.ID, gotFolder)
 	}
@@ -536,5 +819,144 @@ func TestSaveDraftAppendsRemoteDraftWithAllAttachments(t *testing.T) {
 	drafts, err := db.ListDrafts(ctx, "draft-user", "draft-account")
 	if err != nil || len(drafts) != 1 || len(drafts[0].Attachments) != 2 {
 		t.Fatalf("stored draft round-trip failed: drafts=%+v err=%v", drafts, err)
+	}
+	sess.Draft.Body = "edited locally"
+	sess.Draft.Attachments = []mailer.Attachment{{Filename: "updated.txt", ContentType: "text/plain", Data: []byte("updated")}}
+	svc.saveDraft(sess)
+	if remoteAppends != 1 {
+		t.Fatalf("remote appends after repeated save=%d, want exactly one", remoteAppends)
+	}
+	drafts, err = db.ListDrafts(ctx, "draft-user", "draft-account")
+	if err != nil || len(drafts) != 1 || drafts[0].Body != "edited locally" || len(drafts[0].Attachments) != 1 || drafts[0].Attachments[0].Filename != "updated.txt" {
+		t.Fatalf("repeated local draft save was not canonical: drafts=%+v err=%v", drafts, err)
+	}
+}
+
+func TestSaveDraftDoesNotRetryFailedRemoteAppend(t *testing.T) {
+	svc, db := newTestService(t)
+	ctx := context.Background()
+	if _, err := db.DB.ExecContext(ctx, `INSERT INTO users(id,username,password_hash,pin_hash,role,created_at) VALUES('draft-failure-user','draft-failure-user','p','p','user','now')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.ExecContext(ctx, `INSERT INTO accounts(id,user_id,canonical_name,email,sender_name,imap_host,imap_user,imap_password,smtp_host,smtp_user,smtp_password,folder_map,created_at) VALUES('draft-failure-account','draft-failure-user','Work','work@example.com','Work','imap.example','user','sealed','smtp.example','user','sealed','{"Drafts":"Drafts"}','now')`); err != nil {
+		t.Fatal(err)
+	}
+	remoteAppends := 0
+	svc.DraftAppender = func(context.Context, store.Account, string, []byte) error {
+		remoteAppends++
+		return errors.New("remote unavailable")
+	}
+	sess := &session{UserID: "draft-failure-user", ActiveAccount: "draft-failure-account", Draft: draft{To: "recipient@example.com", Body: "first"}}
+	svc.saveDraft(sess)
+	if sess.Draft.ID == "" {
+		t.Fatal("failed remote append did not preserve the local draft ID")
+	}
+	sess.Draft.Body = "second"
+	svc.saveDraft(sess)
+	if remoteAppends != 1 {
+		t.Fatalf("failed remote append was retried %d times, want exactly once", remoteAppends)
+	}
+	draftRecord, err := db.LoadDraft(ctx, sess.UserID, sess.Draft.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if draftRecord.Body != "second" {
+		t.Fatalf("local draft body=%q, want latest local edit", draftRecord.Body)
+	}
+}
+
+func TestSendDraftJournalsStableMessageIDBeforeSMTP(t *testing.T) {
+	svc, db := newTestService(t)
+	ctx := context.Background()
+	box, err := secret.New("test-key-with-more-than-32-characters-123456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.Secrets = box
+	if _, err := db.DB.ExecContext(ctx, `INSERT INTO users(id,username,password_hash,pin_hash,role,created_at) VALUES('send-user','send-user','p','p','user','now')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SaveAccount(ctx, box, store.Account{
+		ID: "send-account", UserID: "send-user", CanonicalName: "Work", Email: "sender@example.com", SenderName: "Sender",
+		IMAPHost: "imap.example", IMAPPort: 993, IMAPUser: "sender", IMAPPassword: "imap-password",
+		SMTPHost: "smtp.example", SMTPPort: 465, SMTPUser: "sender", SMTPPassword: "smtp-password", FolderMap: `{}`, AlertFolders: `[]`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var sentRaw []byte
+	svc.SubmitMail = func(config mailer.Config, _ []string, raw []byte) mailer.SendResult {
+		if config.Password != "smtp-password" {
+			t.Fatalf("SMTP password=%q, want decrypted password", config.Password)
+		}
+		sentRaw = append([]byte(nil), raw...)
+		return mailer.SendResult{Status: mailer.SendAccepted}
+	}
+	sess := &session{UserID: "send-user", State: "review", Draft: draft{ID: "draft-send-1", To: "recipient@example.com", Subject: "subject", Body: "body"}}
+	svc.sendDraft(sess)
+	message, err := mail.ReadMessage(bytes.NewReader(sentRaw))
+	if err != nil {
+		t.Fatalf("sent MIME=%q: %v", sentRaw, err)
+	}
+	messageID := message.Header.Get("Message-ID")
+	if messageID == "" {
+		t.Fatal("sent message has no Message-ID")
+	}
+	journal, err := db.OutboundSubmission(ctx, messageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if journal.MessageID != messageID || journal.UserID != sess.UserID || journal.AccountID != "send-account" || journal.DraftID != "draft-send-1" || journal.Status != "accepted" || journal.AcceptedAt == "" {
+		t.Fatalf("submission journal=%+v", journal)
+	}
+}
+
+func TestSaveDraftReplacesAttachmentGenerationWithoutDeletingCurrent(t *testing.T) {
+	svc, db := newTestService(t)
+	svc.DataRoot = t.TempDir()
+	ctx := context.Background()
+	if _, err := db.DB.ExecContext(ctx, `INSERT INTO users(id,username,password_hash,pin_hash,role,created_at) VALUES('generation-user','generation-user','p','p','user','now')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.ExecContext(ctx, `INSERT INTO accounts(id,user_id,canonical_name,email,sender_name,imap_host,imap_user,imap_password,smtp_host,smtp_user,smtp_password,folder_map,created_at) VALUES('generation-account','generation-user','Work','work@example.com','Work','imap','u','p','smtp','u','p','{}','now')`); err != nil {
+		t.Fatal(err)
+	}
+	sess := &session{UserID: "generation-user", ActiveAccount: "generation-account", Draft: draft{To: "recipient@example.com", Attachments: []mailer.Attachment{{Filename: "old.bin", ContentType: "application/octet-stream", Data: []byte("old")}}}}
+	svc.saveDraft(sess)
+	if sess.Draft.ID == "" {
+		t.Fatal("save did not assign durable draft ID")
+	}
+	first, err := db.LoadDraft(ctx, sess.UserID, sess.Draft.ID)
+	if err != nil || len(first.Attachments) != 1 {
+		t.Fatalf("first draft=%+v err=%v", first, err)
+	}
+	oldPath := first.Attachments[0].Path
+	sess.Draft.Attachments = []mailer.Attachment{{Filename: "new.bin", ContentType: "application/octet-stream", Data: []byte("new")}}
+	svc.saveDraft(sess)
+	second, err := db.LoadDraft(ctx, sess.UserID, sess.Draft.ID)
+	if err != nil || len(second.Attachments) != 1 {
+		t.Fatalf("second draft=%+v err=%v", second, err)
+	}
+	if second.Attachments[0].Path == oldPath {
+		t.Fatal("replacement reused the old attachment generation")
+	}
+	if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+		t.Fatalf("old attachment still exists, stat error=%v", err)
+	}
+	if data, err := os.ReadFile(second.Attachments[0].Path); err != nil || string(data) != "new" {
+		t.Fatalf("current attachment data=%q err=%v", data, err)
+	}
+	storageRoot := filepath.Join(svc.DataRoot, "drafts", draftStorageKey(sess.Draft.ID))
+	entries, err := os.ReadDir(storageRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directories := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			directories++
+		}
+	}
+	if directories != 1 {
+		t.Fatalf("attachment generations=%d, want exactly 1", directories)
 	}
 }

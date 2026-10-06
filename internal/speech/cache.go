@@ -33,7 +33,7 @@ func (c Cache) Paths(voice string, speed int, prompts map[string]string) map[str
 		digest := sha256.Sum256([]byte(voice + fmt.Sprint(speed) + key + text))
 		name := hex.EncodeToString(digest[:]) + ".wav"
 		path := filepath.Join(active, name)
-		if info, err := os.Stat(path); err == nil && info.Size() > 44 {
+		if ValidWAV(path) {
 			paths[text] = path
 		}
 	}
@@ -56,6 +56,9 @@ func (c Cache) Build(ctx context.Context, voice string, speed int, prompts map[s
 		path := filepath.Join(stage, name)
 		if err := c.Synth.Synthesize(ctx, text, path); err != nil {
 			return Manifest{}, fmt.Errorf("asset %s: %w", key, err)
+		}
+		if err := validateWAV(path); err != nil {
+			return Manifest{}, fmt.Errorf("asset %s produced invalid WAV: %w", key, err)
 		}
 		manifest.Assets[key] = name
 	}

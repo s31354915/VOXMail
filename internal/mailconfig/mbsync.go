@@ -6,12 +6,18 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/voxmail/voxmail/internal/mailsecurity"
+	"github.com/voxmail/voxmail/internal/netguard"
 )
 
 // Account is the non-secret portion needed to generate an mbsync channel.
 type Account struct {
-	ID           string
-	IMAPHost     string
+	ID       string
+	IMAPHost string
+	// IMAPAddress is the already-validated numeric endpoint used by the
+	// controlled tunnel helper. IMAPHost remains the TLS verification name.
+	IMAPAddress  string
 	IMAPPort     int
 	IMAPSecurity string
 	IMAPUser     string
@@ -29,12 +35,16 @@ func Generate(a Account) (string, error) {
 	if a.IMAPPort == 0 {
 		a.IMAPPort = 993
 	}
-	security := strings.ToUpper(strings.TrimSpace(a.IMAPSecurity))
-	if security == "" {
-		security = "IMAPS"
+	security, err := mbsyncSecurity(a.IMAPSecurity, a.IMAPPort)
+	if err != nil {
+		return "", err
 	}
-	if security != "IMAPS" && security != "STARTTLS" {
-		return "", fmt.Errorf("unsupported IMAP security mode")
+	tunnel := ""
+	if strings.TrimSpace(a.IMAPAddress) != "" {
+		if err := netguard.ValidateAddress(a.IMAPAddress, a.IMAPPort, false); err != nil {
+			return "", fmt.Errorf("invalid IMAP tunnel address: %w", err)
+		}
+		tunnel = fmt.Sprintf("Tunnel %s\n", quote("/usr/local/bin/voxmail-connect "+a.IMAPAddress))
 	}
 	for remote, local := range a.FolderMap {
 		if strings.TrimSpace(remote) == "" || strings.ContainsAny(remote, "\x00\r\n") {
@@ -68,7 +78,8 @@ func Generate(a Account) (string, error) {
 	base := fmt.Sprintf(`IMAPAccount %s
 Host %s
 Port %d
-User %s
+Timeout 60
+%sUser %s
 PassCmd "/usr/local/bin/voxmail-secret %s"
 SSLType %s
 
@@ -89,7 +100,7 @@ Remove None
 Sync All
 Expunge None
 SyncState *
-	`, name, quote(a.IMAPHost), a.IMAPPort, quote(a.IMAPUser), name, security, name, name, name, quote(root), quote(inbox), name, name, name, patterns)
+	`, name, quote(a.IMAPHost), a.IMAPPort, tunnel, quote(a.IMAPUser), name, security, name, name, name, quote(root), quote(inbox), name, name, name, patterns)
 	for i, remote := range remotes {
 		local := a.FolderMap[remote]
 		channel := safe(fmt.Sprintf("%s-folder-%d", name, i+1))
@@ -105,6 +116,25 @@ SyncState *
 `, channel, name, quote(remote), name, quote(local))
 	}
 	return base, nil
+}
+
+// mbsyncSecurity is the adapter between VOXMail's persisted transport names
+// and mbsync's configuration vocabulary. Keep this translation at the
+// boundary; passing the application name through would turn implicit_tls into
+// IMPLICIT_TLS, which mbsync rejects.
+func mbsyncSecurity(value string, port int) (string, error) {
+	canonical, err := mailsecurity.NormalizeIMAP(value, port)
+	if err != nil {
+		return "", err
+	}
+	switch canonical {
+	case mailsecurity.ImplicitTLS:
+		return "IMAPS", nil
+	case mailsecurity.StartTLS:
+		return "STARTTLS", nil
+	default:
+		return "", fmt.Errorf("unsupported IMAP security mode %q", canonical)
+	}
 }
 
 // ChannelNames returns the exact channels emitted by Generate.  The main

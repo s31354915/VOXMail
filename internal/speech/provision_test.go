@@ -4,11 +4,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestDownloadVerifiedRejectsChecksumMismatchAndLeavesNoDestination(t *testing.T) {
@@ -41,29 +43,173 @@ func TestDownloadVerifiedAcceptsExpectedChecksum(t *testing.T) {
 	}
 }
 
-func TestAtomicInstallPairRollsForwardTogether(t *testing.T) {
+func TestActiveVoiceManifestSelectsAnImmutablePair(t *testing.T) {
 	root := t.TempDir()
-	stagedModel := filepath.Join(root, "stage-model")
-	stagedConfig := filepath.Join(root, "stage-config")
-	model := filepath.Join(root, "voice.onnx")
+	name := "local_voice"
+	version := "version-one"
+	model := filepath.Join(root, voiceVersionsDir, name, version, name+".onnx")
 	config := model + ".json"
-	for path, data := range map[string]string{stagedModel: "new-model", stagedConfig: `{"audio":{}}`, model: "old-model", config: `{"audio":{"old":true}}`} {
-		if err := os.WriteFile(path, []byte(data), 0600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := atomicInstallPair(stagedModel, model, stagedConfig, config); err != nil {
+	if err := os.MkdirAll(filepath.Dir(model), 0700); err != nil {
 		t.Fatal(err)
 	}
-	for path, want := range map[string]string{model: "new-model", config: `{"audio":{}}`} {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if string(data) != want {
-			t.Fatalf("%s = %q, want %q", path, data, want)
-		}
+	if err := os.WriteFile(model, []byte("model-one"), 0600); err != nil {
+		t.Fatal(err)
 	}
+	if err := os.WriteFile(config, []byte(`{"audio":{"sample_rate":22050}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	modelDigest, err := ModelSHA256(model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configDigest, err := ModelSHA256(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeActiveVoiceManifest(root, activeVoiceManifest{Version: 1, Voice: name, Model: filepath.ToSlash(filepath.Join(voiceVersionsDir, name, version, name+".onnx")), Config: filepath.ToSlash(filepath.Join(voiceVersionsDir, name, version, name+".onnx.json")), ModelSHA256: modelDigest, ConfigSHA256: configDigest}); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := InstalledVoicePath(root, name)
+	if !ok || got != model {
+		t.Fatalf("active model path=%q,%v want %q,true", got, ok, model)
+	}
+	if !IsInstalledVoice(root, name) {
+		t.Fatal("active usable pair was not recognized")
+	}
+	if err := os.WriteFile(config, []byte(`{"truncated":`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if IsInstalledVoice(root, name) {
+		t.Fatal("corrupt active sidecar remained usable")
+	}
+}
+
+func TestActiveVoiceManifestRejectsUnversionedAndSymlinkedPairs(t *testing.T) {
+	root := t.TempDir()
+	name := "local_voice"
+	version := "version-one"
+	model := filepath.Join(root, voiceVersionsDir, name, version, name+".onnx")
+	config := model + ".json"
+	if err := os.MkdirAll(filepath.Dir(model), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(model, []byte("model-one"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(config, []byte(`{"audio":{"sample_rate":22050}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	modelDigest, err := ModelSHA256(model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configDigest, err := ModelSHA256(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := activeVoiceManifest{Version: 1, Voice: name, ModelSHA256: modelDigest, ConfigSHA256: configDigest}
+	manifest.Model = filepath.ToSlash(filepath.Join(voiceVersionsDir, name, version, name+".onnx"))
+	manifest.Config = filepath.ToSlash(filepath.Join(voiceVersionsDir, name, version, name+".onnx.json"))
+	if err := writeActiveVoiceManifest(root, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := InstalledVoicePath(root, name); !ok {
+		t.Fatal("valid versioned pair was rejected")
+	}
+
+	manifest.Model = name + ".onnx"
+	manifest.Config = name + ".onnx.json"
+	if err := writeActiveVoiceManifest(root, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := InstalledVoicePath(root, name); ok {
+		t.Fatal("unversioned active pair was accepted")
+	}
+
+	manifest.Model = filepath.ToSlash(filepath.Join(voiceVersionsDir, name, version, name+".onnx"))
+	manifest.Config = filepath.ToSlash(filepath.Join(voiceVersionsDir, name, "different-version", name+".onnx.json"))
+	if err := writeActiveVoiceManifest(root, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := InstalledVoicePath(root, name); ok {
+		t.Fatal("model/config from different versions were accepted")
+	}
+
+	outside := filepath.Join(root, "outside")
+	if err := os.MkdirAll(outside, 0700); err != nil {
+		t.Fatal(err)
+	}
+	versionPath := filepath.Join(root, voiceVersionsDir, name, "linked-version")
+	if err := os.Symlink(outside, versionPath); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	linkedModel := filepath.Join(outside, name+".onnx")
+	linkedConfig := linkedModel + ".json"
+	if err := os.WriteFile(linkedModel, []byte("model-linked"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(linkedConfig, []byte(`{"audio":{"sample_rate":22050}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	linkedModelDigest, err := ModelSHA256(linkedModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	linkedConfigDigest, err := ModelSHA256(linkedConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.Model = filepath.ToSlash(filepath.Join(voiceVersionsDir, name, "linked-version", name+".onnx"))
+	manifest.Config = filepath.ToSlash(filepath.Join(voiceVersionsDir, name, "linked-version", name+".onnx.json"))
+	manifest.ModelSHA256 = linkedModelDigest
+	manifest.ConfigSHA256 = linkedConfigDigest
+	if err := writeActiveVoiceManifest(root, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := InstalledVoicePath(root, name); ok {
+		t.Fatal("symlinked version directory was accepted")
+	}
+}
+
+func TestPreserveVoicePathMovesArtifactsToUniqueRecoveryPath(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "staged")
+	if err := os.WriteFile(source, []byte("recover me"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	recovery, err := preserveVoicePath(source, root, ".failed-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(source); !os.IsNotExist(err) {
+		t.Fatalf("source still exists after preservation: %v", err)
+	}
+	data, err := os.ReadFile(recovery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "recover me" {
+		t.Fatalf("recovery contents=%q", data)
+	}
+}
+
+func TestVoiceOperationSerializesAndHonorsCancellation(t *testing.T) {
+	root := t.TempDir()
+	first, err := AcquireVoiceOperation(context.Background(), root, "voice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := AcquireVoiceOperation(ctx, root, "voice"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("blocked operation error=%v, want deadline exceeded", err)
+	}
+	other, err := AcquireVoiceOperation(context.Background(), root, "other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other.Close()
 }
 
 func TestInstalledVoiceDiscoveryRequiresUsablePair(t *testing.T) {

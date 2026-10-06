@@ -119,7 +119,7 @@ func PrepareStaticPrompts(ctx context.Context, p Piper, greetingPath, mainPath, 
 		if voice == current.VoiceModel {
 			complete := true
 			for _, relative := range current.Assets {
-				if _, err := os.Stat(filepath.Join(filepath.Dir(manifestPath), relative)); err != nil {
+				if !ValidWAV(filepath.Join(filepath.Dir(manifestPath), relative)) {
 					complete = false
 					break
 				}
@@ -249,23 +249,45 @@ func PrepareStaticPrompts(ctx context.Context, p Piper, greetingPath, mainPath, 
 	return manifest, nil
 }
 
+type capabilityReady struct {
+	done   chan struct{}
+	err    error
+	closed bool
+}
+
+func newCapabilityReady() *capabilityReady {
+	return &capabilityReady{done: make(chan struct{})}
+}
+
+func (r *capabilityReady) finish(err error) {
+	if r == nil || r.closed {
+		return
+	}
+	r.err = err
+	r.closed = true
+	close(r.done)
+}
+
 // Runtime owns the expensive speech engines for the duration of one or more
-// active calls. The first caller starts a warmup; additional callers share it.
-// When the final lease is released, the warmup context is cancelled and the
-// next caller gets a fresh lifecycle.
+// active calls. Piper/TTS and Whisper/STT warm independently: a broken STT
+// installation must not prevent fixed or dynamic TTS menus from working.
 type Runtime struct {
 	Piper   Piper
 	Whisper Whisper
 	Dir     string
 	Speed   int
 
-	mu      sync.Mutex
-	refs    int
-	ready   chan struct{}
-	warmErr error
-	cancel  context.CancelFunc
-	worker  *piperWorker
-	onZero  func()
+	mu       sync.Mutex
+	refs     int
+	ready    *capabilityReady
+	ttsReady *capabilityReady
+	sttReady *capabilityReady
+	warmErr  error
+	ttsErr   error
+	sttErr   error
+	cancel   context.CancelFunc
+	worker   *piperWorker
+	onZero   func()
 }
 
 type Lease struct {
@@ -299,18 +321,27 @@ func (p *RuntimePool) Activate(voice string, speed int) (*Runtime, *Lease) {
 	if model == "" {
 		model = "en_US-hfc_male-medium"
 	}
+	originalModel := model
 	if !strings.HasSuffix(model, ".onnx") {
 		model += ".onnx"
 	}
 	if !filepath.IsAbs(model) {
 		model = filepath.Join(p.VoiceDir, model)
+		if resolved, ok := InstalledVoicePath(p.VoiceDir, strings.TrimSuffix(filepath.Base(model), filepath.Ext(model))); ok {
+			model = resolved
+		}
 	}
-	key := fmt.Sprintf("%s|%d", model, speed)
+	modelDigest, _ := ModelSHA256(model)
+	if modelDigest == "" {
+		modelDigest = "unavailable"
+	}
+	normalizedSpeed := normalizeSpeed(speed)
+	key := fmt.Sprintf("%s|%s|%d", strings.TrimSpace(originalModel), modelDigest, normalizedSpeed)
 	p.mu.Lock()
 	runtime := p.runtimes[key]
 	if runtime == nil {
-		runtime = NewRuntime(Piper{Binary: p.PiperBinary, Model: model, Extra: SpeedExtra(speed)}, Whisper{Binary: p.WhisperBinary, Model: p.WhisperModel}, filepath.Join(p.Dir, fmt.Sprintf("%x", sha256.Sum256([]byte(key)))))
-		runtime.Speed = normalizeSpeed(speed)
+		runtime = NewRuntime(Piper{Binary: p.PiperBinary, Model: model, Extra: SpeedExtra(normalizedSpeed)}, Whisper{Binary: p.WhisperBinary, Model: p.WhisperModel}, filepath.Join(p.Dir, fmt.Sprintf("%x", sha256.Sum256([]byte(key)))))
+		runtime.Speed = normalizedSpeed
 		runtime.onZero = func() {
 			p.mu.Lock()
 			defer p.mu.Unlock()
@@ -358,8 +389,12 @@ func (r *Runtime) Activate() *Lease {
 	}
 	r.mu.Lock()
 	if r.refs == 0 {
-		r.ready = make(chan struct{})
+		r.ready = newCapabilityReady()
+		r.ttsReady = newCapabilityReady()
+		r.sttReady = newCapabilityReady()
 		r.warmErr = nil
+		r.ttsErr = nil
+		r.sttErr = nil
 		warmCtx, cancel := context.WithCancel(context.Background())
 		r.cancel = cancel
 		ready := r.ready
@@ -370,26 +405,19 @@ func (r *Runtime) Activate() *Lease {
 	return &Lease{runtime: r}
 }
 
-func (r *Runtime) warm(ctx context.Context, ready chan struct{}) {
+func (r *Runtime) warm(ctx context.Context, ready *capabilityReady) {
 	var wg sync.WaitGroup
-	var firstErr error
-	var errMu sync.Mutex
-	var worker *piperWorker
-	record := func(err error) {
-		if err != nil {
-			errMu.Lock()
-			if firstErr == nil {
-				firstErr = err
-			}
-			errMu.Unlock()
-		}
-	}
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
 		w, err := startPiperWorker(ctx, r.Piper)
 		if err != nil {
-			record(err)
+			r.mu.Lock()
+			if r.ready == ready {
+				r.ttsErr = err
+				r.ttsReady.finish(err)
+			}
+			r.mu.Unlock()
 			return
 		}
 		r.mu.Lock()
@@ -402,64 +430,113 @@ func (r *Runtime) warm(ctx context.Context, ready chan struct{}) {
 			w.close()
 			return
 		}
-		worker = w
 		warmDir := r.Dir
 		if warmDir == "" {
 			warmDir = os.TempDir()
 		}
 		if err := os.MkdirAll(warmDir, 0700); err != nil {
-			record(err)
+			w.close()
+			r.mu.Lock()
+			if r.ready == ready && r.worker == w {
+				r.worker = nil
+				r.ttsErr = err
+				r.ttsReady.finish(err)
+			}
+			r.mu.Unlock()
 			return
 		}
 		file, err := os.CreateTemp(warmDir, ".piper-warm-*.wav")
 		if err != nil {
-			record(err)
+			w.close()
+			r.mu.Lock()
+			if r.ready == ready && r.worker == w {
+				r.worker = nil
+				r.ttsErr = err
+				r.ttsReady.finish(err)
+			}
+			r.mu.Unlock()
 			return
 		}
 		path := file.Name()
 		_ = file.Close()
-		if err := worker.synthesize(ctx, "VOXMail ready.", path); err != nil {
-			record(err)
-		}
+		warmErr := w.synthesize(ctx, "VOXMail ready.", path)
 		_ = os.Remove(path)
+		if warmErr != nil {
+			w.close()
+		}
+		r.mu.Lock()
+		if r.ready == ready {
+			if warmErr != nil && r.worker == w {
+				r.worker = nil
+			}
+			r.ttsErr = warmErr
+			r.ttsReady.finish(warmErr)
+		}
+		r.mu.Unlock()
 	}()
 	go func() {
 		defer wg.Done()
-		record(r.Whisper.Warm(ctx, r.Dir))
+		warmErr := r.Whisper.Warm(ctx, r.Dir)
+		r.mu.Lock()
+		if r.ready == ready {
+			r.sttErr = warmErr
+			r.sttReady.finish(warmErr)
+		}
+		r.mu.Unlock()
 	}()
 	wg.Wait()
 	r.mu.Lock()
 	if r.ready == ready {
-		r.warmErr = firstErr
-		close(ready)
-		r.mu.Unlock()
-		return
-	}
-	// This warm belongs to a superseded generation. Tear down only the worker
-	// we installed, never a worker installed by a newer warm.
-	if r.worker == worker {
-		r.worker = nil
+		r.warmErr = combineCapabilityErrors(r.ttsErr, r.sttErr)
+		ready.finish(r.warmErr)
 	}
 	r.mu.Unlock()
-	if worker != nil {
-		worker.close()
+}
+
+func combineCapabilityErrors(ttsErr, sttErr error) error {
+	if ttsErr == nil && sttErr == nil {
+		return nil
 	}
+	if ttsErr != nil && sttErr != nil {
+		return fmt.Errorf("speech warm-up failed: tts: %v; whisper: %w", ttsErr, sttErr)
+	}
+	if ttsErr != nil {
+		return fmt.Errorf("speech TTS warm-up failed: %w", ttsErr)
+	}
+	return fmt.Errorf("speech Whisper warm-up failed: %w", sttErr)
 }
 
 func (r *Runtime) Wait(ctx context.Context) error {
+	return r.waitCapability(ctx, func(runtime *Runtime) *capabilityReady { return runtime.ready })
+}
+
+// WaitTTS waits only for Piper readiness.
+func (r *Runtime) WaitTTS(ctx context.Context) error {
+	return r.waitCapability(ctx, func(runtime *Runtime) *capabilityReady { return runtime.ttsReady })
+}
+
+// WaitWhisper waits only for Whisper readiness.
+func (r *Runtime) WaitWhisper(ctx context.Context) error {
+	return r.waitCapability(ctx, func(runtime *Runtime) *capabilityReady { return runtime.sttReady })
+}
+
+func (r *Runtime) waitCapability(ctx context.Context, selectReady func(*Runtime) *capabilityReady) error {
 	if r == nil {
 		return fmt.Errorf("speech runtime is not configured")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	r.mu.Lock()
-	ready := r.ready
+	ready := selectReady(r)
 	r.mu.Unlock()
 	if ready == nil {
 		return fmt.Errorf("speech runtime is not active")
 	}
 	select {
-	case <-ready:
+	case <-ready.done:
 		r.mu.Lock()
-		err := r.warmErr
+		err := ready.err
 		r.mu.Unlock()
 		return err
 	case <-ctx.Done():
@@ -468,7 +545,7 @@ func (r *Runtime) Wait(ctx context.Context) error {
 }
 
 func (r *Runtime) Synthesize(ctx context.Context, text, output string) error {
-	if err := r.Wait(ctx); err != nil {
+	if err := r.WaitTTS(ctx); err != nil {
 		return err
 	}
 	r.mu.Lock()
@@ -495,8 +572,24 @@ func (l *Lease) Release() {
 				r.cancel()
 			}
 			r.cancel = nil
+			ready := r.ready
+			ttsReady := r.ttsReady
+			sttReady := r.sttReady
 			r.ready = nil
+			r.ttsReady = nil
+			r.sttReady = nil
 			r.warmErr = nil
+			r.ttsErr = nil
+			r.sttErr = nil
+			if ready != nil {
+				ready.finish(context.Canceled)
+			}
+			if ttsReady != nil {
+				ttsReady.finish(context.Canceled)
+			}
+			if sttReady != nil {
+				sttReady.finish(context.Canceled)
+			}
 			worker := r.worker
 			onZero := r.onZero
 			r.worker = nil
@@ -563,7 +656,7 @@ func PrepareGreeting(ctx context.Context, p Piper, path string) error {
 	if path == "" {
 		return fmt.Errorf("greeting path is required")
 	}
-	if info, err := os.Stat(path); err == nil && info.Size() > 44 {
+	if ValidWAV(path) {
 		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {

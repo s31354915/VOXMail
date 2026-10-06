@@ -4,6 +4,7 @@ import (
 	"html"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 var (
@@ -45,16 +46,23 @@ func spellEmail(value string) string {
 
 func speakCurrency(raw string) string {
 	kind := map[string]string{"$": "dollars", "€": "euros", "£": "pounds"}
-	body := raw[1:]
+	symbol, width := "", 0
+	if first, size := utf8.DecodeRuneInString(raw); first != utf8.RuneError || size > 1 {
+		symbol, width = string(first), size
+	}
+	if width == 0 {
+		return raw
+	}
+	body := raw[width:]
 	if i := strings.IndexAny(body, ".,"); i >= 0 {
 		major := strings.ReplaceAll(body[:i], ",", " ")
 		minor := strings.TrimLeft(body[i+1:], "0")
 		if minor == "" {
-			return major + " " + kind[raw[:1]]
+			return major + " " + kind[symbol]
 		}
-		return major + " " + kind[raw[:1]] + " and " + minor + " cents"
+		return major + " " + kind[symbol] + " and " + minor + " cents"
 	}
-	return strings.ReplaceAll(body, ",", " ") + " " + kind[raw[:1]]
+	return strings.ReplaceAll(body, ",", " ") + " " + kind[symbol]
 }
 
 func groupDigits(value string) string {

@@ -1,6 +1,8 @@
 package mailparse
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -44,12 +46,85 @@ func TestParseCapsAttachmentCountDuringTraversal(t *testing.T) {
 		b.WriteString("--x\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=f\r\n\r\nx\r\n")
 	}
 	b.WriteString("--x--\r\n")
-	m, err := Parse(strings.NewReader(b.String()))
+	_, err := Parse(strings.NewReader(b.String()))
+	if !errors.Is(err, ErrAttachmentLimit) {
+		t.Fatalf("error=%v, want ErrAttachmentLimit", err)
+	}
+}
+
+func TestParseClassifiesTextAttachmentAndPreservesOriginalBody(t *testing.T) {
+	raw := "Content-Type: multipart/mixed; boundary=x\r\n\r\n" +
+		"--x\r\nContent-Type: text/plain\r\n\r\nPrice is $5.\r\n" +
+		"--x\r\nContent-Type: text/plain\r\nContent-Disposition: attachment; filename=notes.txt\r\n\r\nAttached $7.\r\n" +
+		"--x--\r\n"
+	m, err := Parse(strings.NewReader(raw))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(m.Attachments) != maxAttachments {
-		t.Fatalf("attachment count=%d, want %d", len(m.Attachments), maxAttachments)
+	if strings.TrimSpace(m.OriginalText) != "Price is $5." {
+		t.Fatalf("original text=%q", m.OriginalText)
+	}
+	if !strings.Contains(m.Text, "dollars") {
+		t.Fatalf("speech text=%q", m.Text)
+	}
+	if len(m.Attachments) != 1 || m.Attachments[0].Name != "notes.txt" || strings.TrimSpace(string(m.Attachments[0].Data)) != "Attached $7." {
+		t.Fatalf("attachments=%+v", m.Attachments)
+	}
+}
+
+func TestParseRejectsTruncatedOuterMessage(t *testing.T) {
+	input := strings.NewReader("Content-Type: application/octet-stream\r\n\r\n" + strings.Repeat("x", maxMessageBytes))
+	_, err := Parse(input)
+	if !errors.Is(err, ErrMessageTooLarge) {
+		t.Fatalf("error=%v, want ErrMessageTooLarge", err)
+	}
+}
+
+func TestParseRejectsMalformedEncodedAttachment(t *testing.T) {
+	raw := "Content-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\nnot base64!"
+	if _, err := Parse(strings.NewReader(raw)); err == nil {
+		t.Fatal("malformed base64 attachment was accepted")
+	}
+}
+
+func TestParseMetadataDoesNotRetainAttachmentBytes(t *testing.T) {
+	raw := "Content-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=x.bin\r\n\r\nbytes"
+	m, err := ParseMetadata(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Attachments) != 1 || m.Attachments[0].Size != 5 || len(m.Attachments[0].Data) != 0 {
+		t.Fatalf("metadata attachment=%+v", m.Attachments)
+	}
+}
+
+func TestParseDecodesLegacyCharsetForReadableText(t *testing.T) {
+	raw := "Content-Type: text/plain; charset=iso-8859-1\r\n\r\n" + string([]byte{'c', 'a', 'f', 0xe9})
+	m, err := Parse(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.OriginalText != "café" {
+		t.Fatalf("decoded text=%q, want café", m.OriginalText)
+	}
+}
+
+func TestParseRejectsOversizedHeaders(t *testing.T) {
+	raw := "X-Large: " + strings.Repeat("x", maxHeaderBytes) + "\r\n\r\nbody"
+	_, err := Parse(strings.NewReader(raw))
+	if !errors.Is(err, ErrHeaderTooLarge) {
+		t.Fatalf("error=%v, want ErrHeaderTooLarge", err)
+	}
+}
+
+func TestParseRejectsExcessiveMIMENesting(t *testing.T) {
+	body := "Content-Type: text/plain\r\n\r\nbody\r\n"
+	for level := maxMultipartDepth + 1; level >= 0; level-- {
+		body = fmt.Sprintf("Content-Type: multipart/mixed; boundary=b%d\r\n\r\n--b%d\r\n%s--b%d--\r\n", level, level, body, level)
+	}
+	_, err := Parse(strings.NewReader(body))
+	if err == nil || !strings.Contains(err.Error(), "MIME nesting exceeds") {
+		t.Fatalf("error=%v, want nesting-limit error", err)
 	}
 }
 

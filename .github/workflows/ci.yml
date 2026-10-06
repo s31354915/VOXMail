@@ -25,6 +25,8 @@ jobs:
         run: go test -race -count=1 ./...
       - name: E2E harness compiles
         run: go build ./tests/e2e
+      - name: Documentation contract
+        run: scripts/docs-contract.sh
       - name: Dockerfile is well-formed
         run: docker build --check -f Dockerfile .
 
@@ -32,6 +34,9 @@ jobs:
     name: End-to-end container tests
     runs-on: ubuntu-24.04
     needs: unit
+    env:
+      VOXMAIL_E2E_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+      VOXMAIL_E2E_ARTIFACT_DIR: ${{ runner.temp }}/voxmail-e2e-artifacts
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -39,8 +44,16 @@ jobs:
           go-version: "1.23.x"
       - name: Run E2E suite (builds image, container, restart persistence, cleanup)
         run: scripts/e2e.sh
+      - name: Upload redacted E2E diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: voxmail-e2e-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/voxmail-e2e-artifacts
+          if-no-files-found: ignore
       - name: No docker residue left behind
+        if: always()
         run: |
-          test -z "$(docker ps -aqf name=voxmail-e2e)" || { docker ps -aqf name=voxmail-e2e; exit 1; }
-          test -z "$(docker volume ls -qf name=voxmail-e2e-data)" || { docker volume ls -qf name=voxmail-e2e-data; exit 1; }
-          if docker image inspect voxmail-e2e:test >/dev/null 2>&1; then echo "image voxmail-e2e:test was not removed"; exit 1; fi
+          test -z "$(docker ps -aqf name=^/voxmail-e2e-${VOXMAIL_E2E_RUN_ID}$)" || { docker ps -aqf name=^/voxmail-e2e-${VOXMAIL_E2E_RUN_ID}$; exit 1; }
+          test -z "$(docker volume ls -qf name=^voxmail-e2e-data-${VOXMAIL_E2E_RUN_ID}$)" || { docker volume ls -qf name=^voxmail-e2e-data-${VOXMAIL_E2E_RUN_ID}$; exit 1; }
+          if docker image inspect "voxmail-e2e:${VOXMAIL_E2E_RUN_ID}" >/dev/null 2>&1; then echo "image voxmail-e2e:${VOXMAIL_E2E_RUN_ID} was not removed"; exit 1; fi

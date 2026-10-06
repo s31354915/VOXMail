@@ -10,7 +10,7 @@ import (
 type fakeSynth struct{}
 
 func (fakeSynth) Synthesize(_ context.Context, _, output string) error {
-	return os.WriteFile(output, []byte("wav"), 0600)
+	return writeTestWAV(output)
 }
 
 func TestCacheBuildIsAtomic(t *testing.T) {

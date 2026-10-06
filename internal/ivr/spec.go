@@ -31,6 +31,7 @@ func digits(min, max int) func(string) bool {
 }
 
 var specs = map[State]StateSpec{
+	"closed":                {State: "closed", Prompt: "This call is closed.", Valid: fixed(), Timeout: "closed", Repeatable: true},
 	"pin":                   {State: "pin", Prompt: "Enter your PIN, then press pound.", Valid: nil, Back: "closed", Timeout: "closed", Repeatable: true},
 	"main":                  {State: "main", Prompt: "Press 1 for email, 2 for settings, or 3 for information and instructions.", Valid: fixed("1", "2", "3"), Repeatable: true},
 	"accounts":              {State: "accounts", Prompt: "Press 0 for all unread mail, choose an account, or press pound to go back.", Valid: digits(0, 9), Back: "main", Repeatable: true},

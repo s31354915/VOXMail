@@ -18,34 +18,7 @@ type Piper struct {
 }
 
 func (p Piper) Synthesize(ctx context.Context, text, output string) error {
-	if text == "" {
-		return fmt.Errorf("cannot synthesize empty text")
-	}
-	if p.Binary == "" {
-		p.Binary = "piper"
-	}
-	if p.Model == "" {
-		return fmt.Errorf("piper model is required")
-	}
-	if err := safeOutput(output); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(output), 0700); err != nil {
-		return err
-	}
-	args := []string{"--model", p.Model, "--output_file", output}
-	args = append(args, p.Extra...)
-	command := exec.CommandContext(ctx, p.Binary, args...)
-	command.Stdin = strings.NewReader(text)
-	var stderr bytes.Buffer
-	command.Stderr = &stderr
-	if err := command.Run(); err != nil {
-		return fmt.Errorf("piper: %w: %s", err, strings.TrimSpace(stderr.String()))
-	}
-	if info, err := os.Stat(output); err != nil || info.Size() == 0 {
-		return fmt.Errorf("piper produced no audio")
-	}
-	return nil
+	return synthesizePiper(ctx, p, text, output)
 }
 
 func (p Piper) Warm(ctx context.Context, dir string) error {

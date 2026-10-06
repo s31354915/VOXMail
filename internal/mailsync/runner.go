@@ -1,6 +1,7 @@
 package mailsync
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os/exec"
@@ -17,6 +18,39 @@ type Result struct {
 	Account string
 	Output  []byte
 	Changed bool
+}
+
+const maxMbsyncOutput = 1 << 20
+
+type cappedBuffer struct {
+	buf       bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func (b *cappedBuffer) Write(p []byte) (int, error) {
+	if b.limit <= 0 {
+		b.limit = maxMbsyncOutput
+	}
+	remaining := b.limit - b.buf.Len()
+	if remaining > 0 {
+		if len(p) > remaining {
+			_, _ = b.buf.Write(p[:remaining])
+			b.truncated = true
+		} else {
+			_, _ = b.buf.Write(p)
+		}
+	} else if len(p) > 0 {
+		b.truncated = true
+	}
+	return len(p), nil
+}
+
+func (b *cappedBuffer) Bytes() []byte {
+	if !b.truncated {
+		return b.buf.Bytes()
+	}
+	return append(append([]byte(nil), b.buf.Bytes()...), []byte("\n[mbsync output truncated]\n")...)
 }
 
 func (r Runner) Sync(ctx context.Context, configPath, channel string) (Result, error) {
@@ -64,6 +98,9 @@ func validateChannels(channels []string) error {
 }
 
 func (r Runner) run(ctx context.Context, account string, args ...string) (Result, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if r.Binary == "" {
 		r.Binary = "mbsync"
 	}
@@ -73,23 +110,29 @@ func (r Runner) run(ctx context.Context, account string, args ...string) (Result
 	work, cancel := context.WithTimeout(ctx, r.Timeout)
 	defer cancel()
 	cmd := exec.CommandContext(work, r.Binary, args...)
-	output, err := cmd.CombinedOutput()
+	var capture cappedBuffer
+	cmd.Stdout = &capture
+	cmd.Stderr = &capture
+	err := cmd.Run()
+	output := capture.Bytes()
 	code := 0
 	if cmd.ProcessState != nil {
 		code = cmd.ProcessState.ExitCode()
 	}
-	// --ext-exit ORs 32/64 in when the near/far side changed. Those are
-	// success indicators, not errors; keep the logic here so callers can
-	// trigger indexing only when work actually occurred.
-	changed := code&96 != 0
+	// --ext-exit ORs 32/64 in when the near/far side changed. Those bits may be
+	// combined with ordinary failure bits (for example 65), so a change does
+	// not turn a partial failure into success.
+	changed := code >= 0 && code&96 != 0
+	result := Result{Account: account, Output: output, Changed: changed}
 	if work.Err() != nil {
-		return Result{Account: account, Output: output, Changed: changed}, work.Err()
+		return result, work.Err()
 	}
 	if err == nil {
-		return Result{Account: account, Output: output}, nil
+		return result, nil
 	}
-	if changed {
-		return Result{Account: account, Output: output, Changed: true}, nil
+	if code >= 0 && code&^96 == 0 {
+		result.Changed = true
+		return result, nil
 	}
-	return Result{Account: account, Output: output}, fmt.Errorf("mbsync %s: %w: %s", account, err, output)
+	return result, fmt.Errorf("mbsync %s: %w: %s", account, err, output)
 }

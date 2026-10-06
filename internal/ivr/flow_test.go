@@ -22,3 +22,23 @@ func TestPINLocksAfterThreeFailures(t *testing.T) {
 		t.Fatal("session was not closed")
 	}
 }
+
+func TestHistoryIsBoundedAndCloseRevokesAuthentication(t *testing.T) {
+	s := NewSession("c1")
+	s.HistoryLimit = 2
+	s.Authenticated = true
+	for _, state := range []State{StatePIN, StateMain, StateUnread} {
+		s.Enter(state)
+	}
+	if len(s.Previous) != 2 || s.Previous[0] != StatePIN || s.Previous[1] != StateMain {
+		t.Fatalf("history=%v, want the newest two states", s.Previous)
+	}
+	s.Close()
+	if s.State != StateClosed || s.Authenticated || len(s.Previous) != 0 {
+		t.Fatalf("closed session=%+v, want terminal unauthenticated state", s)
+	}
+	s.Close()
+	if s.State != StateClosed || s.Authenticated {
+		t.Fatal("second close was not idempotent")
+	}
+}

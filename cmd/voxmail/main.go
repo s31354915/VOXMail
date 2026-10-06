@@ -19,6 +19,7 @@ import (
 	"github.com/voxmail/voxmail/internal/config"
 	"github.com/voxmail/voxmail/internal/mailindex"
 	"github.com/voxmail/voxmail/internal/mailsync"
+	"github.com/voxmail/voxmail/internal/maintenance"
 	"github.com/voxmail/voxmail/internal/secret"
 	"github.com/voxmail/voxmail/internal/sip"
 	"github.com/voxmail/voxmail/internal/speech"
@@ -41,20 +42,22 @@ func (v *voiceActivator) ActivateVoice(ctx context.Context, name string, menuSpe
 	if !ok {
 		return errors.New("voice model is not installed or not in the trusted catalog")
 	}
-	model := filepath.Join(v.VoiceDir, voice.Voice+".onnx")
-	config := model + ".json"
+	operation, err := speech.AcquireVoiceOperation(ctx, v.VoiceDir, voice.Voice)
+	if err != nil {
+		return err
+	}
+	defer operation.Close()
 	if voice.ModelURL != "" {
 		// Trusted catalog models are downloaded only through the pinned,
 		// checksum-verified installer. Locally installed models are never
 		// replaced or downloaded as a side effect of selecting them.
-		if err := speech.InstallVoice(ctx, v.VoiceDir, voice.Voice); err != nil {
+		if err := operation.InstallVoice(ctx); err != nil {
 			return err
 		}
-	} else if !speech.IsInstalledVoice(v.VoiceDir, voice.Voice) {
-		return errors.New("local voice model is not installed")
 	}
-	if !speech.ValidPiperConfig(config) {
-		return errors.New("voice sidecar is missing after installation")
+	model, ok := speech.InstalledVoicePath(v.VoiceDir, voice.Voice)
+	if !ok {
+		return errors.New("voice model and sidecar are not installed as a valid pair")
 	}
 	if err := (speech.Piper{Binary: v.PiperBinary, Model: model}).Warm(ctx, filepath.Join(v.PromptDir, "warm")); err != nil {
 		return err
@@ -78,7 +81,7 @@ func (v *voiceActivator) ActivateVoice(ctx context.Context, name string, menuSpe
 		for key, relative := range manifest.Assets {
 			if text, exists := texts[key]; exists {
 				path := filepath.Join(cacheDir, relative)
-				if info, statErr := os.Stat(path); statErr == nil && info.Size() > 44 {
+				if speech.ValidWAV(path) {
 					assets[text] = path
 				}
 			}
@@ -101,6 +104,10 @@ func (v *voiceActivator) PreviewVoice(ctx context.Context, name string, speed in
 	if !ok || !speech.IsInstalledVoice(v.VoiceDir, voice.Voice) {
 		return nil, errors.New("voice model is not installed")
 	}
+	model, ok := speech.InstalledVoicePath(v.VoiceDir, voice.Voice)
+	if !ok {
+		return nil, errors.New("voice model and sidecar are not installed as a valid pair")
+	}
 	if speed < 1 || speed > 5 {
 		speed = 3
 	}
@@ -118,7 +125,6 @@ func (v *voiceActivator) PreviewVoice(ctx context.Context, name string, speed in
 		return nil, err
 	}
 	defer os.Remove(path)
-	model := filepath.Join(v.VoiceDir, voice.Voice+".onnx")
 	if err := (speech.Piper{Binary: v.PiperBinary, Model: model, Extra: speech.SpeedExtra(speed)}).Synthesize(ctx, "This is a VOXMail voice preview.", path); err != nil {
 		return nil, err
 	}
@@ -126,7 +132,14 @@ func (v *voiceActivator) PreviewVoice(ctx context.Context, name string, speed in
 }
 
 func main() {
+	const shutdownBudget = 45 * time.Second
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	// Install signal handling before any startup work that can launch a child
+	// process. Model provisioning and static prompt generation are both
+	// context-aware; registering NotifyContext only after they finish would
+	// leave SIGTERM with Go's default immediate-exit behavior during startup.
+	appContext, stopApp := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stopApp()
 	cfg, err := config.Load()
 	if err != nil {
 		log.Error("invalid configuration", "error", err)
@@ -143,8 +156,18 @@ func main() {
 			os.Exit(1)
 		}
 	}
+	if report, cleanupErr := maintenance.CleanupEphemeral(cfg.DataDir, time.Now().UTC(), maintenance.DefaultEphemeralMaxAge); cleanupErr != nil {
+		log.Warn("ephemeral artifact cleanup failed", "error", cleanupErr)
+	} else if report.RemovedFiles > 0 {
+		log.Info("removed abandoned ephemeral artifacts", "files", report.RemovedFiles, "bytes", report.RemovedBytes)
+	}
+	if usage, diskErr := maintenance.StatDisk(cfg.DataDir); diskErr != nil {
+		log.Warn("could not inspect data filesystem capacity", "error", diskErr)
+	} else if usage.FreeBytes < 1<<30 {
+		log.Warn("data filesystem is low on free space", "free_bytes", usage.FreeBytes, "total_bytes", usage.TotalBytes)
+	}
 	if provision, _ := strconv.ParseBool(os.Getenv("VOXMAIL_PROVISION_MODELS")); provision {
-		modelContext, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		modelContext, cancel := context.WithTimeout(appContext, 30*time.Minute)
 		if err := speech.Provision(modelContext, cfg.VoiceDir, cfg.STTModel); err != nil {
 			cancel()
 			log.Error("model provisioning failed", "error", err)
@@ -152,11 +175,12 @@ func main() {
 		}
 		cancel()
 	}
+	piperModel := speech.ResolveConfiguredModel(cfg.VoiceDir, cfg.PiperModel)
 	promptDir := filepath.Join(cfg.DataDir, "prompts")
 	mainMenuPath := filepath.Join(promptDir, "main-menu.wav")
 	manifestPath := filepath.Join(promptDir, "static-prompts.json")
-	promptContext, promptCancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	staticManifest, promptErr := speech.PrepareStaticPrompts(promptContext, speech.Piper{Binary: cfg.PiperBinary, Model: cfg.PiperModel}, cfg.GreetingPath, mainMenuPath, manifestPath)
+	promptContext, promptCancel := context.WithTimeout(appContext, 5*time.Minute)
+	staticManifest, promptErr := speech.PrepareStaticPrompts(promptContext, speech.Piper{Binary: cfg.PiperBinary, Model: piperModel}, cfg.GreetingPath, mainMenuPath, manifestPath)
 	promptCancel()
 	if promptErr != nil {
 		log.Warn("static prompts unavailable; only existing recordings will be used", "error", promptErr)
@@ -166,7 +190,7 @@ func main() {
 	for key, relative := range staticManifest.Assets {
 		if text, ok := staticTexts[key]; ok {
 			path := filepath.Join(promptDir, relative)
-			if info, statErr := os.Stat(path); statErr == nil && info.Size() > 44 {
+			if speech.ValidWAV(path) {
 				staticPrompts[text] = path
 			}
 		}
@@ -175,7 +199,7 @@ func main() {
 	// menu. Keep that shipped asset usable until the next successful model
 	// regeneration upgrades the manifest.
 	if len(staticPrompts) == 0 {
-		if info, statErr := os.Stat(mainMenuPath); statErr == nil && info.Size() > 44 {
+		if speech.ValidWAV(mainMenuPath) {
 			staticPrompts[speech.StaticMainText] = mainMenuPath
 		}
 	}
@@ -184,6 +208,17 @@ func main() {
 		log.Error("cannot open database", "error", err)
 		os.Exit(1)
 	}
+	securityCleanupCtx, securityCleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if cleanupErr := db.PruneEphemeral(securityCleanupCtx, time.Now().UTC()); cleanupErr != nil {
+		log.Warn("ephemeral security-row cleanup failed", "error", cleanupErr)
+	}
+	if cleanupErr := db.PruneHistory(securityCleanupCtx, time.Now().UTC(), store.HistoryRetentionPolicy{
+		MaxAge:  time.Duration(cfg.HistoryRetentionDays) * 24 * time.Hour,
+		MaxRows: cfg.HistoryMaxRows,
+	}); cleanupErr != nil {
+		log.Warn("durable history retention cleanup failed", "error", cleanupErr)
+	}
+	securityCleanupCancel()
 
 	sipBridge := &sip.Baresip{
 		Binary:        cfg.BaresipBinary,
@@ -197,7 +232,7 @@ func main() {
 		Log:           log,
 	}
 	speechRuntime := speech.NewRuntime(
-		speech.Piper{Binary: cfg.PiperBinary, Model: cfg.PiperModel},
+		speech.Piper{Binary: cfg.PiperBinary, Model: piperModel},
 		speech.Whisper{Binary: cfg.STTBinary, Model: cfg.STTModel},
 		filepath.Join(cfg.DataDir, "run", "speech"),
 	)
@@ -206,7 +241,7 @@ func main() {
 		filepath.Join(cfg.DataDir, "run", "speech"),
 	)
 	promptPlayer := &calls.PromptPlayer{
-		Piper:        speech.Piper{Binary: cfg.PiperBinary, Model: cfg.PiperModel},
+		Piper:        speech.Piper{Binary: cfg.PiperBinary, Model: piperModel},
 		Runtime:      speechRuntime,
 		Pool:         speechPool,
 		Store:        db,
@@ -215,6 +250,7 @@ func main() {
 		StaticVoice:  staticManifest.VoiceModel,
 		Dir:          promptDir,
 	}
+	promptPlayer.PruneDynamicPrompts()
 	bridgeService := &calls.Service{
 		Socket:   cfg.ControlSocket,
 		Store:    db,
@@ -228,20 +264,49 @@ func main() {
 			Dir:     cfg.RecordingsDir,
 			Window:  15 * time.Second,
 		},
-		Secrets: secrets,
+		Secrets:              secrets,
+		IMAPEndpointResolver: mailsync.CheckPublicIMAPEndpoint,
+		RegistrationState:    sipBridge.SetRegistrationState,
 	}
 	alertService := &alerts.Service{Store: db, Bridge: bridgeService, Log: log}
 	voiceService := &voiceActivator{VoiceDir: cfg.VoiceDir, PiperBinary: cfg.PiperBinary, PromptDir: promptDir, GreetingPath: cfg.GreetingPath, MainPath: mainMenuPath, ManifestPath: manifestPath, Player: promptPlayer}
 	var syncService *mailsync.Service
-	webApp := &web.Server{Store: db, Secrets: secrets, Log: log, SIP: sipBridge, Alerts: alertService, Voice: voiceService, Preview: voiceService, Calls: bridgeService, DataRoot: cfg.DataDir, VoiceDir: cfg.VoiceDir, Ready: func(ctx context.Context) error {
-		if sipBridge.Enabled() && !bridgeService.Healthy() {
-			return errors.New("call bridge not connected")
+	sipBridge.SetLifetime(appContext)
+	runtimeStatus := func(ctx context.Context) web.RuntimeStatus {
+		sipStatus := sipBridge.Status()
+		bridgeState := "disconnected"
+		if bridgeService.Healthy() {
+			bridgeState = "connected"
+		}
+		mediaState := "not_required"
+		if sipStatus.Enabled {
+			mediaState = "unavailable"
+			if info, statErr := os.Stat(piperModel); statErr == nil && info.Mode().IsRegular() && info.Size() > 0 && speech.ValidPiperConfig(piperModel+".json") {
+				if info, statErr := os.Stat(cfg.STTModel); statErr == nil && info.Mode().IsRegular() && info.Size() > 0 {
+					mediaState = "ready"
+				}
+			}
+		}
+		return web.RuntimeStatus{Process: sipStatus.Process, Bridge: bridgeState, Registration: sipStatus.Registration, Media: mediaState}
+	}
+	webApp := &web.Server{Store: db, Secrets: secrets, Log: log, SIP: sipBridge, Alerts: alertService, Voice: voiceService, Preview: voiceService, Calls: bridgeService, DataRoot: cfg.DataDir, VoiceDir: cfg.VoiceDir, TrustedProxyCIDRs: cfg.TrustedProxyCIDRs, RuntimeStatus: runtimeStatus, Ready: func(ctx context.Context) error {
+		if sipBridge.Enabled() {
+			sipStatus := sipBridge.Status()
+			if sipStatus.Process != sip.ProcessRunning {
+				return fmt.Errorf("SIP process is %s", sipStatus.Process)
+			}
+			if sipStatus.Registration != sip.RegistrationRegistered {
+				return fmt.Errorf("SIP registration is %s", sipStatus.Registration)
+			}
+			if !bridgeService.Healthy() {
+				return errors.New("call bridge not connected")
+			}
 		}
 		if syncService == nil || !syncService.Healthy() {
 			return errors.New("mail synchronization worker is not running")
 		}
 		if sipBridge.Enabled() {
-			if info, statErr := os.Stat(cfg.PiperModel); statErr != nil || !info.Mode().IsRegular() || info.Size() == 0 || !speech.ValidPiperConfig(cfg.PiperModel+".json") {
+			if info, statErr := os.Stat(piperModel); statErr != nil || !info.Mode().IsRegular() || info.Size() == 0 || !speech.ValidPiperConfig(piperModel+".json") {
 				return errors.New("configured Piper model is unavailable")
 			}
 			if info, statErr := os.Stat(cfg.STTModel); statErr != nil || !info.Mode().IsRegular() || info.Size() == 0 {
@@ -255,11 +320,8 @@ func main() {
 	// operation context, so a 30-second server write deadline would close the
 	// connection while the operation is still succeeding.
 	server := &http.Server{Addr: cfg.HTTPAddr, Handler: webApp.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 35 * time.Minute, IdleTimeout: 60 * time.Second}
-	appContext, stopApp := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stopApp()
-
 	indexer := &mailindex.Indexer{Store: db}
-	syncService = &mailsync.Service{Store: db, Root: cfg.DataDir, Runner: mailsync.Runner{}, Index: indexer, Secrets: secrets, Log: log, EndpointChecker: mailsync.CheckPublicIMAPEndpoint}
+	syncService = &mailsync.Service{Store: db, Root: cfg.DataDir, QuarantineRoot: filepath.Join(cfg.DataDir, "quarantine"), Runner: mailsync.Runner{}, Index: indexer, Secrets: secrets, Log: log, EndpointResolver: mailsync.CheckPublicIMAPEndpoint}
 	bridgeService.Refresher = syncService
 	webApp.Sync = syncService
 
@@ -301,13 +363,24 @@ func main() {
 	}()
 
 	<-appContext.Done()
-	shutdown, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Cancel long-running web jobs before stopping the HTTP listener. The
+	// server protects voice-job admission so this cannot race its wait group.
+	webApp.BeginShutdown()
+	shutdown, shutdownCancel := context.WithTimeout(context.Background(), shutdownBudget)
 	defer shutdownCancel()
 	if err := server.Shutdown(shutdown); err != nil {
 		log.Error("graceful shutdown failed", "error", err)
 	}
+	// Stop accepting HTTP work before cancelling and awaiting jobs started by
+	// handlers. This ordering prevents a voice-install request from racing
+	// Server.Close's WaitGroup and ensures its final status update lands before
+	// the database is closed.
+	webApp.Close()
 	sipBridge.Stop()
 	wg.Wait()
+	alertService.Wait()
+	bridgeService.StopTasks()
+	bridgeService.Wait()
 	if err := db.Close(); err != nil {
 		log.Error("closing database", "error", err)
 	}

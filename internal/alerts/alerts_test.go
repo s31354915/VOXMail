@@ -45,16 +45,16 @@ func TestAlertFolderMatch(t *testing.T) {
 func TestAlertText(t *testing.T) {
 	one := []store.AlertCandidate{{Folder: "INBOX", Sender: "Peach", Subject: "Your invoice"}}
 	text := alertText(one)
-	if !strings.Contains(text, "From Peach") || !strings.Contains(text, "Your invoice") {
-		t.Fatalf("unexpected single-alert text %q", text)
+	if !strings.Contains(text, "INBOX") || strings.Contains(text, "Peach") || strings.Contains(text, "Your invoice") {
+		t.Fatalf("alert disclosed sender/subject or omitted folder: %q", text)
 	}
 	many := append([]store.AlertCandidate{{Folder: "INBOX", Sender: "", Subject: ""}}, one...)
 	text = alertText(many)
 	if !strings.Contains(text, "2 new email messages") {
 		t.Fatalf("unexpected multi-alert text %q", text)
 	}
-	if !strings.Contains(text, "unknown sender") || !strings.Contains(text, "no subject") {
-		t.Fatalf("empty fields not described gracefully: %q", text)
+	if !strings.Contains(text, "INBOX") {
+		t.Fatalf("folder was not described: %q", text)
 	}
 }
 
@@ -62,16 +62,44 @@ type fakeBridge struct {
 	mu    sync.Mutex
 	dials []calls.DialRequest
 	err   error
+	hold  bool
 }
 
 func (f *fakeBridge) Dial(_ context.Context, req calls.DialRequest) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.dials = append(f.dials, req)
-	if req.Done != nil {
+	if req.Done != nil && !f.hold {
 		req.Done <- true
 	}
 	return f.err
+}
+
+func TestPendingAlertLimit(t *testing.T) {
+	s := &Service{MaxConcurrent: 2}
+	if !s.reservePending("u1") {
+		t.Fatal("first user reservation should succeed")
+	}
+	if !s.reservePending("u2") {
+		t.Fatal("second user reservation should succeed")
+	}
+	if s.reservePending("u3") {
+		t.Fatal("deployment-wide pending limit was not enforced")
+	}
+	if s.reservePending("u1") {
+		t.Fatal("per-user pending limit was not enforced")
+	}
+	s.releasePending("u1")
+	if !s.reservePending("u3") {
+		t.Fatal("released pending slot was not reusable")
+	}
+	s.releasePending("u3")
+	s.releasePending("u3")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pending != 1 || s.pendingByUser["u2"] != 1 {
+		t.Fatalf("unexpected pending state after idempotent release: pending=%d users=%v", s.pending, s.pendingByUser)
+	}
 }
 
 func seedAlertStore(t *testing.T) *store.Store {
@@ -129,6 +157,9 @@ func TestRoundDialsAndClaims(t *testing.T) {
 	if dials != 1 {
 		t.Fatalf("expected a single dial, got %d", dials)
 	}
+	if bridge.dials[0].Outcome == nil {
+		t.Fatal("alert dial did not expose lifecycle outcome reporting")
+	}
 	if uri != "sip:+15551212@sip.example.com" {
 		t.Fatalf("unexpected uri %q", uri)
 	}
@@ -155,6 +186,28 @@ func TestRoundDialsAndClaims(t *testing.T) {
 		if c.Folder == "INBOX" && c.MessageID == 1 {
 			t.Fatalf("message was not claimed after dial: %+v", c)
 		}
+	}
+}
+
+func TestTestAlertReleasesPendingAfterCompletion(t *testing.T) {
+	db := seedAlertStore(t)
+	bridge := &fakeBridge{}
+	s := &Service{Store: db, Bridge: bridge, MinDelay: time.Minute}
+	if err := s.TestAlert(context.Background(), "u1"); err != nil {
+		t.Fatal(err)
+	}
+	s.Wait()
+	s.mu.Lock()
+	pending := s.pending
+	byUser := s.pendingByUser["u1"]
+	s.mu.Unlock()
+	if pending != 0 || byUser != 0 {
+		t.Fatalf("test alert slot was not released: pending=%d user=%d", pending, byUser)
+	}
+	bridge.mu.Lock()
+	defer bridge.mu.Unlock()
+	if len(bridge.dials) != 1 || bridge.dials[0].Done == nil {
+		t.Fatalf("expected one completed test dial with a completion channel: %+v", bridge.dials)
 	}
 }
 
