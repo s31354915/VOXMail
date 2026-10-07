@@ -139,14 +139,17 @@ printf '%s\n' \
   'MaildirStore smoke-far' \
   'Path '"$smoke_dir"'/mbsync/far/' \
   'Inbox '"$smoke_dir"'/mbsync/far/Inbox' \
+  '' \
   'MaildirStore smoke-near' \
   'Path '"$smoke_dir"'/mbsync/near/' \
   'Inbox '"$smoke_dir"'/mbsync/near/Inbox' \
+  '' \
   'Channel smoke' \
-  ':Far :smoke-far:' \
-  ':Near :smoke-near:' \
+  'Master :smoke-far:' \
+  'Slave :smoke-near:' \
   'Patterns INBOX' \
-  'Create Both' > "$smoke_dir/mbsyncrc"
+  'Create Both' \
+  'SyncState *' > "$smoke_dir/mbsyncrc"
 mbsync --config "$smoke_dir/mbsyncrc" smoke
 
 echo 'runtime smoke passed'
