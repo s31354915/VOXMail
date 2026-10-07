@@ -11,3 +11,6 @@ b.pid
 /internal/calls/drafts/
 # Browser test dependencies are installed locally, never committed.
 /tests/browser/node_modules/
+# Playwright recordings, traces, screenshots, and run metadata are local-only.
+/tests/browser/test-results/
+/tests/browser/playwright-report/
