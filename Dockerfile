@@ -107,10 +107,16 @@ LABEL org.opencontainers.image.revision="${VOXMAIL_REVISION}"
 ENV VOXMAIL_DATA_DIR=/data \
     VOXMAIL_HTTP_ADDR=:8080 \
     VOXMAIL_MAX_CALLS=10
+# The Python base image's setuptools bundle contains its own vendored
+# metadata; upgrade the owning package so Trivy cannot report stale
+# vulnerable jaraco.context/wheel copies from inside setuptools.
 RUN apt-get update && apt-get upgrade -y --no-install-recommends && apt-get install -y --no-install-recommends \
     ca-certificates ffmpeg isync curl openssl libsqlite3-0 libssl3 libstdc++6 \
     && rm -rf /var/lib/apt/lists/* && pip install --no-cache-dir piper-tts==1.3.0 \
-    && pip install --no-cache-dir --upgrade 'jaraco.context>=6.1.0' 'wheel>=0.46.2'
+    && pip install --no-cache-dir --upgrade \
+        'setuptools==84.0.0' \
+        'jaraco.context==6.1.2' \
+        'wheel==0.48.0'
 COPY --from=build /out/voxmail /usr/local/bin/voxmail
 COPY --from=build /out/voxmail-secret /usr/local/bin/voxmail-secret
 COPY --from=build /out/voxmail-connect /usr/local/bin/voxmail-connect
