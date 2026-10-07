@@ -187,10 +187,12 @@ test explicitly says it is an authorized live validation.
 
 ## Publishing
 
-Image publication is manual. The GitHub workflow is started from **Actions →
-Publish VOXMail image** and accepts a source ref, output tag, and explicit
-`promote_latest` choice. It does not publish automatically for ordinary pushes,
-pull requests, or tags.
+Image publication can be started manually or by a marked push. The GitHub
+workflow is started from **Actions → Publish VOXMail image** for a chosen source
+ref, output tag, and explicit `promote_latest` choice. A push to `main` runs the
+same workflow only when the pushed commit message contains `(publish)`; that
+automatic path publishes the exact pushed commit as `latest`. Ordinary pushes,
+pull requests, and tags do not publish.
 
 The workflow tests the selected source, builds amd64 and arm64 images without
 QEMU emulation, attaches BuildKit provenance and an SBOM, scans both images,

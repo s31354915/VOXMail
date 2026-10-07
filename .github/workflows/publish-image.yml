@@ -1,6 +1,9 @@
 name: Publish VOXMail image
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       tag:
@@ -32,10 +35,14 @@ permissions:
 
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/voxmail
-  TAG: ${{ inputs.tag }}
+  # A marked push publishes the exact pushed commit as latest. Manual runs
+  # retain their explicit release/prerelease tag and source ref.
+  TAG: ${{ inputs.tag || 'latest' }}
+  SOURCE_REF: ${{ inputs.source_ref || github.sha }}
 
 jobs:
   verify:
+    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '(publish)') }}
     name: Verify exact source commit
     runs-on: ubuntu-24.04
     outputs:
@@ -49,11 +56,11 @@ jobs:
             echo "invalid image tag: $TAG" >&2
             exit 1
           fi
-          test -n "${{ inputs.source_ref }}"
+          test -n "$SOURCE_REF"
 
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.source_ref }}
+          ref: ${{ env.SOURCE_REF }}
           fetch-depth: 0
 
       - id: source

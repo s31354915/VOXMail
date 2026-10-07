@@ -76,14 +76,16 @@ not remove the process and file-descriptor limits without replacing them with
 equivalent host controls. The container has a 60-second graceful-stop window
 so active sync and calls can clean up before Docker restarts it.
 
-The manually triggered GitHub Action tests the selected source commit, requires
-the matching CI checks, builds native amd64 and arm64 images, records their
-registry digests, scans both images, and combines those digests on GHCR. It
-does not run automatically. Test/prerelease tags do not advance `latest`; that
-alias requires an explicit production-promotion input. See the root README for
-the workflow inputs and generated tags. Fixed HIGH/CRITICAL scanner findings
-block publication. Any future exception must be reviewed, state the reason and
-owner, and include a short expiry date; do not add a permanent blanket ignore.
+The GitHub Action can be started manually or by pushing to `main` with
+`(publish)` in the head commit message. It tests the exact source commit,
+requires the matching CI checks, builds native amd64 and arm64 images, records
+their registry digests, scans both images, and combines those digests on GHCR.
+Marked pushes publish the exact pushed commit as `latest`; manual test or
+prerelease tags do not advance `latest` unless the explicit production-
+promotion input is selected. See the root README for the workflow inputs and
+generated tags. Fixed HIGH/CRITICAL scanner findings block publication. Any
+future exception must be reviewed, state the reason and owner, and include a
+short expiry date; do not add a permanent blanket ignore.
 
 ### Reproducible image updates
 
