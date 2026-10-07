@@ -116,7 +116,7 @@ To intentionally refresh a base image or runtime distribution:
    resulting multi-architecture manifest digest for deployment or rollback.
    Keep the previous digest until the restore drill and readiness checks pass.
 
-The current base pins were resolved on 2026-09-28. A digest update is a
+The current base pins were resolved on 2026-10-06. A digest update is a
 dependency change: review ABI/loader output, speech CLI behavior, baresip
 module loading, mbsync validation, and both amd64 and arm64 smoke results
 before accepting it.
