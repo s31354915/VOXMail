@@ -137,7 +137,7 @@ grep -q 'baresip is ready' "$smoke_dir/baresip.log" || {
 if [ -n "${VOXMAIL_MBSYNC_CONFIG:-}" ]; then
   test -s "$VOXMAIL_MBSYNC_CONFIG" || fail 'VOXMAIL_MBSYNC_CONFIG is missing or empty'
   test -n "${VOXMAIL_MBSYNC_CHANNEL:-}" || fail 'VOXMAIL_MBSYNC_CHANNEL is required with VOXMAIL_MBSYNC_CONFIG'
-  mbsync --dry-run --config "$VOXMAIL_MBSYNC_CONFIG" --ext-exit "$VOXMAIL_MBSYNC_CHANNEL"
+  mbsync --list --config "$VOXMAIL_MBSYNC_CONFIG" "$VOXMAIL_MBSYNC_CHANNEL"
 else
   echo 'mbsync config validation skipped; set VOXMAIL_MBSYNC_CONFIG and VOXMAIL_MBSYNC_CHANNEL for the configured check' >&2
 fi
