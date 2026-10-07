@@ -111,7 +111,7 @@ func TestSyncChannelsPassesEveryChannel(t *testing.T) {
 	}
 }
 
-func TestValidateUsesMbsyncDryRun(t *testing.T) {
+func TestValidateUsesMbsyncList(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell shim is unix-only")
 	}
@@ -129,7 +129,7 @@ func TestValidateUsesMbsyncDryRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "--dry-run\n--config\nvoxmail.conf\n--ext-exit\none\ntwo\n"
+	want := "--list\n--config\nvoxmail.conf\none\ntwo\n"
 	if string(data) != want {
 		t.Fatalf("args = %q, want %q", data, want)
 	}
