@@ -134,12 +134,19 @@ grep -q 'baresip is ready' "$smoke_dir/baresip.log" || {
   fail 'baresip did not reach ready state'
 }
 
-if [ -n "${VOXMAIL_MBSYNC_CONFIG:-}" ]; then
-  test -s "$VOXMAIL_MBSYNC_CONFIG" || fail 'VOXMAIL_MBSYNC_CONFIG is missing or empty'
-  test -n "${VOXMAIL_MBSYNC_CHANNEL:-}" || fail 'VOXMAIL_MBSYNC_CHANNEL is required with VOXMAIL_MBSYNC_CONFIG'
-  mbsync --list --config "$VOXMAIL_MBSYNC_CONFIG" "$VOXMAIL_MBSYNC_CHANNEL"
-else
-  echo 'mbsync config validation skipped; set VOXMAIL_MBSYNC_CONFIG and VOXMAIL_MBSYNC_CHANNEL for the configured check' >&2
-fi
+mkdir -p "$smoke_dir/mbsync/far/Inbox" "$smoke_dir/mbsync/near/Inbox"
+printf '%s\n' \
+  'MaildirStore smoke-far' \
+  'Path '"$smoke_dir"'/mbsync/far/' \
+  'Inbox '"$smoke_dir"'/mbsync/far/Inbox' \
+  'MaildirStore smoke-near' \
+  'Path '"$smoke_dir"'/mbsync/near/' \
+  'Inbox '"$smoke_dir"'/mbsync/near/Inbox' \
+  'Channel smoke' \
+  ':Far :smoke-far:' \
+  ':Near :smoke-near:' \
+  'Patterns INBOX' \
+  'Create Both' > "$smoke_dir/mbsyncrc"
+mbsync --config "$smoke_dir/mbsyncrc" --ext-exit smoke
 
 echo 'runtime smoke passed'

@@ -356,9 +356,6 @@ func (s *Service) syncAccount(ctx context.Context, account store.Account, kind s
 		return err
 	}
 	channels := mailconfig.ChannelNames(mailconfig.Account{ID: account.ID, IMAPHost: account.IMAPHost, IMAPPort: account.IMAPPort, IMAPSecurity: account.IMAPSecurity, IMAPUser: account.IMAPUser, MaildirRoot: root, FolderMap: folderMap})
-	if err := s.Runner.Validate(ctx, configPath, channels...); err != nil {
-		return fmt.Errorf("validate mbsync configuration: %w", err)
-	}
 	result, err := s.Runner.SyncChannels(ctx, configPath, channels...)
 	if err != nil {
 		return err

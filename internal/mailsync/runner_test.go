@@ -111,30 +111,6 @@ func TestSyncChannelsPassesEveryChannel(t *testing.T) {
 	}
 }
 
-func TestValidateUsesMbsyncList(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("shell shim is unix-only")
-	}
-	dir := t.TempDir()
-	argsPath := filepath.Join(dir, "args")
-	shim := filepath.Join(dir, "mbsync")
-	content := "#!/bin/sh\nprintf '%s\\n' \"$@\" > '" + argsPath + "'\nexit 0\n"
-	if err := os.WriteFile(shim, []byte(content), 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := (Runner{Binary: shim}).Validate(context.Background(), "voxmail.conf", "one", "two"); err != nil {
-		t.Fatal(err)
-	}
-	data, err := os.ReadFile(argsPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := "--list\n--config\nvoxmail.conf\none\ntwo\n"
-	if string(data) != want {
-		t.Fatalf("args = %q, want %q", data, want)
-	}
-}
-
 func TestSyncTimesOut(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell shim is unix-only")

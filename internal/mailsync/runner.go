@@ -66,25 +66,6 @@ func (r Runner) SyncChannels(ctx context.Context, configPath string, channels ..
 	return r.run(ctx, strings.Join(channels, ","), args...)
 }
 
-// Validate parses the generated configuration and lists the configured mailbox
-// side without transferring mail. It is deliberately a separate invocation so
-// a malformed generated configuration never starts a partial synchronization.
-func (r Runner) Validate(ctx context.Context, configPath string, channels ...string) error {
-	if r.Binary == "" {
-		r.Binary = "mbsync"
-	}
-	if r.Timeout <= 0 {
-		r.Timeout = 10 * time.Minute
-	}
-	if err := validateChannels(channels); err != nil {
-		return err
-	}
-	args := []string{"--list", "--config", configPath}
-	args = append(args, channels...)
-	_, err := r.run(ctx, strings.Join(channels, ","), args...)
-	return err
-}
-
 func validateChannels(channels []string) error {
 	if len(channels) == 0 {
 		return fmt.Errorf("mbsync channel is required")
