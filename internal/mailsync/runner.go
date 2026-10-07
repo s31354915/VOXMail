@@ -96,10 +96,6 @@ func (r Runner) run(ctx context.Context, account string, args ...string) (Result
 	cmd.Stderr = &capture
 	err := cmd.Run()
 	output := capture.Bytes()
-	code := 0
-	if cmd.ProcessState != nil {
-		code = cmd.ProcessState.ExitCode()
-	}
 	result := Result{Account: account, Output: output}
 	if work.Err() != nil {
 		return result, work.Err()
