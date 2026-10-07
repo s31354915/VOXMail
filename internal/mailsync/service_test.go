@@ -41,7 +41,7 @@ func TestDefaultAccountToSyncIntegrationPath(t *testing.T) {
 	runnerPath := filepath.Join(t.TempDir(), "fake-mbsync")
 	runner := `#!/bin/sh
 set -eu
-if [ "$1" = "--dry-run" ]; then
+if [ "$1" = "--list" ]; then
   exit 0
 fi
 config="$2"
