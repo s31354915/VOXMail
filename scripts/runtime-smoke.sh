@@ -147,6 +147,6 @@ printf '%s\n' \
   ':Near :smoke-near:' \
   'Patterns INBOX' \
   'Create Both' > "$smoke_dir/mbsyncrc"
-mbsync --config "$smoke_dir/mbsyncrc" --ext-exit smoke
+mbsync --config "$smoke_dir/mbsyncrc" smoke
 
 echo 'runtime smoke passed'

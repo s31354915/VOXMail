@@ -42,7 +42,6 @@ func TestDefaultAccountToSyncIntegrationPath(t *testing.T) {
 	runner := `#!/bin/sh
 set -eu
 [ "$1" = "--config" ] || { echo "unexpected first argument: $1" >&2; exit 90; }
-[ "$3" = "--ext-exit" ] || { echo "missing --ext-exit: $3" >&2; exit 91; }
 config="$2"
 root=$(awk '$1 == "Path" {gsub(/"/, "", $2); print $2; exit}' "$config")
 mkdir -p "$root/Inbox/new"

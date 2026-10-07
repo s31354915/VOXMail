@@ -61,7 +61,7 @@ func (r Runner) SyncChannels(ctx context.Context, configPath string, channels ..
 	if err := validateChannels(channels); err != nil {
 		return Result{}, err
 	}
-	args := []string{"--config", configPath, "--ext-exit"}
+	args := []string{"--config", configPath}
 	args = append(args, channels...)
 	return r.run(ctx, strings.Join(channels, ","), args...)
 }
@@ -100,18 +100,11 @@ func (r Runner) run(ctx context.Context, account string, args ...string) (Result
 	if cmd.ProcessState != nil {
 		code = cmd.ProcessState.ExitCode()
 	}
-	// --ext-exit ORs 32/64 in when the near/far side changed. Those bits may be
-	// combined with ordinary failure bits (for example 65), so a change does
-	// not turn a partial failure into success.
-	changed := code >= 0 && code&96 != 0
-	result := Result{Account: account, Output: output, Changed: changed}
+	result := Result{Account: account, Output: output}
 	if work.Err() != nil {
 		return result, work.Err()
 	}
 	if err == nil {
-		return result, nil
-	}
-	if code >= 0 && code&^96 == 0 {
 		result.Changed = true
 		return result, nil
 	}

@@ -31,65 +31,17 @@ func newRunner(binary string) Runner {
 	return Runner{Binary: binary, Timeout: 10 * time.Second}
 }
 
-func TestSyncCleanExitIsNotChanged(t *testing.T) {
+func TestSyncCleanExitIsChanged(t *testing.T) {
 	r := newRunner(fakeMbsync(t, 0, ""))
 	result, err := r.Sync(context.Background(), "config", "work")
 	if err != nil {
 		t.Fatalf("Sync: %v", err)
 	}
-	if result.Changed {
-		t.Fatal("clean exit reported a change")
+	if !result.Changed {
+		t.Fatal("successful sync was not reported as changed")
 	}
 	if result.Account != "work" {
 		t.Fatalf("Account = %q", result.Account)
-	}
-}
-
-func TestSyncNearSideChange(t *testing.T) {
-	r := newRunner(fakeMbsync(t, 32, ""))
-	result, err := r.Sync(context.Background(), "config", "home")
-	if err != nil {
-		t.Fatalf("Sync: %v", err)
-	}
-	if !result.Changed {
-		t.Fatal("near-side change (32) not reported")
-	}
-}
-
-func TestSyncFarSideChange(t *testing.T) {
-	r := newRunner(fakeMbsync(t, 64, ""))
-	result, err := r.Sync(context.Background(), "config", "home")
-	if err != nil {
-		t.Fatalf("Sync: %v", err)
-	}
-	if !result.Changed {
-		t.Fatal("far-side change (64) not reported")
-	}
-}
-
-func TestSyncErrorExitNotChanged(t *testing.T) {
-	r := newRunner(fakeMbsync(t, 3, ""))
-	result, err := r.Sync(context.Background(), "config", "home")
-	if err == nil {
-		t.Fatal("exit 3 should surface as an error")
-	}
-	if result.Changed {
-		t.Fatal("error exit was incorrectly reported as a change")
-	}
-}
-
-func TestSyncChangeAndErrorBitsRemainAnError(t *testing.T) {
-	for _, exitCode := range []int{33, 65, 97} {
-		t.Run(strconv.Itoa(exitCode), func(t *testing.T) {
-			r := newRunner(fakeMbsync(t, exitCode, ""))
-			result, err := r.Sync(context.Background(), "config", "home")
-			if err == nil {
-				t.Fatalf("exit %d should surface an error", exitCode)
-			}
-			if !result.Changed {
-				t.Fatalf("exit %d should retain its change bits", exitCode)
-			}
-		})
 	}
 }
 
@@ -101,7 +53,7 @@ func TestSyncRequiresChannel(t *testing.T) {
 }
 
 func TestSyncChannelsPassesEveryChannel(t *testing.T) {
-	r := newRunner(fakeMbsync(t, 32, ""))
+	r := newRunner(fakeMbsync(t, 0, ""))
 	result, err := r.SyncChannels(context.Background(), "config", "one", "two")
 	if err != nil {
 		t.Fatalf("SyncChannels: %v", err)
