@@ -424,8 +424,18 @@ func phase1(base string) {
 	var probeResult map[string]string
 	_ = json.Unmarshal(probe, &probeResult)
 	admin.must("POST", "/api/v1/accounts/test", map[string]any{"account_id": probeResult["id"]}, 502)
-	admin.must("DELETE", "/api/v1/accounts/"+accountID, nil, 204)
-	admin.must("DELETE", "/api/v1/accounts/"+probeResult["id"], nil, 204)
+	for _, id := range []string{accountID, probeResult["id"]} {
+		deleted := admin.must("DELETE", "/api/v1/accounts/"+id, nil, http.StatusAccepted)
+		var result struct {
+			Status         string `json:"status"`
+			CleanupPending bool   `json:"cleanup_pending"`
+		}
+		err := json.Unmarshal(deleted, &result)
+		check(err == nil && result.Status == "deleted" && result.CleanupPending, "account deletion acknowledges durable queued cleanup")
+		listed := admin.must("GET", "/api/v1/accounts", nil, http.StatusOK)
+		check(!bodyContains(listed, id), "deleted account is immediately absent from owner listing")
+		admin.must("DELETE", "/api/v1/accounts/"+id, nil, http.StatusNotFound)
+	}
 
 	bob2 := newSess(base)
 	admin.must("POST", "/api/v1/users", map[string]any{"username": bobUser, "password": bobPass, "pin": bobPIN, "role": "user"}, 201)
@@ -494,12 +504,14 @@ func phase1(base string) {
 		head := page.Header
 		html, _ := io.ReadAll(page.Body)
 		page.Body.Close()
-		check(page.StatusCode == 200 && strings.Contains(string(html), "<form"), "console page is served")
+		check(page.StatusCode == 200 && strings.Contains(string(html), "<title>VOXMail Console</title>") && strings.Contains(string(html), `id="app"`) && strings.Contains(string(html), "<script"), "console page is served")
 		check(head.Get("X-Content-Type-Options") == "nosniff" && head.Get("X-Frame-Options") == "DENY", "security headers are present")
 	}
 
 	fmt.Println("source-wide brute-force guard")
-	bruteforce(base, "nonexistent-user", "x", []int{401, 401, 401, 401, 401, 429})
+	// The earlier wrong-password attempt consumed one source-wide failure.
+	// Successful logins clear account failures, but preserve the source budget.
+	bruteforce(base, "nonexistent-user", "x", []int{401, 401, 401, 401, 429, 429})
 }
 
 func afterRestart(base string) {
