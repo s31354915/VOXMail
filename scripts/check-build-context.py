@@ -28,7 +28,10 @@ PRIVATE = [
     "internal/calls/drafts/context-marker", "plan-astra.md", "nested/plan-astra.md",
     "pasted-text-1.txt", "docs/REVIEW-SOURCE.md", "docs/REVIEW-PROGRESS.md",
 ]
-REQUIRED_CONTEXT = [
+CONSOLE_SOURCES = [
+    "internal/web/static/console.bundle.js", "internal/web/console/console.css",
+]
+REQUIRED_CONTEXT = CONSOLE_SOURCES + [
     "go.mod", "go.sum", "cmd/voxmail/main.go", "internal/web/static/index.html",
     "baresip/shim/voxmail.c", "assets/welcome.wav", "assets/main-menu.wav",
     "assets/static-prompts.json", "scripts/entrypoint.sh", "scripts/runtime-smoke.sh",
@@ -48,11 +51,22 @@ def copy_source(root, context):
     }.items():
         for path in (root / directory).rglob("*"):
             if path.is_file() and not path.is_symlink() and path.suffix in extensions:
-                if "drafts" in path.relative_to(root).parts:
+                if {"drafts", "node_modules", "__pycache__", "test-results", "playwright-report"}.intersection(path.relative_to(root).parts):
                     continue
                 target = context / path.relative_to(root)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(path, target)
+    # Copy only the served bundle, stylesheet and embedded images, not the
+    # console's build tools or installed npm packages.
+    for name in CONSOLE_SOURCES:
+        target = context / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(root / name, target)
+    for path in (root / "internal/web/static/assets").iterdir():
+        if path.is_file() and not path.is_symlink() and path.suffix in {".svg", ".png", ".webp"}:
+            target = context / path.relative_to(root)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(path, target)
     for name in ["go.mod", "go.sum", ".env.example"]:
         shutil.copyfile(root / name, context / name)
 
@@ -98,7 +112,7 @@ def main():
         for name in REQUIRED_CONTEXT:
             if not (output / "context" / name).is_file():
                 failures.append(f"required source missing from effective context: {name}")
-        for name in ["go.mod", "go.sum", "cmd/voxmail/main.go", "internal/web/static/index.html"]:
+        for name in CONSOLE_SOURCES + ["go.mod", "go.sum", "cmd/voxmail/main.go", "internal/web/static/index.html"]:
             if not (output / "builder" / name).is_file():
                 failures.append(f"application source missing from Go builder: {name}")
         for name in ["context-only.marker", "assets", "scripts", "tests", ".env.example"]:
