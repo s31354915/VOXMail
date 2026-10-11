@@ -69,7 +69,7 @@ test -s "$whisper_model" || fail "Whisper model is missing or empty: $whisper_mo
 printf 'piper_model_sha256=%s\n' "$(sha256sum "$piper_model" | awk '{print $1}')"
 printf 'whisper_model_sha256=%s\n' "$(sha256sum "$whisper_model" | awk '{print $1}')"
 
-# piper-tts 1.3.0 is line-oriented; this is the same one-shot worker contract
+# piper-tts is line-oriented; this is the same one-shot worker contract
 # used by internal/speech, including an actual WAV validation by ffmpeg.
 printf '%s\n' 'VOXMail runtime smoke.' | \
   piper --model "$piper_model" --output_file "$smoke_dir/piper.wav"

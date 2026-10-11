@@ -40,7 +40,7 @@ trap 'rm -rf "$smoke_dir"' EXIT HUP INT TERM
 printf 'piper_model_sha256=%s\n' "$(sha256sum "$piper_model" | awk '{print $1}')"
 printf 'whisper_model_sha256=%s\n' "$(sha256sum "$whisper_model" | awk '{print $1}')"
 
-# Keep this invocation aligned with speech.synthesizePiper: Piper 1.3.0 reads
+# Keep this invocation aligned with speech.synthesizePiper: Piper reads
 # one plain-text line from stdin and reports completion by exiting successfully.
 printf '%s\n' "$spoken_text" | piper --model "$piper_model" --output_file "$smoke_dir/piper.wav"
 test -s "$smoke_dir/piper.wav" || fail 'Piper produced no WAV'
