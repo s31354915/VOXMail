@@ -80,7 +80,7 @@ RUN --mount=type=cache,id=whisper-source-${WHISPER_REF}-${TARGETARCH},target=/sr
     fi; \
     printf 'requested=%s\ncommit=%s\narchitecture=%s\n' "${WHISPER_REF}" "$(git -C /src/whisper.cpp rev-parse HEAD)" "${TARGETARCH}" > /out/provenance/whisper.txt
 
-FROM golang:1.27.0-bookworm@sha256:ded31c68586d2e49e760acc2e65a884b23d032e9bbbed0ae0c55abd3fcaf4452 AS build
+FROM golang:1.27.2-bookworm@sha256:5cf287a799e6b94384bad13d16b14904c531f51ba65792237e122ce42b392f61 AS build
 ARG TARGETARCH
 ARG VOXMAIL_REVISION=unknown
 WORKDIR /src
