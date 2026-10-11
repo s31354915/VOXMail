@@ -18,3 +18,6 @@ b.pid
 # Python imports during fixture checks generate disposable bytecode caches.
 __pycache__/
 *.py[cod]
+# Private local review notes are never repository content.
+/docs/REVIEW-PROGRESS.md
+/docs/REVIEW-SOURCE.md
