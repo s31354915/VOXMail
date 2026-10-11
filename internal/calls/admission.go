@@ -24,14 +24,18 @@ func (s *Service) admit(conn net.Conn, message bridge.Message) error {
 		return s.sendBridge(conn, bridge.Message{Type: "hangup", CallID: message.CallID, Code: 603, Reason: "caller not authorized"})
 	}
 	s.mu.Lock()
+	shuttingDown := s.shuttingDown
 	busy := s.sipApplying || (s.MaxCalls > 0 && len(s.sessions) >= s.MaxCalls)
-	if !busy {
+	if !busy && !shuttingDown {
 		flow := ivr.NewSession(message.CallID)
 		flow.State = ivr.StatePIN
 		s.sessions[message.CallID] = &session{CallID: message.CallID, UserID: user.ID, Phone: phone, State: "pin", Flow: flow, TxPath: message.TxPath, RxPath: message.RxPath}
 		s.armInactivityTimeoutLocked(s.sessions[message.CallID])
 	}
 	s.mu.Unlock()
+	if shuttingDown {
+		return s.sendBridge(conn, bridge.Message{Type: "hangup", CallID: message.CallID, Code: 503, Reason: "server is shutting down"})
+	}
 	if busy {
 		return s.sendBridge(conn, bridge.Message{Type: "hangup", CallID: message.CallID, Code: 486, Reason: "all lines are busy"})
 	}

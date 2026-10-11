@@ -1,0 +1,25 @@
+# The repository owner is the current maintainer. Add eligible maintainers here
+# when responsibility is delegated; each owner needs repository write access.
+* @s31354915
+
+# Release permissions, source/digest gates and dependency proposals.
+/.github/ @s31354915
+/Dockerfile @s31354915
+/docker-compose.yml @s31354915
+/requirements/ @s31354915
+/scripts/ @s31354915
+
+# Native ownership/lifecycle and the Go side of the bridge protocol.
+/baresip/ @s31354915
+/internal/bridge/ @s31354915
+/internal/calls/ @s31354915
+/internal/sip/ @s31354915
+/internal/process/ @s31354915
+/internal/lifecycle/ @s31354915
+/tests/sippeer/ @s31354915
+/tests/shutdown/ @s31354915
+
+# Contributor/security policy and ownership changes need maintainer review.
+/CONTRIBUTING.md @s31354915
+/SECURITY.md @s31354915
+/.github/CODEOWNERS @s31354915

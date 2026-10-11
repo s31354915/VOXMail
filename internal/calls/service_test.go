@@ -123,6 +123,54 @@ func TestServiceTaskShutdownClosesAdmissionBeforeWaiting(t *testing.T) {
 	}
 }
 
+func TestDrainHangsUpActiveCallsAndWaitsForClose(t *testing.T) {
+	bridgeSide, peerSide := net.Pipe()
+	defer bridgeSide.Close()
+	defer peerSide.Close()
+	done := make(chan bool, 1)
+	svc := &Service{
+		client:   bridge.NewClient(bridgeSide),
+		ctx:      context.Background(),
+		sessions: map[string]*session{"active-call": {CallID: "active-call"}},
+		pending:  map[string]DialRequest{"pending-dial": {RequestID: "pending-dial", Done: done}},
+	}
+	result := make(chan error, 1)
+	go func() { result <- svc.Drain(context.Background()) }()
+
+	message, err := bridge.Decode(bufio.NewReader(peerSide))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message.Type != "hangup" || message.CallID != "active-call" || message.Code != 503 {
+		t.Fatalf("shutdown command=%+v, want 503 hangup for active call", message)
+	}
+	select {
+	case err := <-result:
+		t.Fatalf("drain returned before call_closed: %v", err)
+	default:
+	}
+	select {
+	case success := <-done:
+		if success {
+			t.Fatal("pending alert reported success during shutdown")
+		}
+	default:
+		t.Fatal("pending alert was not completed during shutdown")
+	}
+	if err := svc.Dial(context.Background(), DialRequest{URI: "sip:peer@example.test"}); err == nil || !strings.Contains(err.Error(), "shutting down") {
+		t.Fatalf("dial after drain started error=%v, want shutdown rejection", err)
+	}
+	svc.closeCall(bridge.Message{Type: "call_closed", CallID: "active-call"})
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("drain failed after call_closed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("drain did not return after call_closed")
+	}
+}
+
 func TestBeginSIPApplyRejectsActiveCallsAndReleasesIdempotently(t *testing.T) {
 	svc := &Service{sessions: make(map[string]*session), pending: make(map[string]DialRequest)}
 	svc.sessions["call-1"] = &session{CallID: "call-1"}
@@ -249,7 +297,7 @@ func newTestService(t *testing.T) (*Service, *store.Store) {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
-	svc := &Service{Store: db, MaxCalls: 1, sessions: make(map[string]*session), pinLock: make(map[string]time.Time)}
+	svc := &Service{Store: db, DataRoot: t.TempDir(), MaxCalls: 1, sessions: make(map[string]*session), pinLock: make(map[string]time.Time)}
 	return svc, db
 }
 
@@ -290,6 +338,87 @@ func admitAndRead(t *testing.T, svc *Service, message bridge.Message) bridge.Mes
 		t.Fatal("admit did not return")
 	}
 	return out
+}
+
+func TestRootFolderMenuKeepsStandardKeysAndPaginatesOtherFolders(t *testing.T) {
+	account := store.Account{CanonicalName: "Work"}
+	roles := map[string]string{"inbox": "Inbox", "drafts": "Drafts", "sent": "Sent", "trash": "Trash"}
+	folders := []string{
+		"Inbox", "Drafts", "Sent", "Trash", "Archive", "Clients", "Finance", "Personal",
+		"Projects", "Receipts", "Travel", "Work", "Unmapped One", "Unmapped Two",
+	}
+	firstPage := folderPromptFor(account, folders, roles, "", 0)
+	wantOrder := []string{
+		"Press 1 for Inbox", "Press 2 for Drafts", "Press 3 for Sent", "Press 4 for Trash",
+		"Press 5 for Archive", "Press 6 for Clients", "Press 7 for Finance", "Press 8 for Personal",
+		"Press 9 for more folders",
+	}
+	last := -1
+	for _, item := range wantOrder {
+		position := strings.Index(firstPage, item)
+		if position <= last {
+			t.Fatalf("folder menu order missing or wrong for %q in %q", item, firstPage)
+		}
+		last = position
+	}
+	if strings.Contains(firstPage, "Press 0 for Inbox") {
+		t.Fatalf("root menu still assigns Inbox to key 0: %q", firstPage)
+	}
+	secondPage := folderPromptFor(account, folders, roles, "", 1)
+	if !strings.Contains(secondPage, "Press 1 for Projects") ||
+		!strings.Contains(secondPage, "Press 5 for Unmapped Two") ||
+		strings.Contains(secondPage, "Press 1 for Inbox") {
+		t.Fatalf("second folder page does not continue the full unmapped list: %q", secondPage)
+	}
+	children := folderMenuChildren(folders, roles, "")
+	if len(children) != len(folders)-4 {
+		t.Fatalf("other root folders=%v; want every discovered nonstandard folder", children)
+	}
+}
+
+func TestOpenAccountFoldersIncludesDiscoveredUnmappedFolders(t *testing.T) {
+	svc, db := newTestService(t)
+	ctx := context.Background()
+	if err := db.CreateUser(ctx, store.User{ID: "folder-user", Username: "folder-user", PasswordHash: "p", PINHash: "p", Role: "user", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.ExecContext(ctx, `INSERT INTO accounts(id,user_id,canonical_name,email,sender_name,imap_host,imap_user,imap_password,smtp_host,smtp_user,smtp_password,folder_map,created_at) VALUES('folder-account','folder-user','Work','work@example.test','Work','imap.example.test','mail-user','sealed','smtp.example.test','mail-user','sealed','{}','now')`); err != nil {
+		t.Fatal(err)
+	}
+	account := store.Account{ID: "folder-account", UserID: "folder-user", CanonicalName: "Work", FolderMap: `{"INBOX":"Inbox","Drafts":"Drafts","Sent":"Sent","Trash":"Trash"}`}
+	roles := map[string]string{"inbox": "INBOX", "drafts": "Drafts", "sent": "Sent", "trash": "Trash"}
+	mapping := map[string]string{"INBOX": "Inbox", "Drafts": "Drafts", "Sent": "Sent", "Trash": "Trash"}
+	if err := db.SaveFolderRoles(ctx, account.UserID, account.ID, roles, mapping); err != nil {
+		t.Fatal(err)
+	}
+	for remote, local := range map[string]string{
+		"INBOX": "Inbox", "Drafts": "Drafts", "Sent": "Sent", "Trash": "Trash",
+		"Archive": "Archive", "Unmapped/Projects": "Unmapped/Projects",
+	} {
+		if err := db.UpsertRemoteFolder(ctx, account.ID, remote, local, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sess := &session{CallID: "folder-menu", UserID: account.UserID, ActiveAccount: account.ID, State: "account_menu", Accounts: []store.Account{account}}
+	svc.openAccountFolders(sess, account)
+	if sess.State != "folders" {
+		t.Fatalf("folder menu state=%q, want folders", sess.State)
+	}
+	for _, folder := range []string{"Inbox", "Drafts", "Sent", "Trash", "Archive", "Unmapped/Projects"} {
+		found := false
+		for _, got := range sess.Folders {
+			if got == folder {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("discovered folder %q missing from phone menu source %v", folder, sess.Folders)
+		}
+	}
+	if sess.FolderRolePaths["inbox"] != "Inbox" || sess.FolderRolePaths["drafts"] != "Drafts" || sess.FolderRolePaths["sent"] != "Sent" || sess.FolderRolePaths["trash"] != "Trash" {
+		t.Fatalf("standard folder roles not retained: %v", sess.FolderRolePaths)
+	}
 }
 
 func TestAdmitAuthorizedAnswers(t *testing.T) {
@@ -958,5 +1087,34 @@ func TestSaveDraftReplacesAttachmentGenerationWithoutDeletingCurrent(t *testing.
 	}
 	if directories != 1 {
 		t.Fatalf("attachment generations=%d, want exactly 1", directories)
+	}
+}
+
+func TestQueueLocalReadStateRollsBackWhenJournalCannotBeWritten(t *testing.T) {
+	svc, db := newTestService(t)
+	if _, err := db.DB.Exec(`INSERT INTO users(id,username,password_hash,pin_hash,role,created_at) VALUES('u','u','p','p','user','now'); INSERT INTO accounts(id,user_id,canonical_name,email,sender_name,imap_host,imap_user,imap_password,smtp_host,smtp_user,smtp_password,created_at) VALUES('a','u','Mail','u@e','User','h','u','p','h','u','p','now'); CREATE TRIGGER reject_read_journal BEFORE INSERT ON message_mutations BEGIN SELECT RAISE(ABORT,'fixture journal unavailable'); END`); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "message:2,")
+	if err := os.WriteFile(path, []byte("message"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO mail_messages(id,account_id,folder,path,is_read,updated_at) VALUES(1,'a','Inbox',?,0,'now')`, path); err != nil {
+		t.Fatal(err)
+	}
+	sess := &session{UserID: "u", Messages: []store.MailSummary{{ID: 1, AccountID: "a", Folder: "Inbox", Path: path}}}
+	if _, err := svc.queueLocalReadState(sess, sess.Messages[0], true); err == nil {
+		t.Fatal("failed journal reported queued success")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("original unread Maildir file not restored: %v", err)
+	}
+	var read bool
+	var indexedPath string
+	if err := db.DB.QueryRow(`SELECT is_read,path FROM mail_messages WHERE id=1`).Scan(&read, &indexedPath); err != nil || read || indexedPath != path {
+		t.Fatalf("read=%v path=%q err=%v", read, indexedPath, err)
+	}
+	if sess.Messages[0].Read || sess.Messages[0].Path != path {
+		t.Fatal("session changed despite journal failure")
 	}
 }

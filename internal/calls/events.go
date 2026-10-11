@@ -3,6 +3,8 @@ package calls
 import (
 	"context"
 	"errors"
+	"github.com/voxmail/voxmail/internal/diagnostics"
+	"log/slog"
 	"net"
 	"sync"
 	"time"
@@ -13,7 +15,9 @@ import (
 const callEventQueueSize = 32
 
 type callEventJob struct {
-	message bridge.Message
+	message            bridge.Message
+	navigationVersion  uint64
+	hasNavigationStamp bool
 }
 
 type callEventWorker struct {
@@ -32,9 +36,10 @@ type callEventDispatcher struct {
 	conn    net.Conn
 	ctx     context.Context
 
-	mu      sync.Mutex
-	workers map[string]*callEventWorker
-	errs    chan error
+	mu         sync.Mutex
+	workers    map[string]*callEventWorker
+	activeDTMF map[string]string
+	errs       chan error
 	// handleFn is nil in production. Tests use it to deterministically hold
 	// one event and prove queue ordering, isolation, and cancellation without
 	// needing a live SIP call.
@@ -43,11 +48,12 @@ type callEventDispatcher struct {
 
 func newCallEventDispatcher(ctx context.Context, service *Service, conn net.Conn) *callEventDispatcher {
 	return &callEventDispatcher{
-		service: service,
-		conn:    conn,
-		ctx:     ctx,
-		workers: make(map[string]*callEventWorker),
-		errs:    make(chan error, 1),
+		service:    service,
+		conn:       conn,
+		ctx:        ctx,
+		workers:    make(map[string]*callEventWorker),
+		activeDTMF: make(map[string]string),
+		errs:       make(chan error, 1),
 	}
 }
 
@@ -58,6 +64,25 @@ func (d *callEventDispatcher) dispatch(message bridge.Message) error {
 	if message.CallID == "" {
 		return nil
 	}
+	var navigationVersion uint64
+	var hasNavigationStamp bool
+	if message.Type == "dtmf" {
+		// The only meaningful input values are one keypad key on press. Treat
+		// end markers, malformed values, and stale bridge payloads as transport
+		// noise so they cannot trigger an IVR error prompt in the next state.
+		if message.Phase == "end" {
+			d.trace(message, "release ignored")
+			d.mu.Lock()
+			delete(d.activeDTMF, message.CallID)
+			d.mu.Unlock()
+			return nil
+		}
+		if (message.Phase != "" && message.Phase != "start") || !validDTMFKey(message.Digit) {
+			d.trace(message, "invalid input ignored")
+			return nil
+		}
+		navigationVersion, hasNavigationStamp = d.service.navigationVersion(message.CallID)
+	}
 	if message.Type == "call_closed" {
 		// Closing a call is a control-plane event, not ordinary IVR work. Apply
 		// cancellation immediately so an in-flight prompt stops even if the
@@ -66,19 +91,35 @@ func (d *callEventDispatcher) dispatch(message bridge.Message) error {
 		d.stopWorker(message.CallID)
 		return nil
 	}
+	if message.Type == "dtmf" {
+		// Prompt playback runs on the ordered call worker. Interrupt it as soon
+		// as the bridge receives a completed key so the worker can process that
+		// key instead of making callers wait for the whole menu to finish.
+		d.service.interruptPrompt(message.CallID)
+	}
 
 	d.mu.Lock()
+	if message.Type == "dtmf" {
+		if d.activeDTMF[message.CallID] == message.Digit {
+			d.trace(message, "duplicate ignored")
+			d.mu.Unlock()
+			return nil
+		}
+		d.activeDTMF[message.CallID] = message.Digit
+	}
 	worker := d.workers[message.CallID]
 	if worker == nil {
 		worker = d.newWorkerLocked(message.CallID)
 	}
 	select {
-	case worker.queue <- callEventJob{message: message}:
+	case worker.queue <- callEventJob{message: message, navigationVersion: navigationVersion, hasNavigationStamp: hasNavigationStamp}:
 		d.mu.Unlock()
+		d.trace(message, "queued")
 		return nil
 	default:
 		d.mu.Unlock()
 		if message.Type == "dtmf" {
+			d.trace(message, "queue full")
 			// DTMF is level-triggered user input; dropping excess digits is
 			// safer than allowing an unbounded backlog to outlive the call.
 			if d.service.Log != nil {
@@ -121,6 +162,10 @@ func (d *callEventDispatcher) runWorker(callID string, worker *callEventWorker) 
 				return
 			}
 			d.service.bindEventContext(callID, worker.ctx, worker.cancel)
+			if job.hasNavigationStamp && !d.service.navigationVersionIsCurrent(callID, job.navigationVersion) {
+				d.trace(job.message, "stale navigation ignored")
+				continue
+			}
 			if err := d.handle(worker.ctx, job.message); err != nil {
 				d.fail(err)
 				return
@@ -157,10 +202,10 @@ func (d *callEventDispatcher) handle(ctx context.Context, message bridge.Message
 	case "call_ringing":
 		d.service.reportCallAlertOutcome(message.CallID, AlertRinging)
 	case "dtmf":
-		// Baresip's call_dtmf_h callback reports one completed key, not a
-		// start/end pair. The native shim labels that single event phase=end;
-		// reject any start-level event so one key cannot be processed twice.
-		if message.Phase != "" && message.Phase != "end" {
+		// The native shim emits only the key callback and ignores the later
+		// KEYCODE_REL callback. Process that start event once; accepting the
+		// release marker as well would replay a bogus key after every press.
+		if message.Phase != "" && message.Phase != "start" || !validDTMFKey(message.Digit) {
 			return nil
 		}
 		return d.service.handleDTMF(d.conn, message)
@@ -168,10 +213,18 @@ func (d *callEventDispatcher) handle(ctx context.Context, message bridge.Message
 	return nil
 }
 
+func validDTMFKey(key string) bool {
+	if len(key) != 1 {
+		return false
+	}
+	return key[0] >= '0' && key[0] <= '9' || key == "*" || key == "#"
+}
+
 func (d *callEventDispatcher) stopWorker(callID string) {
 	d.mu.Lock()
 	worker := d.workers[callID]
 	delete(d.workers, callID)
+	delete(d.activeDTMF, callID)
 	d.mu.Unlock()
 	if worker == nil {
 		return
@@ -213,5 +266,11 @@ func (d *callEventDispatcher) close() {
 		case <-deadline.C:
 			return
 		}
+	}
+}
+
+func (d *callEventDispatcher) trace(message bridge.Message, outcome string) {
+	if diagnostics.Enabled() && message.Type == "dtmf" {
+		slog.Debug("DTMF dispatch", "call_id", message.CallID, "outcome", outcome)
 	}
 }

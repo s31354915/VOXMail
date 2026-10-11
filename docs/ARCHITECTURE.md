@@ -1,5 +1,37 @@
 # VOXMail architecture and speech lifecycle
 
+## Application lifetime and offline operation
+
+`internal/lifecycle.Application` owns worker admission, cancellation and joins.
+Local workers (HTTP and maintenance) run in both modes. Provider workers (mail
+sync and alerts) and the call bridge are rejected in offline mode before their
+callbacks run. The same validated deployment flag configures the SIP supervisor
+and web operations; persisted enablement or SIP environment overrides cannot
+override `VOXMAIL_OFFLINE_MODE=1`. Default-model provisioning is also suppressed.
+
+Shutdown has two scopes. A signal cancels provider/maintenance workers and HTTP
+request contexts, including manual mailbox synchronization. New HTTP/job and
+worker admission stops. The runtime context keeps the bridge and Baresip alive
+while calls drain, then HTTP handlers and asynchronous voice jobs finish their
+bounded durable bookkeeping. VOXMail stops the runtime, joins every worker,
+alert and call task, and only then closes SQLite. Worker registration shares
+the shutdown lock, preventing late work from escaping the join.
+
+Offline mode permits local inspection, authentication and configuration edits,
+installed-voice previews and retention. It rejects account validation/testing,
+manual synchronization, test calls, recovery-email delivery and voice downloads
+with HTTP 503 before invoking providers or creating jobs. SIP edits persist
+without applying a controller. `/api/v1` and `/readyz` expose `offline_mode`;
+offline readiness checks local database health. During shutdown `/healthz`
+continues to describe the HTTP process while `/readyz` reports `not_ready`.
+The restore drill separately uses Docker's `none` network, so network isolation
+does not depend solely on application policy.
+
+The reproducible `tests/offline/smoke.py` fixture verifies this contract after
+a restart with enabled persisted provider settings, forced SIP, and provisioning
+on Docker's `none` network. `tests/shutdown/smoke.py` separately verifies a real
+call, scheduled/manual mbsync and a voice download finalize before process exit.
+
 ## Mail synchronization
 
 The Go service resolves and policy-checks each user-supplied IMAP host once,
@@ -142,3 +174,14 @@ contacts, and caller whitelist entries. IMAP/SMTP passwords are encrypted by
 the secret box and are not returned by the account API. The browser receives
 safe account views. API validation covers relative aliases, ports, cutoff
 timestamps, voice-name path characters, ownership, sessions, and CSRF writes.
+
+## Console source and embedded artifacts
+
+The console's task modules and shared session/operation state live in
+`internal/web/console/src`; its stylesheet is `internal/web/console/console.css`.
+The locked esbuild tool produces `internal/web/static/console.bundle.js`, which
+is checked in and freshness-checked by browser CI. Go assembles that bundle and
+stylesheet into the embedded HTML template and hashes the exact inline bytes
+for CSP. Deployments need no Node runtime or external module requests. See
+[console development](../internal/web/console/README.md) for rebuild and browser
+verification commands.

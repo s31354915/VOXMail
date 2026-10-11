@@ -22,16 +22,17 @@ on:
         default: false
         type: boolean
 
-# A single group also serializes latest promotion across different release
-# tags; otherwise two valid publications could race while moving the alias.
+# Queue publications for this repository in one group so different tags cannot
+# race during alias promotion. `queue: max` retains up to 100 pending runs
+# instead of replacing earlier pending publications with the newest run.
 concurrency:
   group: voxmail-publish-${{ github.repository }}
-  cancel-in-progress: false
+  queue: max
 
 permissions:
+  actions: read
   contents: read
-  checks: read
-  packages: write
+  packages: read
 
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/voxmail
@@ -52,13 +53,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ ! "$TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+          # Keep room for the six-character architecture suffix on release aliases.
+          if [[ ! "$TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,121}$ ]]; then
             echo "invalid image tag: $TAG" >&2
             exit 1
           fi
           test -n "$SOURCE_REF"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ env.SOURCE_REF }}
           fetch-depth: 0
@@ -67,7 +69,7 @@ jobs:
         name: Record source revision
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: "1.26.x"
           cache: true
@@ -88,60 +90,24 @@ jobs:
     name: Require CI checks for exact source
     needs: verify
     runs-on: ubuntu-24.04
+    timeout-minutes: 70
     env:
       GH_TOKEN: ${{ github.token }}
       SOURCE_SHA: ${{ needs.verify.outputs.source_sha }}
     steps:
-      - name: Require successful repository CI checks
-        shell: bash
-        run: |
-          set -euo pipefail
-          required_checks=(
-            'Go unit tests and static checks'
-            'End-to-end container tests'
-          )
-          for attempt in $(seq 1 60); do
-            checks="$(gh api --paginate \
-              "repos/${GITHUB_REPOSITORY}/commits/${SOURCE_SHA}/check-runs" \
-              --jq '.check_runs[] | [.name, .status, .conclusion] | @tsv')"
-            pending=0
-            failed=0
-            all_success=1
-            for required in "${required_checks[@]}"; do
-              if printf '%s\n' "$checks" | awk -F '\t' -v wanted="$required" \
-                '$1 == wanted || $1 == ("CI / " wanted) { if ($2 == "completed" && $3 == "success") found = 1 } END { exit !found }'; then
-                continue
-              fi
-              all_success=0
-              if printf '%s\n' "$checks" | awk -F '\t' -v wanted="$required" \
-                '$1 == wanted || $1 == ("CI / " wanted) { if ($2 == "queued" || $2 == "in_progress") found = 1 } END { exit !found }'; then
-                pending=1
-              elif printf '%s\n' "$checks" | awk -F '\t' -v wanted="$required" \
-                '$1 == wanted || $1 == ("CI / " wanted) { if ($2 == "completed") found = 1 } END { exit !found }'; then
-                failed=1
-              else
-                # GitHub may not have created the check run yet.
-                pending=1
-              fi
-            done
-            if [ "$all_success" -eq 1 ]; then
-              exit 0
-            fi
-            if [ "$failed" -eq 1 ]; then
-              echo "required CI check failed for ${SOURCE_SHA}" >&2
-              printf '%s\n' "$checks" >&2
-              exit 1
-            fi
-            if [ "$attempt" -eq 60 ]; then
-              echo "timed out waiting for successful CI checks for ${SOURCE_SHA}" >&2
-              printf '%s\n' "$checks" >&2
-              exit 1
-            fi
-            echo "waiting for CI checks for ${SOURCE_SHA} (attempt ${attempt}/60)"
-            sleep 15
-          done
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Acceptance tooling belongs to this immutable workflow revision;
+          # older application sources may not contain the gate script.
+          ref: ${{ github.workflow_sha }}
+      - name: Require successful CI producer for exact source
+        run: scripts/require-ci.sh "$SOURCE_SHA"
 
   build-native:
+    permissions:
+      actions: read
+      contents: read
+      packages: write
     name: Build ${{ matrix.arch }} natively
     needs: [verify, require-ci]
     strategy:
@@ -154,26 +120,27 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.verify.outputs.source_sha }}
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      - name: Build, attest, and push architecture image
-        uses: docker/build-push-action@v6
+      - id: build
+        name: Build, attest, and push a unique staging image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           platforms: linux/${{ matrix.arch }}
           pull: true
           push: true
-          tags: ${{ env.IMAGE }}:${{ env.TAG }}-${{ matrix.arch }}
+          tags: ${{ env.IMAGE }}:staging-${{ needs.verify.outputs.source_sha }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.arch }}
           labels: |
             org.opencontainers.image.revision=${{ needs.verify.outputs.source_sha }}
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
@@ -185,31 +152,16 @@ jobs:
           cache-from: type=gha,scope=voxmail-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=voxmail-${{ matrix.arch }}
 
-      - name: Capture registry digest
+      - name: Capture build output digest
+        env:
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
         shell: bash
         run: |
           set -euo pipefail
-          image_ref="${IMAGE}:${TAG}-${{ matrix.arch }}"
-          digest=""
-          for attempt in $(seq 1 12); do
-            if inspect="$(docker buildx imagetools inspect "$image_ref" 2>&1)"; then
-              digest="$(printf '%s\n' "$inspect" | awk '$1 == "Digest:" { print $2; exit }')"
-              if [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-                break
-              fi
-              echo "registry digest was not present for $image_ref (attempt ${attempt}/12)" >&2
-            else
-              echo "registry inspection failed for $image_ref (attempt ${attempt}/12):" >&2
-              printf '%s\n' "$inspect" >&2
-            fi
-            if [ "$attempt" -lt 12 ]; then
-              sleep 5
-            fi
-          done
-          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-          printf '%s\n' "$digest" > digest
+          [[ "$BUILD_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf '%s\n' "$BUILD_DIGEST" > digest
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: voxmail-digest-${{ matrix.arch }}
           path: digest
@@ -217,57 +169,204 @@ jobs:
 
   scan-native:
     name: Scan ${{ matrix.arch }} image
-    needs: build-native
+    needs: [verify, build-native]
     strategy:
       fail-fast: false
       matrix:
         arch: [amd64, arm64]
     runs-on: ubuntu-24.04
     steps:
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: voxmail-digest-${{ matrix.arch }}
+          path: digests
+
+      - id: image
+        name: Resolve immutable scan reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest="$(cat digests/digest)"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "ref=${IMAGE}@${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Record scan artifact identity
+        env:
+          SOURCE_SHA: ${{ needs.verify.outputs.source_sha }}
+          SCAN_IMAGE: ${{ steps.image.outputs.ref }}
+          SCAN_PLATFORM: linux/${{ matrix.arch }}
+        run: python3 scripts/scan-evidence.py prepare scan-evidence
+
       - name: Scan architecture image for fixed high/critical vulnerabilities
-        uses: aquasecurity/trivy-action@v0.36.0
+        id: scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         env:
           TRIVY_IMAGE_SRC: remote
           TRIVY_PLATFORM: linux/${{ matrix.arch }}
         with:
-          image-ref: ${{ env.IMAGE }}:${{ env.TAG }}-${{ matrix.arch }}
-          format: table
+          image-ref: ${{ steps.image.outputs.ref }}
+          format: json
+          output: scan-evidence/trivy.json
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           vuln-type: os,library
           exit-code: '1'
 
-  publish-manifest:
-    name: Publish multi-architecture manifest
-    needs: [verify, require-ci, build-native, scan-native]
-    runs-on: ubuntu-24.04
+      - name: Record outcome and validate machine-readable scan report
+        if: always()
+        env:
+          SCAN_OUTCOME: ${{ steps.scan.outcome }}
+        run: python3 scripts/scan-evidence.py finish scan-evidence
+
+      - name: Retain scan evidence even when publication is blocked
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: voxmail-scan-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: scan-evidence
+          if-no-files-found: error
+          retention-days: 30
+
+  runtime-native:
+    name: Runtime-test ${{ matrix.arch }} digest
+    needs: [verify, build-native, scan-native]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          name: voxmail-digest-amd64
-          path: digests/amd64
-
-      - uses: actions/download-artifact@v4
+          ref: ${{ github.workflow_sha }}
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        if: env.TAG != 'latest'
         with:
-          name: voxmail-digest-arm64
-          path: digests/arm64
-
-      - uses: docker/login-action@v3
+          go-version: '1.26.x'
+          cache: true
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: voxmail-digest-${{ matrix.arch }}
+          path: digests
 
-      - name: Combine captured architecture digests
+      - name: Run SIP peer smoke against exact build digest
+        id: sip
         shell: bash
+        run: |
+          set -euo pipefail
+          digest="$(cat digests/digest)"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker run --rm --network host \
+            --platform "linux/${{ matrix.arch }}" \
+            --entrypoint /usr/local/bin/voxmail-sip-peer-smoke \
+            "${IMAGE}@${digest}"
+
+      - name: Require real-model acceptance before versioned publication
+        id: models
+        if: env.TAG != 'latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest="$(cat digests/digest)"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          scripts/model-acceptance.sh "${IMAGE}@${digest}" "linux/${{ matrix.arch }}"
+
+
+      - name: Record exact runtime acceptance outcome
+        if: always()
+        env:
+          SOURCE_SHA: ${{ needs.verify.outputs.source_sha }}
+          ACCEPT_PLATFORM: linux/${{ matrix.arch }}
+          SIP_OUTCOME: ${{ steps.sip.outcome }}
+          MODEL_OUTCOME: ${{ steps.models.outcome }}
+        run: python3 scripts/release-evidence.py runtime acceptance-evidence
+      - name: Retain acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: voxmail-acceptance-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: acceptance-evidence
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-manifest:
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    name: Publish multi-architecture manifest
+    outputs:
+      manifest_digest: ${{ steps.release.outputs.digest }}
+      latest_outcome: ${{ steps.latest.outcome }}
+    needs: [verify, require-ci, build-native, scan-native, runtime-native]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: voxmail-*
+          path: evidence
+      - name: Validate exact-source scan and acceptance evidence before alias changes
+        env:
+          SOURCE_SHA: ${{ needs.verify.outputs.source_sha }}
+          VERIFY_RESULT: ${{ needs.verify.result }}
+          REQUIRE_CI_RESULT: ${{ needs.require-ci.result }}
+          BUILD_NATIVE_RESULT: ${{ needs.build-native.result }}
+          SCAN_NATIVE_RESULT: ${{ needs.scan-native.result }}
+          RUNTIME_NATIVE_RESULT: ${{ needs.runtime-native.result }}
+        run: python3 scripts/release-evidence.py validate evidence
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: voxmail-digest-amd64
+          path: digests/amd64
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: voxmail-digest-arm64
+          path: digests/arm64
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26.x"
+
+      - name: Install pinned remote image tagger
+        run: go install github.com/google/go-containerregistry/cmd/crane@v0.22.1
+
+      - name: Stage manifest from captured architecture digests
+        id: manifest
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ needs.verify.outputs.source_sha }}
         run: |
           set -euo pipefail
           amd64_digest="$(cat digests/amd64/digest)"
@@ -275,32 +374,76 @@ jobs:
           for digest in "$amd64_digest" "$arm64_digest"; do
             [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           done
+          staging_tag="staging-${SOURCE_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-index"
           docker buildx imagetools create \
-            --tag "${IMAGE}:${TAG}" \
+            --tag "${IMAGE}:${staging_tag}" \
             "${IMAGE}@${amd64_digest}" \
             "${IMAGE}@${arm64_digest}"
+          manifest_digest="$(crane digest "${IMAGE}:${staging_tag}")"
+          [[ "$manifest_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "digest=$manifest_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Enforce immutable version aliases and promote accepted digests
+        shell: bash
+        env:
+          SCAN_RESULT: ${{ needs.scan-native.result }}
+          MANIFEST_DIGEST: ${{ steps.manifest.outputs.digest }}
+        run: scripts/promote-architecture-tags.sh "$SCAN_RESULT" "$IMAGE" "$TAG" digests "$MANIFEST_DIGEST"
 
       - name: Inspect published manifest and record release identity
+        id: release
         shell: bash
         run: |
           set -euo pipefail
-          docker buildx imagetools inspect "${IMAGE}:${TAG}"
-          {
-            echo "## Published VOXMail image"
-            echo
-            echo "- source revision: \`${{ needs.verify.outputs.source_sha }}\`"
-            echo "- image: \`${IMAGE}:${TAG}\`"
-            echo "- amd64 digest: \`$(cat digests/amd64/digest)\`"
-            echo "- arm64 digest: \`$(cat digests/arm64/digest)\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+          release_digest="$(crane digest "${IMAGE}:${TAG}")"
+          [[ "$release_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$release_digest" == "${{ steps.manifest.outputs.digest }}" ]]
+          echo "digest=$release_digest" >> "$GITHUB_OUTPUT"
+          docker buildx imagetools inspect "${IMAGE}@${release_digest}"
 
       - name: Promote production latest alias
+        id: latest
         if: ${{ inputs.promote_latest && inputs.tag != 'latest' }}
         shell: bash
         run: |
           set -euo pipefail
-          docker buildx imagetools create \
-            --tag "${IMAGE}:latest" \
-            "${IMAGE}@$(cat digests/amd64/digest)" \
-            "${IMAGE}@$(cat digests/arm64/digest)"
-          docker buildx imagetools inspect "${IMAGE}:latest"
+          release_digest="$(crane digest "${IMAGE}:${TAG}")"
+          crane tag "${IMAGE}@${release_digest}" latest
+          [[ "$(crane digest "${IMAGE}:latest")" == "$release_digest" ]]
+
+
+  release-summary:
+    name: Record release identities and acceptance
+    if: ${{ always() && needs.verify.result != 'skipped' }}
+    needs: [verify, require-ci, build-native, scan-native, runtime-native, publish-manifest]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        continue-on-error: true
+        with:
+          pattern: voxmail-*
+          path: evidence
+      - name: Write machine-readable and human-readable release record
+        env:
+          SOURCE_SHA: ${{ needs.verify.outputs.source_sha }}
+          VERIFY_RESULT: ${{ needs.verify.result }}
+          REQUIRE_CI_RESULT: ${{ needs.require-ci.result }}
+          BUILD_NATIVE_RESULT: ${{ needs.build-native.result }}
+          SCAN_NATIVE_RESULT: ${{ needs.scan-native.result }}
+          RUNTIME_NATIVE_RESULT: ${{ needs.runtime-native.result }}
+          PUBLISH_MANIFEST_RESULT: ${{ needs.publish-manifest.result }}
+          MANIFEST_DIGEST: ${{ needs.publish-manifest.outputs.manifest_digest }}
+          LATEST_OUTCOME: ${{ needs.publish-manifest.outputs.latest_outcome }}
+        run: python3 scripts/release-evidence.py summary evidence
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: voxmail-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-summary
+          if-no-files-found: error
+          retention-days: 90

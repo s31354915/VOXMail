@@ -2,6 +2,7 @@ import { defineConfig } from '@playwright/test';
 
 export default defineConfig({
   testDir: './specs',
+  outputDir: process.env.VOXMAIL_BROWSER_OUTPUT_DIR || './test-results',
   timeout: 60_000,
   expect: { timeout: 10_000 },
   fullyParallel: false,

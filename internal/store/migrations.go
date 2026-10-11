@@ -264,6 +264,53 @@ CREATE INDEX IF NOT EXISTS outbound_submissions_retention_idx ON outbound_submis
 )`); err != nil {
 		return err
 	}
+	if err := s.applyMigration(ctx, 21, `CREATE INDEX IF NOT EXISTS sync_runs_terminal_retention_idx ON sync_runs(finished_at,id) WHERE finished_at IS NOT NULL AND finished_at<>'';
+CREATE INDEX IF NOT EXISTS message_mutations_terminal_retention_idx ON message_mutations(created_at,id) WHERE status IN ('success','failed','synchronized');
+CREATE INDEX IF NOT EXISTS outbound_submissions_terminal_retention_idx ON outbound_submissions(updated_at,message_id) WHERE status IN ('accepted','rejected');
+CREATE INDEX IF NOT EXISTS voice_install_jobs_terminal_retention_idx ON voice_install_jobs(updated_at,id) WHERE status IN ('complete','failed');
+CREATE INDEX IF NOT EXISTS cleanup_jobs_terminal_retention_idx ON cleanup_jobs(updated_at,id) WHERE status='complete';
+CREATE INDEX IF NOT EXISTS recovery_tokens_expiry_idx ON recovery_tokens(expires_at,id);
+CREATE INDEX IF NOT EXISTS recovery_tokens_used_idx ON recovery_tokens(used_at,id) WHERE used_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS totp_backup_codes_used_idx ON totp_backup_codes(used_at,id) WHERE used_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS pin_lockouts_expiry_idx ON pin_lockouts(locked_until,phone)`); err != nil {
+		return err
+	}
+	if err := s.applyColumnMigration(ctx, 22, "sync_runs", []struct{ name, declaration string }{
+		{"error_category", "TEXT NOT NULL DEFAULT ''"},
+	}); err != nil {
+		return err
+	}
+	if err := s.applyMigration(ctx, 23, `CREATE TABLE IF NOT EXISTS account_folder_policies (
+ account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+ policy_json TEXT NOT NULL
+)`); err != nil {
+		return err
+	}
+	if err := s.applyMigration(ctx, 24, `CREATE TABLE IF NOT EXISTS account_folder_discovery (
+ account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+ remote_path TEXT NOT NULL,
+ PRIMARY KEY(account_id,remote_path)
+)`); err != nil {
+		return err
+	}
+	if err := s.applyMigration(ctx, 25, `CREATE TABLE IF NOT EXISTS account_folder_bindings (
+ account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+ local_path TEXT NOT NULL,
+ remote_path TEXT NOT NULL,
+ PRIMARY KEY(account_id,local_path,remote_path)
+);
+INSERT OR IGNORE INTO account_folder_bindings(account_id,local_path,remote_path)
+SELECT account_id,local_path,CASE WHEN lower(remote_path)='inbox' THEN 'INBOX' ELSE remote_path END
+FROM remote_folders WHERE local_path<>''`); err != nil {
+		return err
+	}
+	if err := s.applyColumnMigration(ctx, 26, "message_mutations", []struct{ name, declaration string }{
+		{"desired_read", "INTEGER"},
+		{"source_uid", "INTEGER"},
+		{"source_uid_validity", "INTEGER"},
+	}); err != nil {
+		return err
+	}
 	return nil
 }
 

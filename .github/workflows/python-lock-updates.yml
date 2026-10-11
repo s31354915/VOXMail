@@ -1,0 +1,89 @@
+name: Review Python lock updates
+
+on:
+  schedule:
+    - cron: '43 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: voxmail-python-lock-updates
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - id: source
+        name: Record source and runtime image
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          python - <<'PY' >> "$GITHUB_ENV"
+          import pathlib, re
+          source = pathlib.Path('Dockerfile').read_text()
+          image = re.search(r'^FROM (python:3\.11-slim-bookworm@sha256:[0-9a-f]{64})$', source, re.M)
+          if not image:
+              raise SystemExit('expected pinned Python 3.11 runtime image')
+          print('PYTHON_UPDATE_IMAGE=' + image[1])
+          PY
+      - name: Resolve both architectures without repository credentials
+        run: |
+          docker run --rm --platform linux/amd64 \
+            --mount type=bind,source="$PWD",target=/src --workdir /src \
+            "$PYTHON_UPDATE_IMAGE" python scripts/lock-python.py
+      - name: Verify hashes, dependency closure, native imports and negative control
+        run: |
+          docker run --rm --platform linux/amd64 \
+            --mount type=bind,source="$PWD",target=/src,readonly --workdir /src \
+            "$PYTHON_UPDATE_IMAGE" python scripts/check-python-lock.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: reviewed-python-lock-${{ github.run_id }}-${{ github.run_attempt }}
+          path: requirements/python.lock
+          if-no-files-found: error
+          retention-days: 14
+
+  propose:
+    needs: generate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.generate.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: reviewed-python-lock-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/verified-python-lock
+      - name: Copy only the verified lock
+        run: cp "$RUNNER_TEMP/verified-python-lock/python.lock" requirements/python.lock
+      - name: Propose a reviewed dependency update
+        uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7
+        with:
+          base: ${{ github.event.repository.default_branch }}
+          branch: automation/python-runtime-lock
+          add-paths: requirements/python.lock
+          commit-message: 'chore(deps): refresh hashed Python runtime lock'
+          title: 'Refresh hashed Python runtime dependencies'
+          draft: always-true
+          body: |
+            Regenerates the Python 3.11 dependency lock at the recorded source revision.
+            Both amd64/arm64 wheel sets passed hash and dependency-closure verification.
+            Native amd64 offline install, imports, Piper CLI and tampered-hash rejection passed.
+
+            Review version/hash changes and mark this draft ready to start normal PR CI.
+            Native arm64 and real-model acceptance are still required before release.
+            This proposal does not publish images or merge itself.

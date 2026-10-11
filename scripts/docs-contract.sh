@@ -23,6 +23,9 @@ contains() {
 
 for file in \
 	README.md \
+	CONTRIBUTING.md \
+	SECURITY.md \
+	.github/CODEOWNERS \
 	docs/ARCHITECTURE.md \
 	docs/OPERATIONS.md \
 	docs/RELEASE-READINESS.md \
@@ -35,6 +38,9 @@ done
 require_file tests/browser/prepare.sh
 test -x "$root/tests/browser/prepare.sh" || fail "tests/browser/prepare.sh is not executable"
 contains tests/browser/README.md "tests/browser/prepare.sh"
+require_file scripts/browser-test.sh
+test -x "$root/scripts/browser-test.sh" || fail "scripts/browser-test.sh is not executable"
+contains tests/browser/README.md "scripts/browser-test.sh"
 
 # Every environment variable advertised in the example file must be findable
 # in the settings reference. This catches documentation drift when a setting
@@ -53,17 +59,23 @@ for script in \
 	scripts/restore-drill.sh \
 	scripts/runtime-smoke.sh \
 	scripts/real-model-smoke.sh \
+	scripts/model-acceptance.sh \
 	scripts/sip-peer-smoke.sh; do
 	require_file "$script"
 	test -x "$root/$script" || fail "$script is not executable"
 	contains docs/OPERATIONS.md "$script"
 done
 
-contains README.md "docs/RELEASE-READINESS.md"
 contains README.md "Beta software"
 contains docs/SETTINGS.md "VOXMAIL_HTTP_ADDR"
 contains docs/SETTINGS.md "127.0.0.1:8080"
 contains docs/OPERATIONS.md "VOXMAIL_E2E_SIP_PEER=1 scripts/e2e.sh"
 contains docs/RELEASE-READINESS.md "Promotion checklist"
+
+require_file LICENSE
+contains LICENSE "MIT License"
+contains README.md "[MIT License](LICENSE)"
+contains CONTRIBUTING.md "[MIT License](LICENSE)"
+contains Dockerfile "COPY LICENSE /usr/local/share/licenses/voxmail/LICENSE"
 
 echo "documentation contract passed"

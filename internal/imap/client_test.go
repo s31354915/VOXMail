@@ -12,6 +12,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"github.com/voxmail/voxmail/internal/operation"
 	"io"
 	"math/big"
 	"net"
@@ -539,7 +540,7 @@ func TestListMessageIdentitiesStalledFetchHonorsParentCancellation(t *testing.T)
 
 func TestMutationErrorMarksTransportOutcomeUncertain(t *testing.T) {
 	err := mutationError("move IMAP message", io.EOF)
-	if !errors.Is(err, ErrMutationUncertain) {
+	if !errors.Is(err, ErrMutationUncertain) || !errors.Is(err, io.EOF) || operation.Classify(err) != operation.Uncertain {
 		t.Fatalf("mutationError(EOF)=%v, want ErrMutationUncertain", err)
 	}
 }

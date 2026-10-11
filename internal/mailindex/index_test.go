@@ -1,8 +1,10 @@
 package mailindex
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -176,7 +178,7 @@ func TestPruneLocalNeverTouchesRemoteAndKeepsUnparseableDates(t *testing.T) {
 	}
 }
 
-func TestIndexUsesScanMarkerAndFailsClosedOnMalformedMessage(t *testing.T) {
+func TestIndexContinuesAfterMalformedMessageAndPreservesSeenRows(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "db"))
 	if err != nil {
 		t.Fatal(err)
@@ -192,22 +194,17 @@ func TestIndexUsesScanMarkerAndFailsClosedOnMalformedMessage(t *testing.T) {
 	if err := os.MkdirAll(root, 0700); err != nil {
 		t.Fatal(err)
 	}
-	first := filepath.Join(root, "first")
-	second := filepath.Join(root, "second")
+	first := filepath.Join(root, "01-first")
+	middle := filepath.Join(root, "02-malformed")
 	message := []byte("From: a@e\r\nSubject: indexed\r\n\r\nbody\r\n")
 	if err := os.WriteFile(first, message, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(second, message, 0600); err != nil {
+	if err := os.WriteFile(middle, message, 0600); err != nil {
 		t.Fatal(err)
 	}
-	indexer := Indexer{Store: db}
-	if err := indexer.Index(context.Background(), "a-marker", filepath.Dir(filepath.Dir(root))); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(second); err != nil {
-		t.Fatal(err)
-	}
+	var diagnostics bytes.Buffer
+	indexer := Indexer{Store: db, Log: slog.New(slog.NewTextHandler(&diagnostics, nil))}
 	if err := indexer.Index(context.Background(), "a-marker", filepath.Dir(filepath.Dir(root))); err != nil {
 		t.Fatal(err)
 	}
@@ -215,24 +212,50 @@ func TestIndexUsesScanMarkerAndFailsClosedOnMalformedMessage(t *testing.T) {
 	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM mail_messages WHERE account_id='a-marker'`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if count != 1 {
-		t.Fatalf("successful scan stale count=%d, want 1", count)
+	if count != 2 {
+		t.Fatalf("initial indexed count=%d, want 2", count)
 	}
 	stale := filepath.Join(filepath.Dir(filepath.Dir(root)), "Inbox", "new", "stale")
 	if _, err := db.DB.Exec(`INSERT INTO mail_messages(account_id,folder,path,updated_at) VALUES(?,?,?,?)`, "a-marker", "Inbox", stale, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		t.Fatal(err)
 	}
-	bad := filepath.Join(root, "bad")
-	if err := os.WriteFile(bad, []byte("Content-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\nnot base64!"), 0600); err != nil {
+	if err := os.WriteFile(middle, []byte("Content-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\nnot base64!"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := indexer.Index(context.Background(), "a-marker", filepath.Dir(filepath.Dir(root))); err == nil {
-		t.Fatal("malformed scan unexpectedly succeeded")
+	last := filepath.Join(root, "03-last")
+	if err := os.WriteFile(last, []byte("From: c@e\r\nSubject: after malformed\r\n\r\nbody\r\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := indexer.Index(context.Background(), "a-marker", filepath.Dir(filepath.Dir(root))); err != nil {
+		t.Fatalf("scan should continue past malformed message: %v", err)
 	}
 	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM mail_messages WHERE path=?`, stale).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if count != 1 {
-		t.Fatal("malformed scan purged stale index rows")
+	if count != 0 {
+		t.Fatal("completed scan did not purge an unrelated stale index row")
+	}
+	var preservedSubject string
+	if err := db.DB.QueryRow(`SELECT subject FROM mail_messages WHERE path=?`, middle).Scan(&preservedSubject); err != nil {
+		t.Fatalf("previously indexed malformed message was purged: %v", err)
+	}
+	if preservedSubject != "indexed" {
+		t.Fatalf("malformed message overwrote its last valid metadata: %q", preservedSubject)
+	}
+	var lastSubject string
+	if err := db.DB.QueryRow(`SELECT subject FROM mail_messages WHERE path=?`, last).Scan(&lastSubject); err != nil {
+		t.Fatalf("valid message after malformed message was not indexed: %v", err)
+	}
+	if lastSubject != "after malformed" {
+		t.Fatalf("last message subject=%q", lastSubject)
+	}
+	if output := diagnostics.String(); !strings.Contains(output, "mail index skipped malformed message") || !strings.Contains(output, middle) || !strings.Contains(output, "a-marker") {
+		t.Fatalf("parse failure diagnostic lacks account/path context: %q", output)
+	}
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM mail_messages WHERE account_id='a-marker'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 3 {
+		t.Fatalf("final indexed count=%d, want first, preserved malformed, and final valid messages", count)
 	}
 }

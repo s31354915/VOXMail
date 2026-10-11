@@ -8,11 +8,19 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/voxmail/voxmail/internal/folderpolicy"
 )
 
 func (s *Store) ListMail(ctx context.Context, userID string, unreadOnly bool) ([]MailSummary, error) {
 	query := `SELECT m.id,m.account_id,m.folder,m.path,COALESCE(m.message_id,''),COALESCE(m.sender,''),COALESCE(m.recipients,''),COALESCE(m.cc,''),COALESCE(m.subject,''),COALESCE(m.message_date,''),m.message_date_utc,m.is_read,m.attachment_count,COALESCE(m.imap_uid,0),COALESCE(m.uid_validity,0),COALESCE(m.message_flags,'') FROM mail_messages m JOIN accounts a ON a.id=m.account_id WHERE a.user_id=? AND COALESCE(a.deleting,0)=0`
 	args := []any{userID}
+	visibility, visibleArgs, err := s.mailVisibilityPredicate(ctx, userID, "")
+	if err != nil {
+		return nil, err
+	}
+	query += ` AND ` + visibility
+	args = append(args, visibleArgs...)
 	if unreadOnly {
 		accounts, err := s.ListAccounts(ctx, userID)
 		if err != nil {
@@ -23,12 +31,17 @@ func (s *Store) ListMail(ctx context.Context, userID string, unreadOnly bool) ([
 		}
 		parts := make([]string, 0, len(accounts))
 		for _, account := range accounts {
-			parts = append(parts, `(m.account_id=? AND m.folder=? AND m.is_read=0)`)
 			inbox, err := s.InboxFolder(ctx, account)
 			if err != nil {
 				return nil, err
 			}
-			args = append(args, account.ID, inbox)
+			predicate, folderArgs, err := s.mailFolderPredicate(ctx, userID, account.ID, inbox)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, `(m.account_id=? AND `+predicate+` AND m.is_read=0)`)
+			args = append(args, account.ID)
+			args = append(args, folderArgs...)
 		}
 		query += ` AND (` + strings.Join(parts, ` OR `) + `)`
 	}
@@ -52,9 +65,19 @@ func (s *Store) ListMail(ctx context.Context, userID string, unreadOnly bool) ([
 func (s *Store) ListMailForAccount(ctx context.Context, userID, accountID, folder string, unreadOnly bool) ([]MailSummary, error) {
 	query := `SELECT m.id,m.account_id,m.folder,m.path,COALESCE(m.message_id,''),COALESCE(m.sender,''),COALESCE(m.recipients,''),COALESCE(m.cc,''),COALESCE(m.subject,''),COALESCE(m.message_date,''),m.message_date_utc,m.is_read,m.attachment_count,COALESCE(m.imap_uid,0),COALESCE(m.uid_validity,0),COALESCE(m.message_flags,'') FROM mail_messages m JOIN accounts a ON a.id=m.account_id WHERE a.user_id=? AND COALESCE(a.deleting,0)=0 AND m.account_id=?`
 	args := []any{userID, accountID}
+	visibility, visibleArgs, err := s.mailVisibilityPredicate(ctx, userID, accountID)
+	if err != nil {
+		return nil, err
+	}
+	query += ` AND ` + visibility
+	args = append(args, visibleArgs...)
 	if folder != "" {
-		query += ` AND m.folder=?`
-		args = append(args, folder)
+		predicate, folderArgs, err := s.mailFolderPredicate(ctx, userID, accountID, folder)
+		if err != nil {
+			return nil, err
+		}
+		query += ` AND ` + predicate
+		args = append(args, folderArgs...)
 	}
 	if unreadOnly {
 		if folder == "" {
@@ -72,8 +95,12 @@ func (s *Store) ListMailForAccount(ctx context.Context, userID, accountID, folde
 					break
 				}
 			}
-			query += ` AND m.folder=?`
-			args = append(args, folder)
+			predicate, folderArgs, err := s.mailFolderPredicate(ctx, userID, accountID, folder)
+			if err != nil {
+				return nil, err
+			}
+			query += ` AND ` + predicate
+			args = append(args, folderArgs...)
 		}
 		query += ` AND m.is_read=0`
 	}
@@ -119,13 +146,23 @@ func (s *Store) ListMailPage(ctx context.Context, userID, accountID, folder stri
 	}
 	query := `SELECT m.id,m.account_id,m.folder,m.path,COALESCE(m.message_id,''),COALESCE(m.sender,''),COALESCE(m.recipients,''),COALESCE(m.cc,''),COALESCE(m.subject,''),COALESCE(m.message_date,''),m.message_date_utc,m.is_read,m.attachment_count,COALESCE(m.imap_uid,0),COALESCE(m.uid_validity,0),COALESCE(m.message_flags,'') FROM mail_messages m JOIN accounts a ON a.id=m.account_id WHERE a.user_id=? AND COALESCE(a.deleting,0)=0`
 	args := []any{userID}
+	visibility, visibleArgs, err := s.mailVisibilityPredicate(ctx, userID, accountID)
+	if err != nil {
+		return MailPage{}, err
+	}
+	query += ` AND ` + visibility
+	args = append(args, visibleArgs...)
 	if accountID != "" {
 		query += ` AND m.account_id=?`
 		args = append(args, accountID)
 	}
 	if folder != "" {
-		query += ` AND m.folder=?`
-		args = append(args, folder)
+		predicate, folderArgs, err := s.mailFolderPredicate(ctx, userID, accountID, folder)
+		if err != nil {
+			return MailPage{}, err
+		}
+		query += ` AND ` + predicate
+		args = append(args, folderArgs...)
 	}
 	if unreadOnly {
 		if folder == "" {
@@ -148,8 +185,12 @@ func (s *Store) ListMailPage(ctx context.Context, userID, accountID, folder stri
 				if err != nil {
 					return MailPage{}, err
 				}
-				query += ` AND m.folder=?`
-				args = append(args, inbox)
+				predicate, folderArgs, err := s.mailFolderPredicate(ctx, userID, accountID, inbox)
+				if err != nil {
+					return MailPage{}, err
+				}
+				query += ` AND ` + predicate
+				args = append(args, folderArgs...)
 			} else {
 				accounts, err := s.ListAccounts(ctx, userID)
 				if err != nil {
@@ -164,8 +205,13 @@ func (s *Store) ListMailPage(ctx context.Context, userID, accountID, folder stri
 					if err != nil {
 						return MailPage{}, err
 					}
-					parts = append(parts, `(m.account_id=? AND m.folder=?)`)
-					args = append(args, account.ID, inbox)
+					predicate, folderArgs, err := s.mailFolderPredicate(ctx, userID, account.ID, inbox)
+					if err != nil {
+						return MailPage{}, err
+					}
+					parts = append(parts, `(m.account_id=? AND `+predicate+`)`)
+					args = append(args, account.ID)
+					args = append(args, folderArgs...)
 				}
 				query += ` AND (` + strings.Join(parts, ` OR `) + `)`
 			}
@@ -254,12 +300,21 @@ func (s *Store) CountUnreadForAccount(ctx context.Context, userID, accountID str
 // default. This function is intentionally the only fallback used by unread
 // queries, so Spam and Trash are never counted by name guessing.
 func (s *Store) InboxFolder(ctx context.Context, account Account) (string, error) {
+	role, err := s.FolderRole(ctx, account, "inbox")
+	if err == nil {
+		return role.LocalPath, nil
+	}
+	if err != sql.ErrNoRows {
+		return "", err
+	}
+	// An explicitly excluded Inbox role must yield its hidden path rather than
+	// automatically switching the user's role to a different conventional folder.
 	var local string
-	err := s.DB.QueryRowContext(ctx, `SELECT local_path FROM folder_roles WHERE account_id=? AND role='inbox'`, account.ID).Scan(&local)
-	if err == nil && strings.TrimSpace(local) != "" {
+	err = s.DB.QueryRowContext(ctx, `SELECT local_path FROM folder_roles WHERE account_id=? AND role='inbox'`, account.ID).Scan(&local)
+	if err == nil {
 		return filepathCleanFolder(local), nil
 	}
-	if err != nil && err != sql.ErrNoRows {
+	if err != sql.ErrNoRows {
 		return "", err
 	}
 	return inboxFolderLegacy(account), nil
@@ -273,7 +328,7 @@ func (s *Store) FolderRole(ctx context.Context, account Account, role string) (F
 	err := s.DB.QueryRowContext(ctx, `SELECT account_id,role,remote_path,local_path FROM folder_roles WHERE account_id=? AND role=?`, account.ID, strings.ToLower(strings.TrimSpace(role))).Scan(&result.AccountID, &result.Role, &result.RemotePath, &result.LocalPath)
 	if err == nil {
 		result.LocalPath = filepathCleanFolder(result.LocalPath)
-		return result, nil
+		return s.resolveRolePolicy(ctx, account, result)
 	}
 	if err != sql.ErrNoRows {
 		return FolderRole{}, err
@@ -282,10 +337,17 @@ func (s *Store) FolderRole(ctx context.Context, account Account, role string) (F
 	// mapping is accepted, never substring matching such as "Deleted Items".
 	var mapping map[string]string
 	if json.Unmarshal([]byte(account.FolderMap), &mapping) == nil {
+		var candidate *FolderRole
 		for remote, local := range mapping {
 			if strings.EqualFold(strings.TrimSpace(remote), role) {
-				return FolderRole{AccountID: account.ID, Role: role, RemotePath: remote, LocalPath: filepathCleanFolder(local)}, nil
+				if candidate != nil {
+					return FolderRole{}, fmt.Errorf("%w: multiple conventional folders match role %q; assign the role explicitly", ErrInvalidFolderRole, role)
+				}
+				candidate = &FolderRole{AccountID: account.ID, Role: role, RemotePath: remote, LocalPath: filepathCleanFolder(local)}
 			}
+		}
+		if candidate != nil {
+			return s.resolveRolePolicy(ctx, account, *candidate)
 		}
 	}
 	return FolderRole{}, sql.ErrNoRows
@@ -373,7 +435,7 @@ func validateFolderRoleMappings(roles, mapping map[string]string) ([]normalizedF
 	for rawRemote, rawLocal := range mapping {
 		remote := strings.TrimSpace(rawRemote)
 		local := filepathCleanFolder(rawLocal)
-		key := strings.ToLower(remote)
+		key := folderpolicy.RemoteKey(remote)
 		if remote == "" || strings.ContainsAny(remote, "\x00\r\n") || local == "Inbox" && strings.TrimSpace(rawLocal) == "" {
 			return nil, fmt.Errorf("%w: folder mappings must have non-empty names", ErrInvalidFolderRole)
 		}
@@ -395,7 +457,7 @@ func validateFolderRoleMappings(roles, mapping map[string]string) ([]normalizedF
 		if _, exists := seenRoles[role]; exists {
 			return nil, fmt.Errorf("%w: role %q is duplicated", ErrInvalidFolderRole, role)
 		}
-		remoteKey := strings.ToLower(remote)
+		remoteKey := folderpolicy.RemoteKey(remote)
 		if _, exists := seenRemotes[remoteKey]; exists {
 			return nil, fmt.Errorf("%w: remote folder %q is assigned to multiple roles", ErrInvalidFolderRole, remote)
 		}
@@ -815,7 +877,7 @@ func (s *Store) ReplaceAttachmentMetadata(ctx context.Context, messageID int64, 
 }
 
 func (s *Store) UpsertRemoteFolder(ctx context.Context, accountID, remotePath, localPath, role string) error {
-	remotePath = strings.TrimSpace(remotePath)
+	remotePath = folderpolicy.RemoteKey(strings.TrimSpace(remotePath))
 	localPath = filepathCleanFolder(localPath)
 	if accountID == "" || remotePath == "" {
 		return fmt.Errorf("remote folder identity is required")
@@ -832,8 +894,30 @@ func (s *Store) UpsertRemoteFolder(ctx context.Context, accountID, remotePath, l
 	if slash := strings.LastIndex(strings.ReplaceAll(remotePath, "\\", "/"), "/"); slash >= 0 && slash+1 < len(remotePath) {
 		display = remotePath[slash+1:]
 	}
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO remote_folders(account_id,remote_path,local_path,parent_path,depth,role,display_name,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(account_id,remote_path) DO UPDATE SET local_path=excluded.local_path,parent_path=excluded.parent_path,depth=excluded.depth,role=excluded.role,display_name=excluded.display_name,updated_at=excluded.updated_at`, accountID, remotePath, localPath, parent, depth, role, display, time.Now().UTC().Format(time.RFC3339Nano))
-	return err
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// Retain the old observation before replacing it, including databases whose
+	// metadata was inserted through a compatibility/import path after migration.
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO account_folder_bindings(account_id,local_path,remote_path)
+SELECT account_id,local_path,CASE WHEN lower(remote_path)='inbox' THEN 'INBOX' ELSE remote_path END
+FROM remote_folders WHERE account_id=? AND (remote_path=? OR (?='INBOX' AND lower(remote_path)='inbox')) AND local_path<>''`, accountID, remotePath, remotePath); err != nil {
+		return err
+	}
+	// Collapse only alternate spellings of the protocol-reserved INBOX, after
+	// retaining every old directory binding. Other remote names remain exact.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM remote_folders WHERE account_id=? AND remote_path<>? AND ?='INBOX' AND lower(remote_path)='inbox'`, accountID, remotePath, remotePath); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO account_folder_bindings(account_id,local_path,remote_path) VALUES(?,?,?)`, accountID, localPath, folderpolicy.RemoteKey(remotePath)); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO remote_folders(account_id,remote_path,local_path,parent_path,depth,role,display_name,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(account_id,remote_path) DO UPDATE SET local_path=excluded.local_path,parent_path=excluded.parent_path,depth=excluded.depth,role=excluded.role,display_name=excluded.display_name,updated_at=excluded.updated_at`, accountID, remotePath, localPath, parent, depth, role, display, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) DeleteMailIndex(ctx context.Context, userID string, id int64) error {
@@ -850,8 +934,8 @@ func (s *Store) RecordMessageMutation(ctx context.Context, messageID int64, user
 		errText = mutationErr.Error()
 	}
 	result, err := s.DB.ExecContext(ctx, `
-INSERT INTO message_mutations(message_id,user_id,operation,from_folder,to_folder,status,error,created_at)
-SELECT m.id, a.user_id, ?, ?, ?, ?, ?, ?
+INSERT INTO message_mutations(message_id,user_id,operation,from_folder,to_folder,status,error,created_at,desired_read,source_uid,source_uid_validity)
+SELECT m.id, a.user_id, ?, ?, ?, ?, ?, ?,m.is_read,m.imap_uid,m.uid_validity
 FROM mail_messages m JOIN accounts a ON a.id=m.account_id
 WHERE m.id=? AND a.user_id=?`, operation, fromFolder, toFolder, status, errText, time.Now().UTC().Format(time.RFC3339Nano), messageID, userID)
 	if err != nil {
@@ -909,15 +993,34 @@ func (s *Store) OutboundSubmission(ctx context.Context, messageID string) (Outbo
 	return submission, err
 }
 
-// MarkQueuedMutationsSynchronized closes the retry/reporting loop for local
-// Maildir-first flag changes. A successful mbsync run is the confirmation;
-// failed runs leave queued rows untouched so the next scheduled run retries
-// them naturally.
-func (s *Store) MarkQueuedMutationsSynchronized(ctx context.Context, accountID string) error {
+// QueuedMutationWatermark captures the journal boundary before launching mbsync.
+// Changes made while it runs must remain pending for the following run.
+func (s *Store) QueuedMutationWatermark(ctx context.Context, accountID string) (int64, error) {
+	var watermark int64
+	err := s.DB.QueryRowContext(ctx, `SELECT COALESCE(MAX(m.id),0) FROM message_mutations m JOIN mail_messages mm ON mm.id=m.message_id WHERE mm.account_id=? AND m.status='queued'`, accountID).Scan(&watermark)
+	return watermark, err
+}
+
+// MarkQueuedMutationsSynchronized acknowledges only changes that preceded a
+// successful run and whose physical directory was included in its configuration.
+// A nil folder list denotes the legacy wildcard configuration. An empty list
+// acknowledges nothing. Retained directories outside an explicit plan stay queued.
+func (s *Store) MarkQueuedMutationsSynchronized(ctx context.Context, accountID string, watermark int64, folders []string) error {
 	if strings.TrimSpace(accountID) == "" {
 		return fmt.Errorf("account identity is required")
 	}
-	_, err := s.DB.ExecContext(ctx, `UPDATE message_mutations SET status='synchronized',error='' WHERE status='queued' AND message_id IN (SELECT id FROM mail_messages WHERE account_id=?)`, accountID)
+	if watermark <= 0 || (folders != nil && len(folders) == 0) {
+		return nil
+	}
+	query := `UPDATE message_mutations SET status='synchronized',error='' WHERE status='queued' AND operation='mark_read' AND id<=? AND message_id IN (SELECT m.id FROM mail_messages m WHERE m.account_id=? AND m.folder=message_mutations.from_folder AND (message_mutations.source_uid IS NULL OR message_mutations.source_uid=0 OR message_mutations.source_uid=COALESCE(m.imap_uid,0)) AND (message_mutations.source_uid_validity IS NULL OR message_mutations.source_uid_validity=0 OR message_mutations.source_uid_validity=COALESCE(m.uid_validity,0)) AND (SELECT COALESCE(q.desired_read,m.is_read) FROM message_mutations q WHERE q.message_id=m.id AND q.operation='mark_read' AND q.status IN ('queued','synchronized','success') AND q.id<=? ORDER BY q.id DESC LIMIT 1)=m.is_read)`
+	args := []any{watermark, accountID, watermark}
+	if folders != nil {
+		query += ` AND from_folder IN (` + strings.TrimSuffix(strings.Repeat("?,", len(folders)), ",") + `)`
+		for _, folder := range folders {
+			args = append(args, folder)
+		}
+	}
+	_, err := s.DB.ExecContext(ctx, query, args...)
 	return err
 }
 

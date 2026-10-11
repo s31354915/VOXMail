@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"github.com/voxmail/voxmail/internal/maintenance"
 	"io"
 	"os"
 	"os/exec"
@@ -446,7 +447,7 @@ func (r *Runtime) warm(ctx context.Context, ready *capabilityReady) {
 			r.mu.Unlock()
 			return
 		}
-		file, err := os.CreateTemp(warmDir, ".piper-warm-*.wav")
+		file, releaseFile, err := maintenance.CreateTemp(warmDir, ".piper-warm-*.wav")
 		if err != nil {
 			w.close()
 			r.mu.Lock()
@@ -458,6 +459,7 @@ func (r *Runtime) warm(ctx context.Context, ready *capabilityReady) {
 			r.mu.Unlock()
 			return
 		}
+		defer releaseFile()
 		path := file.Name()
 		_ = file.Close()
 		warmErr := w.synthesize(ctx, "VOXMail ready.", path)
@@ -629,10 +631,11 @@ func (w Whisper) Warm(ctx context.Context, dir string) error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
-	file, err := os.CreateTemp(dir, ".whisper-warm-*.wav")
+	file, releaseFile, err := maintenance.CreateTemp(dir, ".whisper-warm-*.wav")
 	if err != nil {
 		return err
 	}
+	defer releaseFile()
 	path := file.Name()
 	defer os.Remove(path)
 	if err := writeSilentWAV(file, 8000); err != nil {
@@ -663,10 +666,11 @@ func PrepareGreeting(ctx context.Context, p Piper, path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".greeting-*.wav")
+	tmp, releaseTmp, err := maintenance.CreateTemp(filepath.Dir(path), ".greeting-*.wav")
 	if err != nil {
 		return err
 	}
+	defer releaseTmp()
 	tmpPath := tmp.Name()
 	_ = tmp.Close()
 	defer os.Remove(tmpPath)

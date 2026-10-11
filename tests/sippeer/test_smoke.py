@@ -1,10 +1,15 @@
 import hashlib
 import socket
+import subprocess
 import unittest
+from pathlib import Path
+from unittest.mock import Mock
 
 try:
     from tests.sippeer.smoke import (
         PCMU,
+        Baresip,
+        SmokeFailure,
         TELEPHONE_EVENT,
         SIPPeer,
         choose_codec,
@@ -23,6 +28,8 @@ except ModuleNotFoundError as exc:
         raise
     from smoke import (
         PCMU,
+        Baresip,
+        SmokeFailure,
         TELEPHONE_EVENT,
         SIPPeer,
         choose_codec,
@@ -39,6 +46,25 @@ except ModuleNotFoundError as exc:
 
 
 class SIPPeerContractTests(unittest.TestCase):
+    def test_shutdown_cannot_pass_after_a_forced_kill(self):
+        fixture = Baresip("baresip", Path("config"), Path("control"), Path("audio"), Path("log"))
+        process = Mock()
+        process.poll.return_value = None
+        process.wait.side_effect = [subprocess.TimeoutExpired("baresip", 5), 0]
+        fixture.process = process
+        with self.assertRaisesRegex(SmokeFailure, "required SIGKILL"):
+            fixture.stop()
+        process.kill.assert_called_once()
+
+    def test_shutdown_cannot_pass_after_a_crash(self):
+        fixture = Baresip("baresip", Path("config"), Path("control"), Path("audio"), Path("log"))
+        process = Mock()
+        process.poll.return_value = -11
+        process.returncode = -11
+        fixture.process = process
+        with self.assertRaisesRegex(SmokeFailure, "uncleanly"):
+            fixture.stop()
+
     def test_sip_parser_respects_content_length_and_case_insensitive_headers(self):
         message = sip_bytes(
             "REGISTER sip:example.test SIP/2.0",

@@ -2,12 +2,12 @@ package web
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/mail"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -15,7 +15,9 @@ import (
 	"github.com/voxmail/voxmail/internal/imapcheck"
 	"github.com/voxmail/voxmail/internal/mailer"
 	"github.com/voxmail/voxmail/internal/mailsecurity"
+	"github.com/voxmail/voxmail/internal/mailsync"
 	"github.com/voxmail/voxmail/internal/netguard"
+	"github.com/voxmail/voxmail/internal/secret"
 	"github.com/voxmail/voxmail/internal/store"
 )
 
@@ -69,7 +71,43 @@ type accountView struct {
 	InitialCutoff                 *string           `json:"initial_cutoff,omitempty"`
 	RetentionDays                 *int              `json:"retention_days,omitempty"`
 	CallAlertEnabled              bool              `json:"call_alert_enabled"`
-	LastSync                      *store.SyncRun    `json:"last_sync,omitempty"`
+	LastSync                      *syncRunView      `json:"last_sync,omitempty"`
+	LastSuccessfulSync            *syncRunView      `json:"last_successful_sync,omitempty"`
+}
+
+type syncRunView struct {
+	store.SyncRun
+	State   string              `json:"state"`
+	Failure *OperationalFailure `json:"failure,omitempty"`
+}
+
+func (s *Server) syncRunJSON(run store.SyncRun) *syncRunView {
+	v := &syncRunView{SyncRun: run, State: "failed"}
+	if run.ErrorCategory != "" {
+		v.Failure = structuredFailure(run.ErrorCategory)
+		// Preserve only a bounded numeric exit diagnostic, never provider text.
+		if status := toolExitStatus.FindString(run.Error); status != "" {
+			v.Failure.Diagnostic = "Child process " + status
+		}
+	} else {
+		v.Failure = operationalFailure(run.Error) // legacy persisted runs
+	}
+	v.Error = ""
+	if v.Failure != nil {
+		v.Error = v.Failure.Reason
+	}
+	if run.FinishedAt == "" {
+		v.State = "unfinished"
+		if probe, ok := s.Sync.(interface{ SyncRunning(string) bool }); ok && probe.SyncRunning(run.AccountID) {
+			v.State = "running"
+		}
+	} else if run.Success {
+		v.State = "succeeded"
+	} else if v.Failure == nil {
+		v.Failure = operationalFailure("unknown failure")
+		v.Error = v.Failure.Reason
+	}
+	return v
 }
 
 func accountJSON(a store.Account) accountView {
@@ -103,7 +141,16 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if run, err := s.Store.LatestSyncRun(r.Context(), account.ID, false); err == nil {
-			view.LastSync = &run
+			view.LastSync = s.syncRunJSON(run)
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			serverError(w, err)
+			return
+		}
+		if run, err := s.Store.LatestSyncRun(r.Context(), account.ID, true); err == nil {
+			view.LastSuccessfulSync = s.syncRunJSON(run)
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			serverError(w, err)
+			return
 		}
 		out = append(out, view)
 	}
@@ -282,11 +329,15 @@ func (s *Server) reorderAccounts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "saved"})
 }
 
-// validateAccount authenticates a new account without persisting credentials.
-// The browser wizard calls this before POST /accounts so folder roles can be
-// chosen only after the provider has been reached and its folders discovered.
+// validateAccount authenticates the values currently in the account form
+// without persisting them. When editing an existing account, blank password
+// fields reuse that account's saved credentials for this validation only.
 func (s *Server) validateAccount(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.require(w, r, true); !ok {
+	u, ok := s.require(w, r, true)
+	if !ok {
+		return
+	}
+	if !s.requireOnline(w, "account validation") {
 		return
 	}
 	var req accountRequest
@@ -296,6 +347,35 @@ func (s *Server) validateAccount(w http.ResponseWriter, r *http.Request) {
 	if err := validateAccountInput(req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	if req.ID != "" {
+		accounts, err := s.Store.ListAccounts(r.Context(), u.ID)
+		if err != nil {
+			serverError(w, err)
+			return
+		}
+		var saved *store.Account
+		for i := range accounts {
+			if accounts[i].ID == req.ID {
+				saved = &accounts[i]
+				break
+			}
+		}
+		if saved == nil {
+			writeError(w, http.StatusNotFound, "account not found")
+			return
+		}
+		req, err = fillAccountValidationPasswords(req, *saved, s.Secrets)
+		if err != nil {
+			if errors.Is(err, errAccountValidationSecretsUnavailable) {
+				writeError(w, http.StatusServiceUnavailable, err.Error())
+			} else if errors.Is(err, errStoredAccountCredentialsUnavailable) {
+				writeOperationalError(w, http.StatusBadGateway, err)
+			} else {
+				writeError(w, http.StatusBadRequest, err.Error())
+			}
+			return
+		}
 	}
 	if strings.TrimSpace(req.IMAPPassword) == "" || strings.TrimSpace(req.SMTPPassword) == "" {
 		writeError(w, http.StatusBadRequest, "IMAP and SMTP passwords are required for validation")
@@ -327,26 +407,58 @@ func (s *Server) validateAccount(w http.ResponseWriter, r *http.Request) {
 		if s.log() != nil {
 			s.log().Warn("new account validation failed", "error", err)
 		}
-		writeError(w, http.StatusBadGateway, err.Error())
+		writeOperationalError(w, http.StatusBadGateway, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "authenticated", "folders": folders})
 }
 
-func (s *Server) checkAccountCredentials(ctx context.Context, req accountRequest) ([]string, error) {
-	imapAddress, err := ssrfSafeAddress(ctx, req.IMAPHost, req.IMAPPort)
-	if err != nil {
-		return nil, fmt.Errorf("IMAP host is not reachable by policy")
+var (
+	errAccountValidationSecretsUnavailable = errors.New("mail secret storage is unavailable")
+	errStoredAccountCredentialsUnavailable = errors.New("stored account credentials are unavailable")
+)
+
+func fillAccountValidationPasswords(req accountRequest, saved store.Account, box *secret.Box) (accountRequest, error) {
+	if req.ID == "" || req.ID != saved.ID {
+		return req, store.ErrAccountNotFound
 	}
-	folders, err := imapcheck.Check(ctx, imapcheck.Config{Host: req.IMAPHost, Address: imapAddress, Port: req.IMAPPort, Security: req.IMAPSecurity, Username: req.IMAPUser, Password: req.IMAPPassword})
+	if req.IMAPPassword == "" {
+		if box == nil {
+			return req, errAccountValidationSecretsUnavailable
+		}
+		password, err := box.Open(saved.IMAPPassword)
+		if err != nil {
+			return req, errStoredAccountCredentialsUnavailable
+		}
+		req.IMAPPassword = password
+	}
+	if req.SMTPPassword == "" {
+		if box == nil {
+			return req, errAccountValidationSecretsUnavailable
+		}
+		password, err := box.Open(saved.SMTPPassword)
+		if err != nil {
+			return req, errStoredAccountCredentialsUnavailable
+		}
+		req.SMTPPassword = password
+	}
+	return req, nil
+}
+
+func (s *Server) checkAccountCredentials(ctx context.Context, req accountRequest) ([]string, error) {
+	imapAddress, err := s.accountAddress(ctx, req.IMAPHost, req.IMAPPort)
+	if err != nil {
+		return nil, fmt.Errorf("IMAP endpoint: %w", err)
+	}
+	folders, err := s.checkIMAPAccount(ctx, imapcheck.Config{Host: req.IMAPHost, Address: imapAddress, Port: req.IMAPPort, Security: req.IMAPSecurity, Username: req.IMAPUser, Password: req.IMAPPassword})
 	if err != nil {
 		return nil, err
 	}
-	smtpAddress, err := ssrfSafeAddress(ctx, req.SMTPHost, req.SMTPPort)
+	smtpAddress, err := s.accountAddress(ctx, req.SMTPHost, req.SMTPPort)
 	if err != nil {
-		return nil, fmt.Errorf("SMTP host is not reachable by policy")
+		return nil, fmt.Errorf("SMTP endpoint: %w", err)
 	}
-	if err := mailer.Check(ctx, mailer.Config{Host: req.SMTPHost, Address: smtpAddress, Port: req.SMTPPort, Security: req.SMTPSecurity, Username: req.SMTPUser, Password: req.SMTPPassword}); err != nil {
+	if err := s.checkSMTPAccount(ctx, mailer.Config{Host: req.SMTPHost, Address: smtpAddress, Port: req.SMTPPort, Security: req.SMTPSecurity, Username: req.SMTPUser, Password: req.SMTPPassword}); err != nil {
 		return nil, err
 	}
 	return folders, nil
@@ -385,14 +497,12 @@ func (s *Server) deleteAccountData(ctx context.Context, userID, accountID string
 	if invalidate {
 		s.invalidateDeletedUserCalls(userID)
 	}
-	cleanupErr := s.removeCleanupPaths(job.Paths)
 	if err := s.Store.FinalizeAccountDeletion(ctx, userID, accountID); err != nil {
 		return false, err
 	}
-	if err := s.Store.FinishCleanupJob(ctx, job.ID, cleanupErr); err != nil && cleanupErr == nil {
-		cleanupErr = err
-	}
-	return cleanupErr != nil, nil
+	// The durable job becomes eligible only after coordination and metadata
+	// removal. Filesystem size never extends the HTTP response lifetime.
+	return true, nil
 }
 
 func (s *Server) invalidateDeletedUserCalls(userID string) {
@@ -404,82 +514,6 @@ func (s *Server) invalidateDeletedUserCalls(userID string) {
 		return
 	}
 	s.Calls.InvalidateUserSessions(userID)
-}
-
-func (s *Server) removeCleanupPaths(paths []string) error {
-	if len(paths) == 0 {
-		return nil
-	}
-	var failures []string
-	for _, path := range paths {
-		if err := s.removeOwnedPath(path); err != nil {
-			failures = append(failures, err.Error())
-		}
-	}
-	if len(failures) > 0 {
-		return fmt.Errorf("cleanup incomplete: %s", strings.Join(failures, "; "))
-	}
-	return nil
-}
-
-func (s *Server) removeOwnedPath(path string) error {
-	if s.DataRoot == "" {
-		return fmt.Errorf("data root is not configured for %q", path)
-	}
-	pathAbs, err := filepath.Abs(filepath.Clean(path))
-	if err != nil {
-		return err
-	}
-	dataRoot, err := filepath.Abs(filepath.Clean(s.DataRoot))
-	if err != nil {
-		return err
-	}
-	allowed := []string{
-		filepath.Join(dataRoot, "mail"),
-		filepath.Join(dataRoot, "drafts"),
-		filepath.Join(dataRoot, "config", "mbsync"),
-		filepath.Join(dataRoot, "quarantine"),
-	}
-	for _, root := range allowed {
-		rootAbs, rootErr := filepath.Abs(filepath.Clean(root))
-		if rootErr != nil {
-			continue
-		}
-		rel, relErr := filepath.Rel(rootAbs, pathAbs)
-		if relErr != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			continue
-		}
-		rootReal, rootErr := filepath.EvalSymlinks(rootAbs)
-		if rootErr != nil {
-			if os.IsNotExist(rootErr) {
-				return nil
-			}
-			continue
-		}
-		pathReal, pathErr := filepath.EvalSymlinks(pathAbs)
-		if pathErr != nil {
-			if !os.IsNotExist(pathErr) {
-				return pathErr
-			}
-			parentReal, parentErr := filepath.EvalSymlinks(filepath.Dir(pathAbs))
-			if parentErr != nil {
-				if os.IsNotExist(parentErr) {
-					return nil
-				}
-				return parentErr
-			}
-			pathReal = filepath.Join(parentReal, filepath.Base(pathAbs))
-		}
-		realRel, realErr := filepath.Rel(rootReal, pathReal)
-		if realErr != nil || realRel == "." || realRel == ".." || strings.HasPrefix(realRel, ".."+string(filepath.Separator)) {
-			return fmt.Errorf("owned path escapes data root: %q", path)
-		}
-		if err := os.RemoveAll(pathAbs); err != nil {
-			return fmt.Errorf("remove %q: %w", path, err)
-		}
-		return nil
-	}
-	return fmt.Errorf("path is outside an owned cleanup root: %q", path)
 }
 
 func (s *Server) deleteAccount(w http.ResponseWriter, r *http.Request) {
@@ -523,6 +557,9 @@ func (s *Server) syncAccount(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !s.requireOnline(w, "mail synchronization") {
+		return
+	}
 	if s.Sync == nil {
 		writeError(w, http.StatusServiceUnavailable, "mail synchronization is not running")
 		return
@@ -544,14 +581,67 @@ func (s *Server) syncAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "account not found")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
-	defer cancel()
-	if err := s.Sync.RefreshAccount(ctx, u.ID, accountID); err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
+	starter, ok := s.Sync.(AccountSyncStarter)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "asynchronous mail synchronization is unavailable")
+		return
+	}
+	runID, err := starter.StartRefreshAccount(r.Context(), s.voiceCtx, u.ID, accountID)
+	if errors.Is(err, mailsync.ErrSyncBusy) {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	if errors.Is(err, mailsync.ErrSyncCapacity) {
+		writeError(w, http.StatusTooManyRequests, err.Error())
+		return
+	}
+	if err != nil {
+		writeOperationalError(w, http.StatusBadGateway, err)
 		return
 	}
 	_ = s.Store.Audit(r.Context(), u.ID, "account_sync_requested", accountID)
-	writeJSON(w, http.StatusOK, map[string]string{"status": "synchronized"})
+	w.Header().Set("Location", "/api/v1/accounts")
+	writeJSON(w, http.StatusAccepted, map[string]any{"status": "running", "run_id": runID, "account_id": accountID})
+}
+
+func (s *Server) cancelManualSync(w http.ResponseWriter, r *http.Request) {
+	u, ok := s.require(w, r, true)
+	if !ok {
+		return
+	}
+	accountID := r.PathValue("id")
+	accounts, err := s.Store.ListAccounts(r.Context(), u.ID)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	found := false
+	for _, account := range accounts {
+		if account.ID == accountID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, "account not found")
+		return
+	}
+	canceler, ok := s.Sync.(ManualSyncCanceler)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "manual synchronization cancellation is unavailable")
+		return
+	}
+	canceled, err := canceler.CancelManualSync(r.Context(), accountID)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	if !canceled {
+		writeError(w, http.StatusConflict, "no manual synchronization is currently running")
+		return
+	}
+	_ = s.Store.Audit(r.Context(), u.ID, "account_sync_cancel_requested", accountID)
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "cancellation requested"})
 }
 
 func (s *Server) accountMutations(w http.ResponseWriter, r *http.Request) {
@@ -595,6 +685,9 @@ type testAccountRequest struct {
 func (s *Server) testAccount(w http.ResponseWriter, r *http.Request) {
 	u, ok := s.require(w, r, true)
 	if !ok {
+		return
+	}
+	if !s.requireOnline(w, "account testing") {
 		return
 	}
 	var req testAccountRequest
@@ -645,29 +738,42 @@ func (s *Server) testAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	imapAddress, err := ssrfSafeAddress(ctx, account.IMAPHost, imapPort)
+	imapAddress, err := s.accountAddress(ctx, account.IMAPHost, imapPort)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "IMAP host is not reachable by policy")
 		return
 	}
-	folders, err := imapcheck.Check(ctx, imapcheck.Config{Host: account.IMAPHost, Address: imapAddress, Port: imapPort, Security: account.IMAPSecurity, Username: account.IMAPUser, Password: imapPassword})
+	folders, err := s.checkIMAPAccount(ctx, imapcheck.Config{Host: account.IMAPHost, Address: imapAddress, Port: imapPort, Security: account.IMAPSecurity, Username: account.IMAPUser, Password: imapPassword})
 	if err != nil {
 		if s.log() != nil {
 			s.log().Warn("authenticated IMAP test failed", "account_id", account.ID, "error", err)
 		}
-		writeError(w, http.StatusBadGateway, err.Error())
+		writeOperationalError(w, http.StatusBadGateway, err)
 		return
 	}
-	smtpAddress, err := ssrfSafeAddress(ctx, account.SMTPHost, smtpPort)
+	smtpAddress, err := s.accountAddress(ctx, account.SMTPHost, smtpPort)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "SMTP host is not reachable by policy")
 		return
 	}
-	if err := mailer.Check(ctx, mailer.Config{Host: account.SMTPHost, Address: smtpAddress, Port: smtpPort, Security: account.SMTPSecurity, Username: account.SMTPUser, Password: smtpPassword}); err != nil {
+	if err := s.checkSMTPAccount(ctx, mailer.Config{Host: account.SMTPHost, Address: smtpAddress, Port: smtpPort, Security: account.SMTPSecurity, Username: account.SMTPUser, Password: smtpPassword}); err != nil {
 		if s.log() != nil {
 			s.log().Warn("authenticated SMTP test failed", "account_id", account.ID, "error", err)
 		}
-		writeError(w, http.StatusBadGateway, err.Error())
+		writeOperationalError(w, http.StatusBadGateway, err)
+		return
+	}
+	if err := s.Store.RecordFolderDiscovery(ctx, u.ID, account.ID, account.ConfigVersion, folders); err != nil {
+		switch {
+		case errors.Is(err, store.ErrAccountConfigConflict):
+			writeError(w, http.StatusConflict, "account settings changed during discovery; test saved settings again")
+		case errors.Is(err, store.ErrAccountNotFound):
+			writeError(w, http.StatusNotFound, "account not found")
+		case errors.Is(err, store.ErrInvalidAccountConfig):
+			writeError(w, http.StatusBadGateway, "provider folders cannot be mapped: "+err.Error())
+		default:
+			serverError(w, err)
+		}
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "authenticated", "folders": folders})
@@ -683,4 +789,33 @@ func ssrfSafeDial(ctx context.Context, host string, port int) error {
 
 func ssrfSafeAddress(ctx context.Context, host string, port int) (string, error) {
 	return netguard.CheckAndPin(ctx, host, port, false)
+}
+
+func (s *Server) checkIMAPAccount(ctx context.Context, cfg imapcheck.Config) ([]string, error) {
+	if s.imapAccountCheck != nil {
+		return s.imapAccountCheck(ctx, cfg)
+	}
+	return imapcheck.Check(ctx, cfg)
+}
+
+func (s *Server) accountAddress(ctx context.Context, host string, port int) (string, error) {
+	if s.accountEndpoint == nil {
+		return ssrfSafeAddress(ctx, host, port)
+	}
+	address, err := s.accountEndpoint(ctx, host, port)
+	if err != nil {
+		return "", err
+	}
+	// Even an injected reachability adapter cannot return a private endpoint.
+	if err := netguard.ValidateAddress(address, port, false); err != nil {
+		return "", err
+	}
+	return address, nil
+}
+
+func (s *Server) checkSMTPAccount(ctx context.Context, cfg mailer.Config) error {
+	if s.smtpAccountCheck != nil {
+		return s.smtpAccountCheck(ctx, cfg)
+	}
+	return mailer.Check(ctx, cfg)
 }

@@ -45,7 +45,7 @@ RUN --mount=type=cache,id=bare-baresip-source-${BARESIP_REF}-${TARGETARCH},targe
     -DMODULES='account;g711;auconv;auresamp;aubridge;aufile;in_band_dtmf;ice;stun;srtp;dtls_srtp;stdio' \
     -DAPP_MODULES_DIR=/src/appmodules -DAPP_MODULES=voxmail \
     -DVOXMAIL_BUILD_NATIVE_TESTS=ON; \
-    cmake --build /build/baresip --target voxmail_command_queue_test voxmail_json_output_test voxmail_frame_parser_test voxmail_client_owner_test voxmail_command_wakeup_test voxmail_nonblocking_pipe_test voxmail_pcm_writer_test voxmail_pthread_start_test --config Release -j"$(nproc)"; \
+    cmake --build /build/baresip --target voxmail_command_queue_test voxmail_json_output_test voxmail_frame_parser_test voxmail_client_owner_test voxmail_command_wakeup_test voxmail_nonblocking_pipe_test voxmail_pcm_writer_test voxmail_pthread_start_test voxmail_event_shutdown_test --config Release -j"$(nproc)"; \
     ctest --test-dir /build/baresip/app_modules/voxmail --output-on-failure; \
     cmake --build /build/baresip --config Release -j"$(nproc)"; \
     mkdir -p /out/modules /out/provenance; \
@@ -87,7 +87,10 @@ WORKDIR /src
 COPY go.mod ./
 COPY go.sum* ./
 RUN --mount=type=cache,id=gomod-${TARGETARCH},target=/go/pkg/mod,sharing=locked go mod download
-COPY . .
+# Only application source and its embedded assets enter the Go builder.
+# Keep local operator/review material out even if an ignore rule is missed.
+COPY cmd/ ./cmd/
+COPY internal/ ./internal/
 RUN --mount=type=cache,id=gobuild-${TARGETARCH},target=/root/.cache/go-build,sharing=locked \
     set -eu; \
     CGO_ENABLED=1 go build -trimpath -ldflags='-s -w' -o /out/voxmail ./cmd/voxmail && \
@@ -102,21 +105,24 @@ RUN --mount=type=cache,id=gobuild-${TARGETARCH},target=/root/.cache/go-build,sha
       "${piper_model_sha}" "${piper_config_sha}" "${whisper_model_sha}" > /out/provenance/models.txt
 
 FROM python:3.11-slim-bookworm@sha256:0a310eeecf4e1f5a0743f9a6520c90c88d089c903ca5fd283f501e3a805f5f89
+COPY LICENSE /usr/local/share/licenses/voxmail/LICENSE
 ARG VOXMAIL_REVISION=unknown
 LABEL org.opencontainers.image.revision="${VOXMAIL_REVISION}"
 ENV VOXMAIL_DATA_DIR=/data \
     VOXMAIL_HTTP_ADDR=:8080 \
     VOXMAIL_MAX_CALLS=10
+COPY requirements/python.lock /usr/local/share/voxmail/provenance/python.lock
 # The Python base image's setuptools bundle contains its own vendored
 # metadata; upgrade the owning package so Trivy cannot report stale
 # vulnerable jaraco.context/wheel copies from inside setuptools.
 RUN apt-get update && apt-get upgrade -y --no-install-recommends && apt-get install -y --no-install-recommends \
     ca-certificates ffmpeg isync curl openssl libsqlite3-0 libssl3 libstdc++6 \
-    && rm -rf /var/lib/apt/lists/* && pip install --no-cache-dir piper-tts==1.3.0 \
-    && pip install --no-cache-dir --upgrade \
-        'setuptools==84.0.0' \
-        'jaraco.context==6.1.2' \
-        'wheel==0.48.0'
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m pip install --no-cache-dir --upgrade --require-hashes --only-binary=:all: \
+        --index-url https://pypi.org/simple -r /usr/local/share/voxmail/provenance/python.lock \
+    && python -m pip check \
+    && sha256sum /usr/local/share/voxmail/provenance/python.lock \
+        > /usr/local/share/voxmail/provenance/python-lock.sha256
 COPY --from=build /out/voxmail /usr/local/bin/voxmail
 COPY --from=build /out/voxmail-secret /usr/local/bin/voxmail-secret
 COPY --from=build /out/voxmail-connect /usr/local/bin/voxmail-connect

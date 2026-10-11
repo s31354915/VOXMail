@@ -4,16 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"github.com/voxmail/voxmail/internal/operation"
+	"github.com/voxmail/voxmail/internal/process"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 )
 
-const piperSynthesisTimeout = 2 * time.Minute
+const piperSynthesisTimeout = process.PiperTimeout
 
 // validateWAV verifies the complete little-endian PCM WAV representation that
 // Piper 1.3.0 writes. In particular, it checks the RIFF size and every chunk
@@ -131,7 +132,9 @@ func ValidWAV(path string) bool { return validateWAV(path) == nil }
 // v1.3.0 CLI has no JSON-input mode, so process completion is the authoritative
 // completion signal. The temporary path is in the destination directory so
 // rename is atomic on the same filesystem.
-func synthesizePiper(ctx context.Context, p Piper, text, output string) error {
+func synthesizePiper(ctx context.Context, p Piper, text, output string) (retErr error) {
+	stage, category := "settings", operation.Configuration
+	defer func() { retErr = operation.Wrap("piper", stage, category, retErr) }()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -148,6 +151,7 @@ func synthesizePiper(ctx context.Context, p Piper, text, output string) error {
 	if err := safeOutput(output); err != nil {
 		return err
 	}
+	stage, category = "prepare_output", operation.Failed
 	if err := os.MkdirAll(filepath.Dir(output), 0700); err != nil {
 		return err
 	}
@@ -166,23 +170,23 @@ func synthesizePiper(ctx context.Context, p Piper, text, output string) error {
 	args = append(args, p.Extra...)
 	runCtx, cancel := context.WithTimeout(ctx, piperSynthesisTimeout)
 	defer cancel()
-	command := exec.CommandContext(runCtx, p.Binary, args...)
-	configurePiperCommand(command)
+	stage, category = "synthesize", operation.Failed
+	command := process.New(runCtx, "piper", p.Binary, 0, args...)
 	command.Stdin = strings.NewReader(text + "\n")
-	var stderr bytes.Buffer
-	command.Stderr = &stderr
 	if err := command.Run(); err != nil {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return errors.Join(err, ctx.Err())
 		}
 		if runCtx.Err() != nil {
-			return fmt.Errorf("piper synthesis timed out: %w", runCtx.Err())
+			return errors.Join(err, runCtx.Err())
 		}
-		return fmt.Errorf("piper: %w: %s", err, strings.TrimSpace(stderr.String()))
+		return fmt.Errorf("piper: %w: %s", err, strings.TrimSpace(command.StderrText()))
 	}
+	stage, category = "validate_output", operation.Protocol
 	if err := validateWAV(tmpPath); err != nil {
 		return fmt.Errorf("piper produced invalid WAV: %w", err)
 	}
+	stage, category = "publish_output", operation.Failed
 	if err := os.Rename(tmpPath, output); err != nil {
 		return fmt.Errorf("publish synthesized WAV: %w", err)
 	}

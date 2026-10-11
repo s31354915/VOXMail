@@ -2,6 +2,7 @@ package mailsync
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -148,6 +149,85 @@ func TestStopAccountRejectsLateSynchronization(t *testing.T) {
 	}
 	if err := service.syncAccount(context.Background(), store.Account{ID: "account-being-deleted"}, "manual"); err != store.ErrAccountDeleting {
 		t.Fatalf("late sync error = %v, want store.ErrAccountDeleting", err)
+	}
+}
+
+func TestCancelManualSyncCancelsOnlyManualRunAndReleasesAccount(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "cancel-sync.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	if err := db.CreateUser(ctx, store.User{ID: "cancel-user", Username: "cancel-user", PasswordHash: "p", PINHash: "p", Role: "user", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	box, err := secret.New("cancel-sync-test-key-with-more-than-32-characters-123456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := store.Account{ID: "cancel-account", UserID: "cancel-user", CanonicalName: "Cancel", Email: "cancel@example.com", SenderName: "Cancel", IMAPHost: "imap.example", IMAPUser: "user", IMAPPassword: "imap-password", IMAPPort: 993, SMTPHost: "smtp.example", SMTPUser: "user", SMTPPassword: "smtp-password", FolderMap: `{}`}
+	if err := db.SaveAccount(ctx, box, account); err != nil {
+		t.Fatal(err)
+	}
+	account.ConfigVersion = 1
+	root := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "started")
+	runnerPath := filepath.Join(t.TempDir(), "blocking-mbsync")
+	script := "#!/bin/sh\nprintf started > " + marker + "\nexec sleep 30\n"
+	if err := os.WriteFile(runnerPath, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	service := &Service{Store: db, Root: root, Runner: Runner{Binary: runnerPath}, EndpointResolver: func(context.Context, string, int) (string, error) { return "192.0.2.1:993", nil }}
+	startRun := func(runCtx context.Context, kind string) <-chan error {
+		result := make(chan error, 1)
+		go func() { result <- service.syncAccount(runCtx, account, kind) }()
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if service.SyncRunning(account.ID) {
+				if _, err := os.Stat(marker); err == nil {
+					return result
+				}
+			}
+			time.Sleep(time.Millisecond)
+		}
+		t.Fatal("sync worker did not reach the blocking child")
+		return result
+	}
+	manualResult := startRun(ctx, "manual")
+	canceled, err := service.CancelManualSync(ctx, account.ID)
+	if err != nil || !canceled {
+		t.Fatalf("manual cancellation=(%v,%v), want true,nil", canceled, err)
+	}
+	select {
+	case err := <-manualResult:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("manual sync result=%v, want context canceled", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("manual sync did not stop after cancellation")
+	}
+	if service.SyncRunning(account.ID) {
+		t.Fatal("manual cancellation left the account busy")
+	}
+	failed, err := db.LatestSyncRun(ctx, account.ID, false)
+	if err != nil || failed.Success || failed.FinishedAt == "" || !strings.Contains(failed.Error, "canceled") {
+		t.Fatalf("canceled sync was not durably finalized: %+v err=%v", failed, err)
+	}
+
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+	scheduledCtx, stopScheduled := context.WithCancel(ctx)
+	scheduledResult := startRun(scheduledCtx, "incremental")
+	if canceled, err := service.CancelManualSync(ctx, account.ID); err != nil || canceled {
+		t.Fatalf("scheduled cancellation=(%v,%v), want false,nil", canceled, err)
+	}
+	stopScheduled()
+	select {
+	case <-scheduledResult:
+	case <-time.After(3 * time.Second):
+		t.Fatal("scheduled sync did not stop after its parent context was canceled")
 	}
 }
 
@@ -465,5 +545,125 @@ func TestReconcileDoesNotDeleteUnknownOrSymlinkedOutsideEntries(t *testing.T) {
 	}
 	if count != 2 {
 		t.Fatalf("identity-unknown/symlink rows were removed: count=%d", count)
+	}
+}
+
+func TestSyncRefusesStaleFolderConfigurationBeforeLaunchingRunner(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "stale-folders.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.CreateUser(ctx, store.User{ID: "owner", Username: "owner", PasswordHash: "p", PINHash: "p", Role: "user", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	box, err := secret.New("sync-test-key-with-more-than-32-characters-123456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := store.Account{ID: "a", UserID: "owner", CanonicalName: "Mail", Email: "owner@example.test", SenderName: "Owner", IMAPHost: "imap.example", IMAPUser: "owner", IMAPPassword: "p", SMTPHost: "smtp.example", SMTPUser: "owner", SMTPPassword: "p", FolderMap: `{}`}
+	if err := db.SaveAccount(ctx, box, account); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := db.ListAccounts(ctx, "owner")
+	if err != nil || len(snapshot) != 1 {
+		t.Fatalf("snapshot: %+v %v", snapshot, err)
+	}
+	if _, err := db.DB.Exec(`UPDATE accounts SET config_version=config_version+1 WHERE id='a'`); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(t.TempDir(), "runner-started")
+	binary := filepath.Join(t.TempDir(), "mbsync")
+	script := "#!/bin/sh\nprintf started > '" + strings.ReplaceAll(marker, "'", "'\\''") + "'\n"
+	if err := os.WriteFile(binary, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	service := &Service{Store: db, Root: t.TempDir(), Runner: Runner{Binary: binary}, EndpointResolver: func(context.Context, string, int) (string, error) { return "8.8.8.8:993", nil }}
+	if err := service.syncAccount(ctx, snapshot[0], "incremental"); !errors.Is(err, store.ErrAccountConfigConflict) {
+		t.Fatalf("stale sync snapshot accepted: %v", err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("stale snapshot launched runner: %v", err)
+	}
+	run, err := db.LatestSyncRun(ctx, "a", false)
+	if err != nil || run.Success || !strings.Contains(run.Error, store.ErrAccountConfigConflict.Error()) {
+		t.Fatalf("stale run result not durable: %+v %v", run, err)
+	}
+	current, err := db.ListAccounts(ctx, "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.syncAccount(ctx, current[0], "incremental"); err != nil {
+		t.Fatalf("fresh configuration could not retry: %v", err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("fresh runner did not launch: %v", err)
+	}
+}
+
+func TestReconciliationRetainsLiveUIDsAcrossPhysicalRemap(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "remap.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.DB.Exec(`INSERT INTO users(id,username,password_hash,pin_hash,role,created_at) VALUES('owner','owner','p','p','user','now'); INSERT INTO accounts(id,user_id,canonical_name,email,sender_name,imap_host,imap_user,imap_password,smtp_host,smtp_user,smtp_password,folder_map,created_at) VALUES('a','owner','Mail','a@e','A','h','u','p','h','u','p','{"Alias":"After"}','now')`); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	for _, folder := range []string{"Before", "After"} {
+		if err := db.UpsertRemoteFolder(ctx, "a", "Alias", folder, ""); err != nil {
+			t.Fatal(err)
+		}
+		folderRoot := filepath.Join(root, "mail", "a", folder)
+		if err := os.MkdirAll(filepath.Join(folderRoot, "cur"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		mailPath := filepath.Join(folderRoot, "cur", "message,U=1:2,")
+		if err := os.WriteFile(mailPath, []byte("mail"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(folderRoot, ".mbsyncstate"), []byte("FarUidValidity 101\nNearUidValidity 1\nMaxPulledUid 7\nMaxPushedUid 1\n\n7 1 S\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.DB.Exec(`INSERT INTO mail_messages(account_id,folder,path,message_id,updated_at) VALUES('a',?,?, '<same@test>','now')`, folder, mailPath); err != nil {
+			t.Fatal(err)
+		}
+	}
+	folders, err := db.PhysicalFoldersForRemote(ctx, "owner", "a", "Alias")
+	if err != nil || len(folders) != 2 {
+		t.Fatalf("retained remote directories: %v %v", folders, err)
+	}
+	service := &Service{Store: db, Root: root}
+	account := store.Account{ID: "a", UserID: "owner"}
+	snapshot := map[string]struct{}{}
+	retainRemoteIdentity(snapshot, folders, remoteimap.MessageIdentity{UID: 7, UIDValidity: 101, MessageID: "<same@test>"})
+	if err := service.reconcileIndexedMessages(ctx, account, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.ListIndexedMail(ctx, "a")
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("live historical cache incorrectly removed: %+v %v", rows, err)
+	}
+	for _, row := range rows {
+		if row.UID != 7 || row.UIDValidity != 101 {
+			t.Fatalf("per-directory mbsync identity lost: %+v", row)
+		}
+		if _, err := os.Stat(row.Path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Reusing the UID in a different epoch cannot retain either old message,
+	// even when the provider reports the same Message-ID.
+	snapshot = map[string]struct{}{}
+	retainRemoteIdentity(snapshot, folders, remoteimap.MessageIdentity{UID: 7, UIDValidity: 102, MessageID: "<same@test>"})
+	if err := service.reconcileIndexedMessages(ctx, account, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = db.ListIndexedMail(ctx, "a")
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("old UIDVALIDITY incorrectly retained: %+v %v", rows, err)
 	}
 }

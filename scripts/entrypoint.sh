@@ -26,29 +26,10 @@ fi
 # baresip is spawned and supervised by the voxmail process itself, using the
 # SIP account configured in the web console (or VOXMAIL_SIP_ACCOUNT override).
 
-# Remove a stale pid file and, if it still points at a live process from an
-# earlier run, stop it so orphaned children do not outlive the entrypoint.
-if [ -f /data/run/voxmail.pid ]; then
-  stale_pid="$(cat /data/run/voxmail.pid 2>/dev/null || true)"
-  case "$stale_pid" in
-    ''|*[!0-9]*) ;;
-    *)
-      if [ -r "/proc/$stale_pid/cmdline" ] && tr '\000' ' ' < "/proc/$stale_pid/cmdline" | grep -Fq '/usr/local/bin/voxmail'; then
-        kill "$stale_pid" 2>/dev/null || true
-      fi
-      ;;
-  esac
-  rm -f /data/run/voxmail.pid
-fi
+# Older images wrote a PID into the persistent volume. It is not a process
+# identity across container restarts, so discard it without signaling that PID.
+rm -f /data/run/voxmail.pid
 
-voxmail_pid=""
-cleanup() {
-  if [ -n "$voxmail_pid" ]; then kill "$voxmail_pid" 2>/dev/null || true; fi
-  rm -f /data/run/voxmail.pid
-}
-trap cleanup INT TERM EXIT
-
-/usr/local/bin/voxmail &
-voxmail_pid=$!
-echo "$voxmail_pid" > /data/run/voxmail.pid
-wait "$voxmail_pid"
+# Keep the application as the container's foreground process so Docker (or
+# Compose's init process) delivers signals directly and waits for its shutdown.
+exec /usr/local/bin/voxmail

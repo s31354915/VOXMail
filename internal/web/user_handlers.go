@@ -75,7 +75,7 @@ func (s *Server) deleteUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID := r.PathValue("id")
-	accounts, err := s.Store.ListAccounts(r.Context(), userID)
+	accounts, err := s.Store.AccountIDsForDeletion(r.Context(), userID)
 	if err != nil {
 		serverError(w, err)
 		return
@@ -84,8 +84,8 @@ func (s *Server) deleteUser(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "mail synchronization cannot be stopped safely")
 		return
 	} else if coordinator != nil {
-		for _, account := range accounts {
-			if err := coordinator.StopAccount(r.Context(), account.ID); err != nil {
+		for _, accountID := range accounts {
+			if err := coordinator.StopAccount(r.Context(), accountID); err != nil {
 				serverError(w, err)
 				return
 			}
@@ -93,8 +93,8 @@ func (s *Server) deleteUser(w http.ResponseWriter, r *http.Request) {
 	}
 	s.invalidateDeletedUserCalls(userID)
 	cleanupPending := false
-	for _, account := range accounts {
-		pending, err := s.deleteAccountData(r.Context(), userID, account.ID, false)
+	for _, accountID := range accounts {
+		pending, err := s.deleteAccountData(r.Context(), userID, accountID, false)
 		if err != nil {
 			serverError(w, err)
 			return

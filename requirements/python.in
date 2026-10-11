@@ -1,0 +1,5 @@
+# Runtime roots. Regenerate python.lock inside the pinned Python 3.11 base.
+piper-tts==1.3.0
+setuptools==84.0.0
+jaraco.context==6.1.2
+wheel==0.48.0

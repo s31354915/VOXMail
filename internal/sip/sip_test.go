@@ -2,6 +2,7 @@ package sip
 
 import (
 	"context"
+	"github.com/voxmail/voxmail/internal/operation"
 	"net"
 	"os"
 	"path/filepath"
@@ -9,9 +10,55 @@ import (
 	"testing"
 	"time"
 
+	"github.com/voxmail/voxmail/internal/maintenance"
 	"github.com/voxmail/voxmail/internal/secret"
 	"github.com/voxmail/voxmail/internal/store"
 )
+
+func TestSupervisedChildProtectsAudioUntilItHasExited(t *testing.T) {
+	root := t.TempDir()
+	audio := filepath.Join(root, "run", "voxmail")
+	if err := os.MkdirAll(audio, 0700); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(root, "audio-child.sh")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nprintf capture > \"$VOXMAIL_AUDIO_DIR/active.rx.pcm\"\nexec sleep 30\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	b := &Baresip{Binary: binary, AudioDir: audio, enabled: true}
+	b.mu.Lock()
+	err := b.startLocked(context.Background())
+	b.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Stop()
+	path := filepath.Join(audio, "active.rx.pcm")
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("child did not create its recording")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	now := time.Now().Add(48 * time.Hour)
+	if _, err := maintenance.CleanupEphemeral(root, now, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal("maintenance removed a running child's capture", err)
+	}
+	b.Stop()
+	if _, err := maintenance.CleanupEphemeral(root, now, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("child exit did not release abandoned audio", err)
+	}
+}
 
 func TestBaresipProcessOutlivesApplyContext(t *testing.T) {
 	dir := t.TempDir()
@@ -77,12 +124,12 @@ func TestBaresipStatusSeparatesProcessAndRegistration(t *testing.T) {
 	}
 	b.SetRegistrationState("failed", "401 Unauthorized")
 	status = b.Status()
-	if status.Registration != RegistrationFailed || status.LastError != "401 Unauthorized" {
+	if status.Registration != RegistrationFailed || status.LastError != "401 Unauthorized" || status.ErrorCategory != "authentication" || status.ResponseCode != 401 {
 		t.Fatalf("failed registration status=%+v", status)
 	}
 	b.SetRegistrationState("registered", "")
 	status = b.Status()
-	if status.Process != ProcessRunning || status.Registration != RegistrationRegistered || status.LastError != "" {
+	if status.Process != ProcessRunning || status.Registration != RegistrationRegistered || status.LastError != "" || status.ErrorCategory != "" || status.ResponseCode != 0 {
 		t.Fatalf("registered status=%+v", status)
 	}
 	b.SetRegistrationState("not-a-real-phase", "should be ignored")
@@ -97,6 +144,47 @@ func TestBaresipStopWithoutChildReportsDisabled(t *testing.T) {
 	status := b.Status()
 	if status.Enabled || status.Process != ProcessDisabled || status.Registration != RegistrationDisabled {
 		t.Fatalf("stopped status=%+v", status)
+	}
+}
+
+func TestOfflineModeOverridesRestoredAndEnvironmentSIPEnablement(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "baresip-started")
+	binary := filepath.Join(dir, "fake-baresip.sh")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\ntouch \"$MARKER\"\nexec sleep 5\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MARKER", marker)
+	t.Setenv("VOXMAIL_OFFLINE_MODE", "1")
+	t.Setenv("VOXMAIL_ENABLE_CALLS", "1")
+	t.Setenv("VOXMAIL_SIP_ACCOUNT", "<sip:restored@example.test>;auth_user=restored;auth_pass=secret")
+	db, err := store.Open(filepath.Join(dir, "restored.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	box, err := secret.New("test-key-with-more-than-32-characters-123456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertSIP(context.Background(), box, store.SIPSettings{
+		Domain: "provider.example.test", Username: "restored", Password: "restored-secret", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	b := &Baresip{
+		Binary: binary, ConfigDir: filepath.Join(dir, "config"),
+		ControlSocket: filepath.Join(dir, "baresip.sock"), Store: db, Secrets: box,
+	}
+	if err := b.Apply(context.Background()); err != nil {
+		t.Fatalf("Apply in offline mode: %v", err)
+	}
+	status := b.Status()
+	if status.Enabled || status.Process != ProcessDisabled || b.AccountLine() != "" {
+		t.Fatalf("offline SIP status=%+v account=%q", status, b.AccountLine())
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("offline mode launched Baresip: stat marker error=%v", err)
 	}
 }
 
@@ -400,28 +488,6 @@ func TestAccountParamOnlyQuotesValuesThatNeedIt(t *testing.T) {
 	}
 }
 
-func TestBaresipRotatesOversizedLog(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "baresip.log")
-	if err := os.WriteFile(path, []byte("old log"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	b := &Baresip{LogPath: path, LogMaxBytes: 4}
-	if err := b.rotateLogIfNeeded(); err != nil {
-		t.Fatal(err)
-	}
-	rotated, err := os.ReadFile(path + ".1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(rotated) != "old log" {
-		t.Fatalf("rotated log=%q, want old log", rotated)
-	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("original log still exists: %v", err)
-	}
-}
-
 func TestEnvSettingsOverrides(t *testing.T) {
 	t.Setenv("VOXMAIL_SIP_USERNAME", "envuser")
 	t.Setenv("VOXMAIL_SIP_PASSWORD", "envpass")
@@ -458,5 +524,25 @@ func TestEnvSettingsLeavesDefaults(t *testing.T) {
 	base := store.SIPSettings{Username: "alice", Password: "pw", Domain: "sip.example.com"}
 	if out := envSettings(base); out.Username != "alice" || out.Password != "pw" || out.Domain != "sip.example.com" {
 		t.Fatalf("empty env vars clobbered settings: %+v", out)
+	}
+}
+
+func TestRegistrationFailureClassifiesOnlyNativeResponseCode(t *testing.T) {
+	for _, tc := range []struct {
+		reason   string
+		category operation.Category
+		code     int
+	}{
+		{"403 password=secret", operation.Authentication, 403},
+		{"504 timeout", operation.Timeout, 504},
+		{"404 unknown", operation.SIPAccount, 404},
+		{"503 authentication failed TLS timeout", operation.Protocol, 503},
+		{"password=secret authentication failed", operation.Protocol, 0},
+		{"999 unknown", operation.Protocol, 0},
+	} {
+		category, code := registrationFailure(tc.reason)
+		if category != string(tc.category) || code != tc.code {
+			t.Fatalf("%q: category=%s code=%d", tc.reason, category, code)
+		}
 	}
 }

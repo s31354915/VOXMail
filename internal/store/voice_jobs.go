@@ -61,6 +61,15 @@ func (s *Store) VoiceInstallJob(ctx context.Context, id string) (VoiceInstallJob
 	return job, err
 }
 
+// ActiveVoiceInstallJob returns the deployment's in-flight installation, if
+// one exists. The worker is serialized, so at most one row can be active.
+func (s *Store) ActiveVoiceInstallJob(ctx context.Context) (VoiceInstallJob, error) {
+	var job VoiceInstallJob
+	err := s.DB.QueryRowContext(ctx, `SELECT id,user_id,voice,stage,status,progress,error,created_at,updated_at FROM voice_install_jobs WHERE status IN ('queued','running') ORDER BY created_at DESC,id DESC LIMIT 1`).
+		Scan(&job.ID, &job.UserID, &job.Voice, &job.Stage, &job.Status, &job.Progress, &job.Error, &job.CreatedAt, &job.UpdatedAt)
+	return job, err
+}
+
 // MarkInterruptedVoiceInstallJobs converts work that was in flight when the
 // process died into an explicit terminal state. New workers must be started by
 // a fresh request; silently resuming a partially downloaded/activated model
@@ -80,6 +89,6 @@ func (s *Store) PurgeVoiceInstallJobs(ctx context.Context, cutoff time.Time) err
 	if cutoff.IsZero() {
 		return fmt.Errorf("voice job cutoff is required")
 	}
-	_, err := s.DB.ExecContext(ctx, `DELETE FROM voice_install_jobs WHERE status IN ('complete','failed') AND updated_at < ?`, cutoff.UTC().Format(time.RFC3339Nano))
+	_, err := s.DB.ExecContext(ctx, `DELETE FROM voice_install_jobs WHERE id IN (SELECT id FROM voice_install_jobs WHERE status IN ('complete','failed') AND updated_at < ? LIMIT ?)`, cutoff.UTC().Format(time.RFC3339Nano), MaintenanceBatchRows)
 	return err
 }

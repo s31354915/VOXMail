@@ -1,11 +1,12 @@
 package speech
 
 import (
-	"bytes"
 	"context"
 	"fmt"
+	"github.com/voxmail/voxmail/internal/maintenance"
+	"github.com/voxmail/voxmail/internal/operation"
+	"github.com/voxmail/voxmail/internal/process"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -25,10 +26,11 @@ func (p Piper) Warm(ctx context.Context, dir string) error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, ".warm-*.wav")
+	tmp, releaseTmp, err := maintenance.CreateTemp(dir, ".warm-*.wav")
 	if err != nil {
 		return err
 	}
+	defer releaseTmp()
 	path := tmp.Name()
 	_ = tmp.Close()
 	defer os.Remove(path)
@@ -52,7 +54,9 @@ func (w Whisper) TranscribeAndRemove(ctx context.Context, wav string) (text stri
 	return w.Transcribe(ctx, wav)
 }
 
-func (w Whisper) Transcribe(ctx context.Context, wav string) (string, error) {
+func (w Whisper) Transcribe(ctx context.Context, wav string) (_ string, retErr error) {
+	stage, category := "settings", operation.Configuration
+	defer func() { retErr = operation.Wrap("whisper", stage, category, retErr) }()
 	if wav == "" {
 		return "", fmt.Errorf("audio file is required")
 	}
@@ -63,16 +67,19 @@ func (w Whisper) Transcribe(ctx context.Context, wav string) (string, error) {
 		return "", fmt.Errorf("whisper model is required")
 	}
 	args := []string{"-m", w.Model, "-f", wav, "--no-prints"}
-	command := exec.CommandContext(ctx, w.Binary, args...)
-	var stdout, stderr bytes.Buffer
-	command.Stdout = &stdout
-	command.Stderr = &stderr
+	stage, category = "transcribe", operation.Failed
+	command := process.New(ctx, "whisper", w.Binary, process.WhisperTimeout, args...)
+	stdout := process.NewBuffer(process.MaxOutput)
+	command.Stdout = stdout
 	if err := command.Run(); err != nil {
-		return "", fmt.Errorf("whisper: %w: %s", err, strings.TrimSpace(stderr.String()))
+		return "", fmt.Errorf("whisper: %w: %s", err, strings.TrimSpace(command.StderrText()))
+	}
+	if stdout.Truncated() {
+		return "", operation.Wrap("whisper", "output", operation.ResourceLimit, fmt.Errorf("whisper transcription exceeds output limit"))
 	}
 	text := strings.TrimSpace(stdout.String())
 	if text == "" {
-		return "", fmt.Errorf("whisper returned empty transcription")
+		return "", operation.Wrap("whisper", "output", operation.Protocol, fmt.Errorf("whisper returned empty transcription"))
 	}
 	return text, nil
 }

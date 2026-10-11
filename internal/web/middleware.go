@@ -4,10 +4,48 @@ import (
 	"net"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/voxmail/voxmail/internal/store"
 )
+
+// requireOnline is the manual-operation half of the offline contract. Worker
+// suppression alone must not allow HTTP requests to dial restored providers.
+func (s *Server) requireOnline(w http.ResponseWriter, operation string) bool {
+	if s.OfflineMode {
+		writeError(w, http.StatusServiceUnavailable, operation+" is unavailable in offline mode")
+		return false
+	}
+	return true
+}
+
+func (s *Server) shuttingDown() bool {
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
+	return s.closing
+}
+
+func (s *Server) withAdmission(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.admissionMu.Lock()
+		if s.closing {
+			s.admissionMu.Unlock()
+			// These two handlers do not touch external/shared dependencies when
+			// closing and therefore cannot extend the request join indefinitely.
+			if r.URL.Path == "/healthz" {
+				s.health(w, r)
+			} else if r.URL.Path == "/readyz" {
+				s.ready(w, r)
+			} else {
+				writeError(w, http.StatusServiceUnavailable, "server is shutting down")
+			}
+			return
+		}
+		s.requestWG.Add(1)
+		s.admissionMu.Unlock()
+		defer s.requestWG.Done()
+		next.ServeHTTP(w, r)
+	})
+}
 
 func (s *Server) require(w http.ResponseWriter, r *http.Request, write bool) (store.User, bool) {
 	token := sessionToken(r)
@@ -59,75 +97,20 @@ func (s *Server) requireAlerts(w http.ResponseWriter, r *http.Request, write boo
 	return u, true
 }
 
-func (s *Server) issueSession(w http.ResponseWriter, r *http.Request, userID string) {
-	token := newID()
-	csrf := newID()
-	s.Sessions.Put(token, Session{UserID: userID, CSRF: csrf, Expires: time.Now().Add(12 * time.Hour)})
-	secure := r.TLS != nil || (s.trustedProxy(r) && strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https"))
-	http.SetCookie(w, &http.Cookie{Name: "voxmail_session", Value: token, Path: "/", HttpOnly: true, Secure: secure, SameSite: http.SameSiteStrictMode, MaxAge: 43200})
-	w.Header().Set("X-CSRF-Token", csrf)
+func (s *Server) issueSession(w http.ResponseWriter, r *http.Request, userID string) bool {
+	grant, ok := s.reserveSession(w, userID)
+	if !ok {
+		return false
+	}
+	return grant.commit(w, r)
 }
+
 func sessionToken(r *http.Request) string {
 	c, err := r.Cookie("voxmail_session")
 	if err != nil {
 		return ""
 	}
 	return c.Value
-}
-func (s *SessionStore) Put(token string, session Session) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.byToken[token] = session
-	s.reapLocked()
-}
-func (s *SessionStore) Get(token string) (Session, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	session, ok := s.byToken[token]
-	if !ok || time.Now().After(session.Expires) {
-		delete(s.byToken, token)
-		return Session{}, false
-	}
-	s.reapLocked()
-	return session, true
-}
-func (s *SessionStore) Delete(token string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.byToken, token)
-}
-
-func (s *SessionStore) DeleteUser(userID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for token, session := range s.byToken {
-		if session.UserID == userID {
-			delete(s.byToken, token)
-		}
-	}
-}
-func (s *SessionStore) reapLocked() {
-	if len(s.byToken) < 256 || time.Since(s.lastReap) < time.Minute {
-		return
-	}
-	s.lastReap = time.Now()
-	now := time.Now()
-	for token, session := range s.byToken {
-		if now.After(session.Expires) {
-			delete(s.byToken, token)
-		}
-	}
-}
-
-func (s *Server) loginBlocked(key string) time.Duration {
-	s.loginMu.Lock()
-	defer s.loginMu.Unlock()
-	s.reapLoginsLocked()
-	state := s.logins[key]
-	if time.Now().Before(state.Until) {
-		return time.Until(state.Until)
-	}
-	return 0
 }
 
 // loginKeys is retained as the direct-connection helper used by unit tests.
@@ -143,7 +126,7 @@ func loginKeysForHost(host, username string) []string {
 		host = "unknown"
 	}
 	name := strings.ToLower(strings.TrimSpace(username))
-	return []string{host + "|*", host + "|" + name}
+	return []string{"source:" + host, "pair:" + host + "|" + name}
 }
 
 func remoteHost(remoteAddr string) string {
@@ -211,40 +194,6 @@ func (s *Server) clientHost(r *http.Request) string {
 	return host
 }
 
-func (s *Server) loginFailure(key string) {
-	s.loginMu.Lock()
-	defer s.loginMu.Unlock()
-	s.reapLoginsLocked()
-	if s.logins == nil {
-		s.logins = make(map[string]loginState)
-	}
-	state := s.logins[key]
-	state.Failures++
-	state.Seen = time.Now()
-	if state.Failures >= 5 {
-		state.Until = time.Now().Add(5 * time.Minute)
-		state.Failures = 0
-	}
-	s.logins[key] = state
-}
-
-func (s *Server) loginSuccess(key string) {
-	s.loginMu.Lock()
-	defer s.loginMu.Unlock()
-	delete(s.logins, key)
-}
-
-func (s *Server) reapLoginsLocked() {
-	if len(s.logins) < 256 {
-		return
-	}
-	cutoff := time.Now().Add(-1 * time.Hour)
-	for key, state := range s.logins {
-		if state.Seen.Before(cutoff) && !time.Now().Before(state.Until) {
-			delete(s.logins, key)
-		}
-	}
-}
 func publicUser(u store.User) map[string]any {
 	return map[string]any{"id": u.ID, "username": u.Username, "role": u.Role, "enabled": u.Enabled, "two_factor_enabled": u.TOTPSecret != ""}
 }

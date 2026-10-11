@@ -5,9 +5,10 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"github.com/voxmail/voxmail/internal/maintenance"
+	"github.com/voxmail/voxmail/internal/process"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -87,18 +88,23 @@ func (p *PromptPlayer) PlayWithRuntimeForUser(ctx context.Context, runtime *spee
 
 	if runtime != nil && strings.TrimSpace(userID) != "" {
 		if cached, ok := p.dynamicPromptPath(userID, runtime, text); ok {
+			releaseCached := maintenance.Protect(cached)
 			if _, err := os.Stat(cached); err == nil {
-				return p.playWAV(ctx, fifo, cached)
+				err := p.playWAV(ctx, fifo, cached)
+				releaseCached()
+				return err
 			}
+			releaseCached()
 		}
 	}
 	if err := os.MkdirAll(p.Dir, 0700); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(p.Dir, ".prompt-*.wav")
+	tmp, releaseTmp, err := maintenance.CreateTemp(p.Dir, ".prompt-*.wav")
 	if err != nil {
 		return err
 	}
+	defer releaseTmp()
 	wav := tmp.Name()
 	_ = tmp.Close()
 	defer os.Remove(wav)
@@ -108,6 +114,8 @@ func (p *PromptPlayer) PlayWithRuntimeForUser(ctx context.Context, runtime *spee
 		}
 		if strings.TrimSpace(userID) != "" {
 			if cached, ok := p.dynamicPromptPath(userID, runtime, text); ok {
+				releaseCached := maintenance.Protect(cached)
+				defer releaseCached()
 				if err := p.activateDynamicPrompt(wav, cached); err == nil {
 					p.pruneDynamicPrompts()
 					return p.playWAV(ctx, fifo, cached)
@@ -178,27 +186,31 @@ func (p *PromptPlayer) pruneDynamicPrompts() {
 		}
 		path := filepath.Join(root, entry.Name())
 		if time.Since(info.ModTime()) > dynamicPromptMaxAge {
-			_ = os.Remove(path)
-			continue
+			if removed, _ := maintenance.RemoveIfUnowned(path); removed {
+				continue
+			}
 		}
 		files = append(files, promptFile{path: path, modTime: info.ModTime(), size: info.Size()})
 		total += info.Size()
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].modTime.Before(files[j].modTime) })
-	for len(files) > maxDynamicPromptFiles || total > maxDynamicPromptBytes {
+	retained := len(files)
+	for retained > maxDynamicPromptFiles || total > maxDynamicPromptBytes {
 		if len(files) == 0 {
 			break
 		}
 		oldest := files[0]
 		files = files[1:]
-		total -= oldest.size
-		_ = os.Remove(oldest.path)
+		if removed, _ := maintenance.RemoveIfUnowned(oldest.path); removed {
+			total -= oldest.size
+			retained--
+		}
 	}
 }
 
-// PruneDynamicPrompts performs the bounded cache cleanup during startup as
-// well as after synthesis, so a deployment that receives no calls still
-// removes expired generated speech.
+// PruneDynamicPrompts applies cache age and quota cleanup during startup and
+// after synthesis. The maintenance worker independently expires idle cache
+// in bounded periodic passes, including when no calls arrive.
 func (p *PromptPlayer) PruneDynamicPrompts() {
 	p.pruneDynamicPrompts()
 }
@@ -211,10 +223,11 @@ func (p *PromptPlayer) activateDynamicPrompt(source, destination string) error {
 	if err := os.MkdirAll(filepath.Dir(destination), 0700); err != nil {
 		return err
 	}
-	stage, err := os.CreateTemp(filepath.Dir(destination), ".dynamic-*.wav")
+	stage, releaseStage, err := maintenance.CreateTemp(filepath.Dir(destination), ".dynamic-*.wav")
 	if err != nil {
 		return err
 	}
+	defer releaseStage()
 	stagePath := stage.Name()
 	defer os.Remove(stagePath)
 	data, err := os.ReadFile(source)
@@ -399,6 +412,8 @@ func (p *PromptPlayer) PlayMedia(ctx context.Context, fifo, input string) error 
 }
 
 func (p *PromptPlayer) playWAV(ctx context.Context, fifo, wav string) error {
+	release := maintenance.Protect(wav)
+	defer release()
 	return p.playInput(ctx, fifo, wav)
 }
 
@@ -410,7 +425,7 @@ func (p *PromptPlayer) playInput(ctx context.Context, fifo, input string) error 
 	if binary == "" {
 		binary = "ffmpeg"
 	}
-	const maxPlaybackDuration = 10 * time.Minute
+	const maxPlaybackDuration = process.PlaybackTimeout
 	mediaCtx, cancel := context.WithTimeout(ctx, maxPlaybackDuration)
 	defer cancel()
 	pipe, err := openPCMWriter(mediaCtx, fifo)
@@ -418,7 +433,7 @@ func (p *PromptPlayer) playInput(ctx context.Context, fifo, input string) error 
 		return err
 	}
 	defer pipe.Close()
-	cmd := exec.CommandContext(mediaCtx, binary, "-nostdin", "-i", input, "-vn", "-ar", "8000", "-ac", "1", "-f", "s16le", "pipe:1")
+	cmd := process.New(mediaCtx, "ffmpeg", binary, 0, "-nostdin", "-i", input, "-vn", "-ar", "8000", "-ac", "1", "-f", "s16le", "pipe:1")
 	cmd.Stdout = &pcmLimitWriter{w: pipe, max: 8_000 * 2 * 600}
 	if err := cmd.Run(); err != nil {
 		if mediaCtx.Err() != nil {

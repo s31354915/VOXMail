@@ -5,18 +5,20 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strconv"
-	"sync"
 	"syscall"
 	"time"
 
 	"github.com/voxmail/voxmail/internal/alerts"
 	"github.com/voxmail/voxmail/internal/calls"
 	"github.com/voxmail/voxmail/internal/config"
+	"github.com/voxmail/voxmail/internal/diagnostics"
+	"github.com/voxmail/voxmail/internal/lifecycle"
 	"github.com/voxmail/voxmail/internal/mailindex"
 	"github.com/voxmail/voxmail/internal/mailsync"
 	"github.com/voxmail/voxmail/internal/maintenance"
@@ -115,10 +117,11 @@ func (v *voiceActivator) PreviewVoice(ctx context.Context, name string, speed in
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
 	}
-	tmp, err := os.CreateTemp(dir, ".preview-*.wav")
+	tmp, releaseTmp, err := maintenance.CreateTemp(dir, ".preview-*.wav")
 	if err != nil {
 		return nil, err
 	}
+	defer releaseTmp()
 	path := tmp.Name()
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(path)
@@ -133,13 +136,14 @@ func (v *voiceActivator) PreviewVoice(ctx context.Context, name string, speed in
 
 func main() {
 	const shutdownBudget = 45 * time.Second
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	// Install signal handling before any startup work that can launch a child
-	// process. Model provisioning and static prompt generation are both
-	// context-aware; registering NotifyContext only after they finish would
-	// leave SIGTERM with Go's default immediate-exit behavior during startup.
-	appContext, stopApp := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stopApp()
+	log := slog.New(slog.NewJSONHandler(os.Stdout, diagnostics.HandlerOptions()))
+	slog.SetDefault(log)
+	// Install signal handling before startup work so model provisioning and
+	// prompt generation can be interrupted. The long-lived runtime context is
+	// separate: shutdown must keep the SIP bridge alive long enough to hang up
+	// active calls before it stops Baresip.
+	signalContext, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stopSignals()
 	cfg, err := config.Load()
 	if err != nil {
 		log.Error("invalid configuration", "error", err)
@@ -156,18 +160,20 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	if report, cleanupErr := maintenance.CleanupEphemeral(cfg.DataDir, time.Now().UTC(), maintenance.DefaultEphemeralMaxAge); cleanupErr != nil {
+	fileCleanupCtx, fileCleanupCancel := context.WithTimeout(signalContext, maintenance.DefaultPassTimeout)
+	if report, cleanupErr := maintenance.CleanupEphemeralContext(fileCleanupCtx, cfg.DataDir, time.Now().UTC(), maintenance.DefaultEphemeralMaxAge); cleanupErr != nil {
 		log.Warn("ephemeral artifact cleanup failed", "error", cleanupErr)
 	} else if report.RemovedFiles > 0 {
 		log.Info("removed abandoned ephemeral artifacts", "files", report.RemovedFiles, "bytes", report.RemovedBytes)
 	}
+	fileCleanupCancel()
 	if usage, diskErr := maintenance.StatDisk(cfg.DataDir); diskErr != nil {
 		log.Warn("could not inspect data filesystem capacity", "error", diskErr)
 	} else if usage.FreeBytes < 1<<30 {
 		log.Warn("data filesystem is low on free space", "free_bytes", usage.FreeBytes, "total_bytes", usage.TotalBytes)
 	}
-	if provision, _ := strconv.ParseBool(os.Getenv("VOXMAIL_PROVISION_MODELS")); provision {
-		modelContext, cancel := context.WithTimeout(appContext, 30*time.Minute)
+	if provision, _ := strconv.ParseBool(os.Getenv("VOXMAIL_PROVISION_MODELS")); provision && !cfg.OfflineMode {
+		modelContext, cancel := context.WithTimeout(signalContext, 30*time.Minute)
 		if err := speech.Provision(modelContext, cfg.VoiceDir, cfg.STTModel); err != nil {
 			cancel()
 			log.Error("model provisioning failed", "error", err)
@@ -179,7 +185,7 @@ func main() {
 	promptDir := filepath.Join(cfg.DataDir, "prompts")
 	mainMenuPath := filepath.Join(promptDir, "main-menu.wav")
 	manifestPath := filepath.Join(promptDir, "static-prompts.json")
-	promptContext, promptCancel := context.WithTimeout(appContext, 5*time.Minute)
+	promptContext, promptCancel := context.WithTimeout(signalContext, 5*time.Minute)
 	staticManifest, promptErr := speech.PrepareStaticPrompts(promptContext, speech.Piper{Binary: cfg.PiperBinary, Model: piperModel}, cfg.GreetingPath, mainMenuPath, manifestPath)
 	promptCancel()
 	if promptErr != nil {
@@ -208,7 +214,15 @@ func main() {
 		log.Error("cannot open database", "error", err)
 		os.Exit(1)
 	}
-	securityCleanupCtx, securityCleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	securityCleanupCtx, securityCleanupCancel := context.WithTimeout(signalContext, maintenance.DefaultPassTimeout)
+	if interrupted, cleanupErr := db.InterruptSyncRuns(securityCleanupCtx); cleanupErr != nil {
+		log.Error("cannot finalize interrupted synchronization runs", "error", cleanupErr)
+		securityCleanupCancel()
+		_ = db.Close()
+		os.Exit(1)
+	} else if interrupted > 0 {
+		log.Info("finalized interrupted synchronization runs", "runs", interrupted)
+	}
 	if cleanupErr := db.PruneEphemeral(securityCleanupCtx, time.Now().UTC()); cleanupErr != nil {
 		log.Warn("ephemeral security-row cleanup failed", "error", cleanupErr)
 	}
@@ -227,6 +241,7 @@ func main() {
 		AudioDir:      filepath.Join(cfg.DataDir, "run", "voxmail"),
 		LogPath:       filepath.Join(cfg.DataDir, "logs", "baresip.log"),
 		MaxCalls:      cfg.MaxCalls,
+		Offline:       cfg.OfflineMode,
 		Store:         db,
 		Secrets:       secrets,
 		Log:           log,
@@ -271,7 +286,6 @@ func main() {
 	alertService := &alerts.Service{Store: db, Bridge: bridgeService, Log: log}
 	voiceService := &voiceActivator{VoiceDir: cfg.VoiceDir, PiperBinary: cfg.PiperBinary, PromptDir: promptDir, GreetingPath: cfg.GreetingPath, MainPath: mainMenuPath, ManifestPath: manifestPath, Player: promptPlayer}
 	var syncService *mailsync.Service
-	sipBridge.SetLifetime(appContext)
 	runtimeStatus := func(ctx context.Context) web.RuntimeStatus {
 		sipStatus := sipBridge.Status()
 		bridgeState := "disconnected"
@@ -287,9 +301,15 @@ func main() {
 				}
 			}
 		}
-		return web.RuntimeStatus{Process: sipStatus.Process, Bridge: bridgeState, Registration: sipStatus.Registration, Media: mediaState}
+		return web.RuntimeStatus{Process: sipStatus.Process, Bridge: bridgeState, Registration: sipStatus.Registration, Media: mediaState, LastError: sipStatus.LastError, ErrorCategory: sipStatus.ErrorCategory, ResponseCode: sipStatus.ResponseCode}
 	}
-	webApp := &web.Server{Store: db, Secrets: secrets, Log: log, SIP: sipBridge, Alerts: alertService, Voice: voiceService, Preview: voiceService, Calls: bridgeService, DataRoot: cfg.DataDir, VoiceDir: cfg.VoiceDir, TrustedProxyCIDRs: cfg.TrustedProxyCIDRs, RuntimeStatus: runtimeStatus, Ready: func(ctx context.Context) error {
+	voiceInstaller := speech.AdministratorVoiceInstaller{Validate: func(ctx context.Context, model string) error {
+		return (speech.Piper{Binary: cfg.PiperBinary, Model: model}).Warm(ctx, filepath.Join(cfg.DataDir, "run", "speech"))
+	}}
+	webApp := &web.Server{VoiceInstaller: voiceInstaller, Store: db, Secrets: secrets, Log: log, SIP: sipBridge, Alerts: alertService, Voice: voiceService, Preview: voiceService, Calls: bridgeService, DataRoot: cfg.DataDir, VoiceDir: cfg.VoiceDir, OfflineMode: cfg.OfflineMode, TrustedProxyCIDRs: cfg.TrustedProxyCIDRs, RuntimeStatus: runtimeStatus, Ready: func(ctx context.Context) error {
+		if cfg.OfflineMode {
+			return nil
+		}
 		if sipBridge.Enabled() {
 			sipStatus := sipBridge.Status()
 			if sipStatus.Process != sip.ProcessRunning {
@@ -315,69 +335,95 @@ func main() {
 		}
 		return nil
 	}}
-	// Voice installation and static prompt regeneration can legitimately take
-	// several minutes on a fresh volume.  The settings handler has a 30-minute
-	// operation context, so a 30-second server write deadline would close the
-	// connection while the operation is still succeeding.
-	server := &http.Server{Addr: cfg.HTTPAddr, Handler: webApp.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 35 * time.Minute, IdleTimeout: 60 * time.Second}
-	indexer := &mailindex.Indexer{Store: db}
+	// Long sync, installation and preview work runs in tracked background jobs.
+	// The HTTP write budget accommodates the remaining bounded provider checks
+	// and SMTP submission without tying mailbox size to a connection deadline.
+	application := lifecycle.NewApplication(signalContext, cfg.OfflineMode)
+	defer application.StopRuntime()
+	webApp.JobContext = application.WorkerContext()
+	// Shutdown cancels in-flight HTTP operations such as manual synchronization
+	// while the call bridge remains available to send hangup commands.
+	server := &http.Server{Addr: cfg.HTTPAddr, Handler: webApp.Handler(), BaseContext: func(net.Listener) context.Context { return application.WorkerContext() }, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 90 * time.Second, IdleTimeout: 60 * time.Second}
+	indexer := &mailindex.Indexer{Store: db, Log: log}
 	syncService = &mailsync.Service{Store: db, Root: cfg.DataDir, QuarantineRoot: filepath.Join(cfg.DataDir, "quarantine"), Runner: mailsync.Runner{}, Index: indexer, Secrets: secrets, Log: log, EndpointResolver: mailsync.CheckPublicIMAPEndpoint}
-	bridgeService.Refresher = syncService
-	webApp.Sync = syncService
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := syncService.Run(appContext); err != nil && !errors.Is(err, context.Canceled) {
+	if !cfg.OfflineMode {
+		bridgeService.Refresher = syncService
+		webApp.Sync = syncService
+	}
+	sipBridge.SetLifetime(application.RuntimeContext())
+	application.Start(lifecycle.LocalWorker, func(ctx context.Context) {
+		if err := webApp.RunAccountCleanup(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Error("account cleanup stopped", "error", err)
+		}
+	})
+	artifactCleaner, cleanerErr := maintenance.NewCleaner(cfg.DataDir, maintenance.DefaultEphemeralMaxAge)
+	if cleanerErr != nil {
+		log.Error("cannot initialize periodic maintenance", "error", cleanerErr)
+	} else {
+		retention := &maintenance.Worker{Store: db, Files: artifactCleaner, Log: log, Policy: store.HistoryRetentionPolicy{
+			MaxAge:  time.Duration(cfg.HistoryRetentionDays) * 24 * time.Hour,
+			MaxRows: cfg.HistoryMaxRows,
+		}}
+		application.Start(lifecycle.LocalWorker, func(ctx context.Context) {
+			if err := retention.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				log.Warn("periodic maintenance stopped", "error", err)
+			}
+		})
+	}
+	application.Start(lifecycle.ProviderWorker, func(ctx context.Context) {
+		if err := syncService.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Error("sync service stopped", "error", err)
 		}
-	}()
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := alertService.Run(appContext); err != nil && !errors.Is(err, context.Canceled) {
-			log.Error("alert service stopped", "error", err)
+	})
+	application.Start(lifecycle.ProviderWorker, func(ctx context.Context) {
+		if err := alertService.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Error("alerts service stopped", "error", err)
 		}
-	}()
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := sipBridge.Apply(appContext); err != nil {
+	})
+	application.Start(lifecycle.CallBridgeWorker, func(ctx context.Context) {
+		if err := sipBridge.Apply(ctx); err != nil {
 			log.Warn("baresip did not start", "error", err)
 		}
-		if err := bridgeService.Run(appContext); err != nil && !errors.Is(err, context.Canceled) {
+		if err := bridgeService.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Warn("call bridge stopped", "error", err)
 		}
-	}()
+	})
 	serverFailed := make(chan error, 1)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	application.Start(lifecycle.LocalWorker, func(context.Context) {
 		log.Info("web server listening", "addr", cfg.HTTPAddr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("web server stopped", "error", err)
 			serverFailed <- err
-			stopApp()
+			stopSignals()
 		}
-	}()
+	})
 
-	<-appContext.Done()
+	<-signalContext.Done()
 	// Cancel long-running web jobs before stopping the HTTP listener. The
 	// server protects voice-job admission so this cannot race its wait group.
 	webApp.BeginShutdown()
+	application.BeginShutdown()
 	shutdown, shutdownCancel := context.WithTimeout(context.Background(), shutdownBudget)
 	defer shutdownCancel()
+	if !cfg.OfflineMode {
+		callDrain, callDrainCancel := context.WithTimeout(shutdown, 5*time.Second)
+		if err := bridgeService.Drain(callDrain); err != nil {
+			log.Warn("active calls did not drain before shutdown", "error", err)
+		}
+		callDrainCancel()
+	}
 	if err := server.Shutdown(shutdown); err != nil {
 		log.Error("graceful shutdown failed", "error", err)
+		_ = server.Close()
 	}
 	// Stop accepting HTTP work before cancelling and awaiting jobs started by
 	// handlers. This ordering prevents a voice-install request from racing
 	// Server.Close's WaitGroup and ensures its final status update lands before
 	// the database is closed.
 	webApp.Close()
+	application.StopRuntime()
 	sipBridge.Stop()
-	wg.Wait()
+	application.Wait()
 	alertService.Wait()
 	bridgeService.StopTasks()
 	bridgeService.Wait()

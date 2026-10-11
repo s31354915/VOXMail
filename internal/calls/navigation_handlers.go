@@ -2,7 +2,9 @@ package calls
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -576,46 +578,96 @@ func (s *Service) refreshAccount(sess *session, accountID string) {
 }
 
 func (s *Service) openAccountFolders(sess *session, account store.Account) {
-	folders, err := s.Store.ListMailFolders(s.baseContext(), sess.UserID, account.ID)
+	ctx := s.baseContext()
+	mailboxes, err := s.Store.ListLogicalMailboxes(ctx, sess.UserID, account.ID)
 	if err != nil {
 		s.prompt(sess, "Folders are temporarily unavailable.")
 		return
 	}
-	seen := make(map[string]bool, len(folders))
-	for _, folder := range folders {
-		seen[folder] = true
-	}
-	var folderMap map[string]string
-	if json.Unmarshal([]byte(account.FolderMap), &folderMap) == nil {
-		for remote, local := range folderMap {
-			if local != "" && !seen[local] {
-				folders = append(folders, local)
-				seen[local] = true
-			}
-			if remote != "" && !seen[remote] {
-				folders = append(folders, remote)
-				seen[remote] = true
-			}
+	allFolders := make([]string, 0, len(mailboxes))
+	labels, physicalKeys := map[string]string{}, map[string]string{}
+	for _, mailbox := range mailboxes {
+		allFolders = append(allFolders, mailbox.Key)
+		labels[mailbox.Key] = mailbox.Name
+		for _, member := range mailbox.Members {
+			physicalKeys[member] = mailbox.Key
 		}
 	}
-	sort.Strings(folders)
+	rolePaths := map[string]string{}
+	inbox, err := s.Store.InboxFolder(ctx, account)
+	if err != nil {
+		s.prompt(sess, "Folders are temporarily unavailable.")
+		return
+	}
+	rolePaths["inbox"] = physicalKeys[normalizeFolderPath(inbox)]
+	roles, err := s.Store.ListFolderRoles(ctx, sess.UserID, account.ID)
+	if err != nil {
+		s.prompt(sess, "Folder settings are temporarily unavailable.")
+		return
+	}
+	assignedRoles := map[string]bool{}
+	for _, role := range roles {
+		name := strings.ToLower(strings.TrimSpace(role.Role))
+		assignedRoles[name] = true
+		resolved, roleErr := s.Store.FolderRole(ctx, account, name)
+		if errors.Is(roleErr, sql.ErrNoRows) {
+			rolePaths[name] = ""
+			continue
+		}
+		if roleErr != nil {
+			s.prompt(sess, "Folder settings are temporarily unavailable.")
+			return
+		}
+		rolePaths[name] = physicalKeys[normalizeFolderPath(resolved.LocalPath)]
+	}
+	for _, role := range []string{"drafts", "sent", "trash"} {
+		if rolePaths[role] != "" || assignedRoles[role] {
+			continue
+		}
+		resolved, roleErr := s.Store.FolderRole(ctx, account, role)
+		if roleErr == nil {
+			rolePaths[role] = physicalKeys[normalizeFolderPath(resolved.LocalPath)]
+			continue
+		}
+		if errors.Is(roleErr, store.ErrInvalidFolderRole) {
+			// Multiple case-distinct conventional remotes need an owner choice.
+			continue
+		}
+		if !errors.Is(roleErr, sql.ErrNoRows) {
+			s.prompt(sess, "Folder settings are temporarily unavailable.")
+			return
+		}
+		candidate, matches := "", 0
+		for folder, key := range physicalKeys {
+			if strings.EqualFold(folder, role) {
+				candidate = key
+				matches++
+			}
+		}
+		if matches == 1 {
+			rolePaths[role] = candidate
+		}
+	}
 	s.mu.Lock()
-	sess.Folders = folders
+	sess.Folders = allFolders
+	sess.FolderRolePaths = rolePaths
+	sess.FolderLabels = labels
 	sess.FolderPage = 0
 	sess.FolderPrefix = ""
 	sess.SelectedFolder = ""
 	transitionLocked(sess, "folders")
 	s.mu.Unlock()
-	if len(folders) == 0 {
-		s.prompt(sess, "This account has no synchronized folders.")
-	} else {
-		s.prompt(sess, folderPromptFor(account, folders, "", 0))
-	}
+	s.prompt(sess, folderPromptFor(account, allFolders, rolePaths, "", 0, labels))
 }
 
 func (s *Service) handleFolderMenu(sess *session, key string) {
 	s.mu.Lock()
+	labels := copyFolderLabels(sess.FolderLabels)
 	folders := append([]string(nil), sess.Folders...)
+	rolePaths := make(map[string]string, len(sess.FolderRolePaths))
+	for role, folder := range sess.FolderRolePaths {
+		rolePaths[role] = folder
+	}
 	prefix, page, accountID := sess.FolderPrefix, sess.FolderPage, sess.ActiveAccount
 	var account store.Account
 	for _, candidate := range sess.Accounts {
@@ -625,30 +677,44 @@ func (s *Service) handleFolderMenu(sess *session, key string) {
 		}
 	}
 	s.mu.Unlock()
-	if key == "0" && prefix == "" {
-		inbox, err := s.Store.InboxFolder(s.baseContext(), account)
-		if err != nil {
-			s.prompt(sess, "Inbox is temporarily unavailable.")
-			return
-		}
-		s.listenFolder(sess, accountID, inbox)
-		return
-	}
-	children := folderChildren(folders, prefix)
+	children := folderMenuChildren(folders, rolePaths, prefix, labels)
 	if key == "9" {
-		if (page+1)*8 < len(children) {
+		if folderPageHasMore(len(children), prefix == "", page) {
 			s.mu.Lock()
 			sess.FolderPage++
 			page = sess.FolderPage
 			s.mu.Unlock()
-			s.prompt(sess, folderPromptFor(account, folders, prefix, page))
+			s.prompt(sess, folderPromptFor(account, folders, rolePaths, prefix, page, labels))
 		}
+		return
+	}
+	if prefix == "" && page == 0 && key >= "1" && key <= "4" {
+		role, label := standardFolderRole(key)
+		folder := rolePaths[role]
+		if folder == "" {
+			s.prompt(sess, label+" is not configured for this account. "+folderPromptFor(account, folders, rolePaths, prefix, page, labels))
+			return
+		}
+		s.mu.Lock()
+		sess.SelectedFolder = folder
+		s.mu.Unlock()
+		s.listenFolder(sess, accountID, folder)
 		return
 	}
 	if key < "1" || key > "8" {
 		return
 	}
 	index := page*8 + int(key[0]-'1')
+	if prefix == "" {
+		if page == 0 {
+			if key < "5" {
+				return
+			}
+			index = int(key[0] - '5')
+		} else {
+			index = 4 + (page-1)*8 + int(key[0]-'1')
+		}
+	}
 	if index < 0 || index >= len(children) {
 		return
 	}
@@ -656,12 +722,18 @@ func (s *Service) handleFolderMenu(sess *session, key string) {
 	sess.SelectedFolder = children[index]
 	transitionLocked(sess, "folder_action")
 	s.mu.Unlock()
-	s.prompt(sess, fmt.Sprintf("Folder %s. Press 1 to listen to messages here, or 2 to open nested folders. Press pound to return.", mappedFolder(account, children[index])))
+	s.prompt(sess, fmt.Sprintf("Folder %s. Press 1 to listen to messages here, or 2 to open nested folders. Press pound to return.", folderLabel(account, children[index], labels)))
 }
 
 func (s *Service) handleFolderAction(sess *session, key string) {
 	s.mu.Lock()
+	labels := copyFolderLabels(sess.FolderLabels)
 	folder, accountID := sess.SelectedFolder, sess.ActiveAccount
+	folders := append([]string(nil), sess.Folders...)
+	rolePaths := make(map[string]string, len(sess.FolderRolePaths))
+	for role, folder := range sess.FolderRolePaths {
+		rolePaths[role] = folder
+	}
 	var account store.Account
 	for _, candidate := range sess.Accounts {
 		if candidate.ID == accountID {
@@ -681,13 +753,12 @@ func (s *Service) handleFolderAction(sess *session, key string) {
 		sess.FolderPrefix = folder
 		sess.FolderPage = 0
 		transitionLocked(sess, "folders")
-		folders := append([]string(nil), sess.Folders...)
 		s.mu.Unlock()
 		if len(folderChildren(folders, folder)) == 0 {
 			s.prompt(sess, "There are no nested folders here. Press 1 to listen to this folder, or pound to return.")
 			return
 		}
-		s.prompt(sess, folderPromptFor(account, folders, folder, 0))
+		s.prompt(sess, folderPromptFor(account, folders, rolePaths, folder, 0, labels))
 	}
 }
 
@@ -709,17 +780,26 @@ func (s *Service) listenFolder(sess *session, accountID, folder string) {
 }
 
 func folderChildren(folders []string, prefix string) []string {
-	prefix = strings.Trim(strings.ReplaceAll(prefix, "\\", "/"), "/")
+	prefix = normalizeFolderPath(prefix)
 	seen := make(map[string]bool)
 	var out []string
 	for _, raw := range folders {
-		folder := strings.Trim(strings.ReplaceAll(raw, "\\", "/"), "/")
+		folder := normalizeFolderPath(raw)
+		if strings.HasPrefix(folder, "/groups/") {
+			if prefix == "" && !seen[folder] {
+				seen[folder] = true
+				out = append(out, folder)
+			}
+			continue
+		}
 		if folder == "" || folder == prefix || (prefix != "" && !strings.HasPrefix(folder, prefix+"/")) {
 			continue
 		}
 		rest := strings.TrimPrefix(folder, prefix)
 		rest = strings.TrimPrefix(rest, "/")
-		child := rest
+		// A direct child still needs its complete physical path. Returning
+		// only the basename would query "2026" instead of "Projects/2026".
+		child := folder
 		if slash := strings.IndexByte(rest, '/'); slash >= 0 {
 			child = strings.TrimSuffix(folder[:len(folder)-len(rest)+slash], "/")
 		}
@@ -870,33 +950,111 @@ func (s *Service) accountMenuPrompt(sess *session, account store.Account) string
 	return fmt.Sprintf("%s. Press 1 to listen to mail, 2 to send an email, 3 to refresh, or 4 for account settings. Press pound to go back.", account.CanonicalName)
 }
 
-func folderPrompt(account store.Account, folders []string, page int) string {
-	return folderPromptFor(account, folders, "", page)
+func standardFolderRole(key string) (string, string) {
+	switch key {
+	case "1":
+		return "inbox", "Inbox"
+	case "2":
+		return "drafts", "Drafts"
+	case "3":
+		return "sent", "Sent"
+	case "4":
+		return "trash", "Trash"
+	default:
+		return "", ""
+	}
 }
 
-func folderPromptFor(account store.Account, folders []string, prefix string, page int) string {
+func normalizeFolderPath(folder string) string {
+	if strings.HasPrefix(folder, "/groups/") {
+		return folder
+	}
+	return strings.Trim(strings.ReplaceAll(strings.TrimSpace(folder), "\\", "/"), "/")
+}
+
+func folderMenuChildren(folders []string, rolePaths map[string]string, prefix string, labels ...map[string]string) []string {
 	children := folderChildren(folders, prefix)
-	parts := make([]string, 0, len(folders))
-	start := page * 8
-	for i := start; i < len(children); i++ {
-		if i == start+8 {
-			break
+	if len(labels) > 0 {
+		sort.Slice(children, func(i, j int) bool {
+			return folderLabel(store.Account{}, children[i], labels...) < folderLabel(store.Account{}, children[j], labels...)
+		})
+	}
+	if prefix != "" {
+		return children
+	}
+	standard := make(map[string]bool, len(rolePaths))
+	for _, role := range []string{"inbox", "drafts", "sent", "trash"} {
+		folder := rolePaths[role]
+		if folder = normalizeFolderPath(folder); folder != "" {
+			standard[folder] = true
 		}
-		parts = append(parts, fmt.Sprintf("Press %d for %s", i-start+1, mappedFolder(account, children[i])))
 	}
-	next := ""
-	if start+8 < len(children) {
-		next = " Press 9 for more."
+	others := make([]string, 0, len(children))
+	for _, folder := range children {
+		if !standard[normalizeFolderPath(folder)] {
+			others = append(others, folder)
+		}
 	}
+	return others
+}
+
+func folderPageHasMore(count int, root bool, page int) bool {
+	start := page * 8
+	if root {
+		if page == 0 {
+			return 4 < count
+		} else {
+			start = 4 + (page-1)*8
+		}
+	}
+	return start+8 < count
+}
+
+func folderPromptFor(account store.Account, folders []string, rolePaths map[string]string, prefix string, page int, labels ...map[string]string) string {
+	children := folderMenuChildren(folders, rolePaths, prefix, labels...)
+	parts := make([]string, 0, 12)
 	where := "root"
 	if prefix != "" {
-		where = mappedFolder(account, prefix)
+		start := page * 8
+		end := min(start+8, len(children))
+		for i := start; i < end; i++ {
+			parts = append(parts, fmt.Sprintf("Press %d for %s", i-start+1, folderLabel(account, children[i], labels...)))
+		}
+		where = folderLabel(account, prefix, labels...)
+		if end < len(children) {
+			parts = append(parts, "Press 9 for more")
+		}
+		if len(parts) == 0 {
+			parts = append(parts, "There are no nested folders")
+		}
+		return "Folders in " + where + " for " + account.CanonicalName + ". " + strings.Join(parts, ". ") + ". Press pound to go back."
 	}
-	rootOption := ""
-	if prefix == "" {
-		rootOption = " Press 0 for Inbox at the root."
+
+	start, keyStart := 0, 5
+	if page > 0 {
+		start, keyStart = 4+(page-1)*8, 1
+		parts = append(parts, "More folders")
+	} else {
+		parts = append(parts,
+			"Press 1 for Inbox",
+			"Press 2 for Drafts",
+			"Press 3 for Sent",
+			"Press 4 for Trash",
+		)
 	}
-	return "Folders in " + where + " for " + account.CanonicalName + ". " + strings.Join(parts, ". ") + "." + next + rootOption + " Press pound to go back."
+	end := min(start+8, len(children))
+	if page == 0 {
+		end = min(4, len(children))
+	}
+	for i := start; i < end; i++ {
+		parts = append(parts, fmt.Sprintf("Press %d for %s", keyStart+i-start, folderLabel(account, children[i], labels...)))
+	}
+	if end < len(children) {
+		parts = append(parts, "Press 9 for more folders")
+	} else if len(children) == 0 {
+		parts = append(parts, "There are no other folders")
+	}
+	return "Folders for " + account.CanonicalName + ". " + strings.Join(parts, ". ") + ". Press pound to go back."
 }
 
 func contactPrompt(contacts []store.Contact, page int) string {
@@ -921,6 +1079,21 @@ func recipientPrompt(d draft) string {
 		toCount = 1 + len(d.AdditionalTo)
 	}
 	return fmt.Sprintf("You have %d To recipient(s), %d Cc, and %d Bcc. Press 1 to add To, 2 to add Cc, 3 to add Bcc, or 4 to continue.", toCount, len(d.Cc), len(d.Bcc))
+}
+
+func copyFolderLabels(labels map[string]string) map[string]string {
+	copy := make(map[string]string, len(labels))
+	for key, label := range labels {
+		copy[key] = label
+	}
+	return copy
+}
+
+func folderLabel(account store.Account, folder string, labels ...map[string]string) string {
+	if len(labels) > 0 && labels[0][folder] != "" {
+		return labels[0][folder]
+	}
+	return mappedFolder(account, folder)
 }
 
 func mappedFolder(account store.Account, folder string) string {

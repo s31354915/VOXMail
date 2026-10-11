@@ -7,7 +7,10 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"github.com/voxmail/voxmail/internal/diagnostics"
+	"github.com/voxmail/voxmail/internal/operation"
 	"mime"
 	"mime/multipart"
 	"mime/quotedprintable"
@@ -37,6 +40,9 @@ type Config struct {
 	// AllowPrivate is reserved for local integration tests or an explicitly
 	// isolated deployment. It is false for normal account operations.
 	AllowPrivate bool
+	// TLSConfig supplies trusted private-CA roots for isolated deployments and
+	// integration fixtures. Web account input never controls this field.
+	TLSConfig *tls.Config
 }
 
 const (
@@ -68,7 +74,14 @@ type SendResult struct {
 // Check authenticates to an SMTP submission service without sending a
 // message. Port 465 uses implicit TLS; 587 uses STARTTLS. Port 25 is rejected
 // for this authenticated-submission check.
-func Check(ctx context.Context, c Config) error {
+func Check(ctx context.Context, c Config) (retErr error) {
+	stage, category := "settings", operation.Configuration
+	defer func() {
+		if retErr != nil && ctx != nil && ctx.Err() != nil {
+			retErr = errors.Join(retErr, ctx.Err())
+		}
+		retErr = operation.Wrap("smtp", stage, category, retErr)
+	}()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -84,6 +97,7 @@ func Check(ctx context.Context, c Config) error {
 	if c.Port == 25 && !c.AllowPlaintext25 {
 		return fmt.Errorf("SMTP port 25 is disabled for authenticated submission")
 	}
+	stage, category = "dial", operation.Connection
 	dialCtx, dialCancel := context.WithTimeout(operationCtx, smtpConnectionTimeout)
 	defer dialCancel()
 	dialer := &net.Dialer{Timeout: smtpConnectionTimeout}
@@ -100,7 +114,8 @@ func Check(ctx context.Context, c Config) error {
 		return err
 	}
 	if security == "implicit_tls" {
-		tlsConn := tls.Client(conn, &tls.Config{ServerName: c.Host, MinVersion: tls.VersionTLS12})
+		stage, category = "tls_handshake", operation.TLS
+		tlsConn := tls.Client(conn, smtpTLSConfig(c))
 		commandCtx, commandCancel := context.WithTimeout(operationCtx, smtpCommandTimeout)
 		err := tlsConn.HandshakeContext(commandCtx)
 		commandCancel()
@@ -116,6 +131,7 @@ func Check(ctx context.Context, c Config) error {
 	}
 	stopClose := context.AfterFunc(operationCtx, func() { _ = conn.Close() })
 	defer stopClose()
+	stage, category = "greeting", operation.Protocol
 	client, err := smtp.NewClient(conn, c.Host)
 	if err != nil {
 		_ = conn.Close()
@@ -123,6 +139,7 @@ func Check(ctx context.Context, c Config) error {
 	}
 	defer client.Close()
 	if security == "starttls" {
+		stage, category = "starttls", operation.TLS
 		if err := setSMTPDeadline(conn, operationCtx); err != nil {
 			return err
 		}
@@ -132,19 +149,21 @@ func Check(ctx context.Context, c Config) error {
 		if err := setSMTPDeadline(conn, operationCtx); err != nil {
 			return err
 		}
-		if err := client.StartTLS(&tls.Config{ServerName: c.Host, MinVersion: tls.VersionTLS12}); err != nil {
+		if err := client.StartTLS(smtpTLSConfig(c)); err != nil {
 			return fmt.Errorf("SMTP STARTTLS failed: %w", err)
 		}
 	}
 	if err := setSMTPDeadline(conn, operationCtx); err != nil {
 		return err
 	}
+	stage, category = "authenticate", operation.Authentication
 	if err := client.Auth(smtp.PlainAuth("", c.Username, c.Password, c.Host)); err != nil {
 		return fmt.Errorf("SMTP authentication failed: %w", err)
 	}
 	if err := setSMTPDeadline(conn, operationCtx); err != nil {
 		return err
 	}
+	stage, category = "cleanup", operation.Protocol
 	return client.Quit()
 }
 
@@ -166,7 +185,23 @@ func SendWithOutcome(c Config, to []string, raw []byte) SendResult {
 // SendWithOutcomeContext is the cancellable form of SendWithOutcome. The
 // context closes the underlying connection so a caller does not have to wait
 // for a protocol read deadline when abandoning a submission.
-func SendWithOutcomeContext(ctx context.Context, c Config, to []string, raw []byte) SendResult {
+func SendWithOutcomeContext(ctx context.Context, c Config, to []string, raw []byte) (result SendResult) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	finishTrace := diagnostics.Start(ctx, "smtp", "send", "recipient_count", len(to), "message_bytes", len(raw))
+	stage, category := "settings", operation.Configuration
+	defer func() {
+		if result.Status == SendUncertain {
+			category = operation.Uncertain
+		}
+		if result.Err != nil && ctx.Err() != nil {
+			result.Err = errors.Join(result.Err, ctx.Err())
+		}
+		result.Err = operation.Wrap("smtp", stage, category, result.Err)
+		result.CleanupError = operation.Wrap("smtp", "cleanup", operation.Protocol, result.CleanupError)
+		finishTrace(result.Err)
+	}()
 	if c.Host == "" || c.Port < 1 || len(to) == 0 || len(raw) == 0 || c.From == "" {
 		return SendResult{Status: SendRejected, Err: fmt.Errorf("incomplete SMTP request")}
 	}
@@ -182,6 +217,7 @@ func SendWithOutcomeContext(ctx context.Context, c Config, to []string, raw []by
 	}
 	operationCtx, cancel := context.WithTimeout(ctx, smtpOperationTimeout)
 	defer cancel()
+	stage, category = "dial", operation.Connection
 	dialCtx, dialCancel := context.WithTimeout(operationCtx, smtpConnectionTimeout)
 	defer dialCancel()
 	conn, err := netguard.DialContext(dialCtx, c.Host, c.Port, c.Address, c.AllowPrivate)
@@ -195,7 +231,8 @@ func SendWithOutcomeContext(ctx context.Context, c Config, to []string, raw []by
 	stopClose := context.AfterFunc(operationCtx, func() { _ = conn.Close() })
 	defer stopClose()
 	if security == "implicit_tls" {
-		tlsConn := tls.Client(conn, &tls.Config{ServerName: c.Host, MinVersion: tls.VersionTLS12})
+		stage, category = "tls_handshake", operation.TLS
+		tlsConn := tls.Client(conn, smtpTLSConfig(c))
 		commandCtx, commandCancel := context.WithTimeout(operationCtx, smtpCommandTimeout)
 		err := tlsConn.HandshakeContext(commandCtx)
 		commandCancel()
@@ -208,6 +245,7 @@ func SendWithOutcomeContext(ctx context.Context, c Config, to []string, raw []by
 	if err := setSMTPDeadline(conn, operationCtx); err != nil {
 		return SendResult{Status: SendRejected, Err: err}
 	}
+	stage, category = "greeting", operation.Protocol
 	client, err := smtp.NewClient(conn, c.Host)
 	if err != nil {
 		_ = conn.Close()
@@ -215,6 +253,7 @@ func SendWithOutcomeContext(ctx context.Context, c Config, to []string, raw []by
 	}
 	defer client.Close()
 	if security == "starttls" {
+		stage, category = "starttls", operation.TLS
 		if err := setSMTPDeadline(conn, operationCtx); err != nil {
 			return SendResult{Status: SendRejected, Err: err}
 		}
@@ -224,7 +263,7 @@ func SendWithOutcomeContext(ctx context.Context, c Config, to []string, raw []by
 		if err := setSMTPDeadline(conn, operationCtx); err != nil {
 			return SendResult{Status: SendRejected, Err: err}
 		}
-		if err := client.StartTLS(&tls.Config{ServerName: c.Host, MinVersion: tls.VersionTLS12}); err != nil {
+		if err := client.StartTLS(smtpTLSConfig(c)); err != nil {
 			return SendResult{Status: SendRejected, Err: err}
 		}
 	}
@@ -232,6 +271,7 @@ func SendWithOutcomeContext(ctx context.Context, c Config, to []string, raw []by
 		if err := setSMTPDeadline(conn, operationCtx); err != nil {
 			return SendResult{Status: SendRejected, Err: err}
 		}
+		stage, category = "authenticate", operation.Authentication
 		if err := client.Auth(smtp.PlainAuth("", c.Username, c.Password, c.Host)); err != nil {
 			return SendResult{Status: SendRejected, Err: err}
 		}
@@ -239,9 +279,11 @@ func SendWithOutcomeContext(ctx context.Context, c Config, to []string, raw []by
 	if err := setSMTPDeadline(conn, operationCtx); err != nil {
 		return SendResult{Status: SendRejected, Err: err}
 	}
+	stage, category = "sender", operation.Protocol
 	if err := client.Mail(c.From); err != nil {
 		return SendResult{Status: SendRejected, Err: err}
 	}
+	stage, category = "recipient", operation.Protocol
 	for _, recipient := range to {
 		if err := setSMTPDeadline(conn, operationCtx); err != nil {
 			return SendResult{Status: SendRejected, Err: err}
@@ -253,6 +295,7 @@ func SendWithOutcomeContext(ctx context.Context, c Config, to []string, raw []by
 	if err := setSMTPDeadline(conn, operationCtx); err != nil {
 		return SendResult{Status: SendRejected, Err: err}
 	}
+	stage, category = "data", operation.Protocol
 	writer, err := client.Data()
 	if err != nil {
 		return SendResult{Status: SendRejected, Err: err}
@@ -275,6 +318,19 @@ func SendWithOutcomeContext(ctx context.Context, c Config, to []string, raw []by
 		return SendResult{Status: SendAccepted, CleanupError: err}
 	}
 	return SendResult{Status: SendAccepted}
+}
+
+func smtpTLSConfig(c Config) *tls.Config {
+	cfg := &tls.Config{}
+	if c.TLSConfig != nil {
+		cfg = c.TLSConfig.Clone()
+	}
+	cfg.ServerName = c.Host
+	cfg.InsecureSkipVerify = false
+	if cfg.MinVersion < tls.VersionTLS12 {
+		cfg.MinVersion = tls.VersionTLS12
+	}
+	return cfg
 }
 
 func setSMTPDeadline(conn net.Conn, ctx context.Context) error {

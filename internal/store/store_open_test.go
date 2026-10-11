@@ -131,10 +131,10 @@ INSERT INTO mail_messages(account_id,folder,path,subject,updated_at) VALUES('leg
 		t.Fatalf("historical defaults source_size=%d deleting=%d config_version=%d", sourceSize, deleting, configVersion)
 	}
 	var migrations int
-	if err := db.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version=20`).Scan(&migrations); err != nil {
+	if err := db.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version IN (20,21,22)`).Scan(&migrations); err != nil {
 		t.Fatal(err)
 	}
-	if migrations != 1 {
+	if migrations != 3 {
 		t.Fatal("latest migrations were not applied to historical schema")
 	}
 }

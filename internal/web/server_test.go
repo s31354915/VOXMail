@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -64,6 +65,33 @@ type deletionSyncProbe struct {
 }
 
 func (p *deletionSyncProbe) RefreshAccount(context.Context, string, string) error { return nil }
+
+type syncContextProbe struct {
+	called      bool
+	hadDeadline bool
+}
+
+type manualSyncCancellationProbe struct {
+	active bool
+	called []string
+	err    error
+}
+
+func (*manualSyncCancellationProbe) RefreshAccount(context.Context, string, string) error { return nil }
+
+func (p *manualSyncCancellationProbe) CancelManualSync(_ context.Context, accountID string) (bool, error) {
+	p.called = append(p.called, accountID)
+	if p.err != nil {
+		return false, p.err
+	}
+	return p.active, nil
+}
+
+func (p *syncContextProbe) RefreshAccount(ctx context.Context, _, _ string) error {
+	_, p.hadDeadline = ctx.Deadline()
+	p.called = true
+	return nil
+}
 
 func (p *deletionSyncProbe) StopAccount(ctx context.Context, accountID string) error {
 	p.stopped = append(p.stopped, accountID)
@@ -132,8 +160,14 @@ func TestDeleteAccountDataCleansOwnedArtifactsAfterCoordination(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pending {
-		t.Fatal("owned cleanup unexpectedly remained pending")
+	if !pending {
+		t.Fatal("deletion did not admit durable background cleanup")
+	}
+	if _, err := os.Stat(maildir); err != nil {
+		t.Fatalf("request performed filesystem cleanup: %v", err)
+	}
+	if err := server.cleanupAccountPass(ctx); err != nil {
+		t.Fatal(err)
 	}
 	if len(syncProbe.stopped) != 1 || syncProbe.stopped[0] != "delete-web-account" || !syncProbe.deletingSeen {
 		t.Fatalf("sync coordination=%+v deleting_seen=%v", syncProbe.stopped, syncProbe.deletingSeen)
@@ -159,6 +193,88 @@ func TestDeleteAccountDataCleansOwnedArtifactsAfterCoordination(t *testing.T) {
 	}
 	if status != "complete" {
 		t.Fatalf("cleanup job status=%q, want complete", status)
+	}
+}
+
+func TestManualSyncHasNoImplicitRequestDeadline(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "sync-deadline.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	box, err := secret.New("test-key-with-more-than-32-characters-123456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncer := &syncContextProbe{}
+	h := (&Server{Store: db, Secrets: box, Sync: syncer, Sessions: NewSessionStore()}).Handler()
+	csrf, cookies := issue(t, h)
+	var userID string
+	if err := db.DB.QueryRowContext(context.Background(), `SELECT id FROM users WHERE username='admin'`).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	account := store.Account{
+		ID: "long-initial-sync", UserID: userID, CanonicalName: "Large mailbox", Email: "large@example.test", SenderName: "Large mailbox",
+		IMAPHost: "imap.example.test", IMAPPort: 993, IMAPSecurity: "implicit_tls", IMAPUser: "mail-user", IMAPPassword: "imap-secret",
+		SMTPHost: "smtp.example.test", SMTPPort: 465, SMTPSecurity: "implicit_tls", SMTPUser: "mail-user", SMTPPassword: "smtp-secret", FolderMap: "{}",
+	}
+	if err := db.SaveAccount(context.Background(), box, account); err != nil {
+		t.Fatalf("SaveAccount: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/accounts/long-initial-sync/sync", nil)
+	req.Header.Set("X-CSRF-Token", csrf)
+	for _, cookie := range cookies {
+		req.AddCookie(cookie)
+	}
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, req)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("manual sync status=%d body=%s", response.Code, response.Body.String())
+	}
+	if !syncer.called || syncer.hadDeadline {
+		t.Fatalf("manual sync context called=%v had_deadline=%v; want no implicit deadline", syncer.called, syncer.hadDeadline)
+	}
+}
+
+func TestManualSyncCancellationRequiresOwnedAccountAndActiveManualRun(t *testing.T) {
+	srv, h := voiceWebFixture(t)
+	box, err := secret.New("manual-sync-cancel-test-key-with-more-than-32-bytes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.Secrets = box
+	account := store.Account{ID: "owned-cancel-account", UserID: "user", CanonicalName: "Owned", Email: "owned@example.test", SenderName: "Owned", IMAPHost: "imap.example.test", IMAPPort: 993, IMAPSecurity: "implicit_tls", IMAPUser: "user", IMAPPassword: "imap-secret", SMTPHost: "smtp.example.test", SMTPPort: 465, SMTPSecurity: "implicit_tls", SMTPUser: "user", SMTPPassword: "smtp-secret", FolderMap: `{}`}
+	if err := srv.Store.SaveAccount(context.Background(), box, account); err != nil {
+		t.Fatal(err)
+	}
+	probe := &manualSyncCancellationProbe{active: true}
+	srv.Sync = probe
+
+	response := voiceRequest(h, "admin", http.MethodPost, "/api/v1/accounts/"+account.ID+"/sync/cancel", nil)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("non-owner cancellation status=%d, want 404", response.Code)
+	}
+	if len(probe.called) != 0 {
+		t.Fatal("non-owner request reached cancellation service")
+	}
+	response = voiceRequest(h, "user", http.MethodPost, "/api/v1/accounts/missing/sync/cancel", nil)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("unknown account cancellation status=%d, want 404", response.Code)
+	}
+	if len(probe.called) != 0 {
+		t.Fatal("unknown account request reached cancellation service")
+	}
+	response = voiceRequest(h, "user", http.MethodPost, "/api/v1/accounts/"+account.ID+"/sync/cancel", nil)
+	if response.Code != http.StatusAccepted || !strings.Contains(response.Body.String(), "cancellation requested") {
+		t.Fatalf("owned active cancellation status=%d body=%s", response.Code, response.Body.String())
+	}
+	if len(probe.called) != 1 || probe.called[0] != account.ID {
+		t.Fatalf("cancellation service calls=%v", probe.called)
+	}
+	probe.active = false
+	response = voiceRequest(h, "user", http.MethodPost, "/api/v1/accounts/"+account.ID+"/sync/cancel", nil)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("inactive cancellation status=%d, want 409", response.Code)
 	}
 }
 
@@ -244,6 +360,18 @@ func TestContentSecurityPolicyHashesEmbeddedAssets(t *testing.T) {
 			t.Fatalf("CSP is missing embedded asset hash %q: %s", required, policy)
 		}
 	}
+	for _, required := range []string{
+		"script-src 'sha256-" + scriptHash + "';",
+		"style-src 'sha256-" + styleHash + "';",
+	} {
+		if !strings.Contains(policy, required) {
+			t.Fatalf("CSP allows sources beyond the assembled asset hash: %s", policy)
+		}
+	}
+	if strings.Contains(policy, "unsafe-inline") || strings.Contains(policy, "unsafe-eval") {
+		t.Fatalf("CSP permits unsafe execution: %s", policy)
+	}
+
 }
 
 func TestIndexAdvertisesCurrentSetupState(t *testing.T) {
@@ -320,7 +448,7 @@ func TestVoiceSaveControlIsOutsideAlertOnlyContainer(t *testing.T) {
 
 func TestBrowserFormsDeclareExplicitSubmitControls(t *testing.T) {
 	html := string(indexHTML)
-	for _, required := range []string{`id="auth"`, `id="auth-loading"`, `id="recovery-tools"`, `renderAuthState`, `data-setup-available="unknown"`, `aria-label="Move '+esc(a.canonical_name)+' up"`, `aria-label="Move '+esc(c.name)+' down"`} {
+	for _, required := range []string{`id="auth"`, `id="auth-loading"`, `id="recovery-tools"`, `renderAuthState`, `data-setup-available="unknown"`, `aria-label="Move ' + esc(a.canonical_name) + ' up"`, `aria-label="Move ' + esc(c.name) + ' down"`} {
 		if !strings.Contains(html, required) {
 			t.Fatalf("auth state contract missing %q", required)
 		}
@@ -381,9 +509,22 @@ func TestBootstrapSetupHTTPHasOneWinner(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	h := (&Server{Store: db, Sessions: NewSessionStore()}).Handler()
+	hashesReady := make(chan struct{})
+	var hashMu sync.Mutex
+	hashCalls := 0
+	app := &Server{Store: db, Sessions: NewSessionStore(), setupHash: func(string) (string, error) {
+		hashMu.Lock()
+		hashCalls++
+		if hashCalls == 2 {
+			close(hashesReady)
+		}
+		hashMu.Unlock()
+		<-hashesReady
+		return "test-hash", nil
+	}}
+	h := app.Handler()
 
-	const attempts = 8
+	const attempts = 2
 	start := make(chan struct{})
 	type result struct {
 		status  int
@@ -451,6 +592,140 @@ func TestBootstrapSetupHTTPHasOneWinner(t *testing.T) {
 	restarted.ServeHTTP(w, req)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("setup after durable completion status=%d, want %d", w.Code, http.StatusConflict)
+	}
+}
+
+func TestCompletedSetupRejectsBeforeCredentialHashing(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "setup-completed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.CreateBootstrapUser(context.Background(), store.User{ID: "existing-admin", Username: "admin", PasswordHash: "p", PINHash: "p", Role: "admin", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	hashCalls := 0
+	h := (&Server{Store: db, setupHash: func(string) (string, error) {
+		hashCalls++
+		return "unexpected", nil
+	}}).Handler()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/setup", strings.NewReader(`{"username":"attacker","password":"a-valid-long-password","pin":"1234"}`))
+	req.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, req)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("completed setup status=%d body=%s, want 409", response.Code, response.Body.String())
+	}
+	if hashCalls != 0 {
+		t.Fatalf("completed setup invoked credential hashing %d times", hashCalls)
+	}
+}
+
+func TestSetupBoundsConcurrentHashingAndThrottlesSources(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "setup-guard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	releaseHashes := make(chan struct{})
+	enteredHash := make(chan struct{}, 8)
+	var active, maximum int32
+	setupHash := func(string) (string, error) {
+		current := atomic.AddInt32(&active, 1)
+		for {
+			old := atomic.LoadInt32(&maximum)
+			if current <= old || atomic.CompareAndSwapInt32(&maximum, old, current) {
+				break
+			}
+		}
+		enteredHash <- struct{}{}
+		<-releaseHashes
+		atomic.AddInt32(&active, -1)
+		return "test-hash", nil
+	}
+	h := (&Server{Store: db, Sessions: NewSessionStore(), setupHash: setupHash}).Handler()
+	start := make(chan struct{})
+	type result struct {
+		status int
+		host   string
+	}
+	results := make(chan result, 2)
+	for i, host := range []string{"198.51.100.21", "198.51.100.22"} {
+		i, host := i, host
+		go func() {
+			<-start
+			body := fmt.Sprintf(`{"username":"admin-%d","password":"bootstrap-password-%02d","pin":"%04d"}`, i, i, i)
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/setup", strings.NewReader(body))
+			req.RemoteAddr = host + ":41000"
+			req.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			h.ServeHTTP(response, req)
+			results <- result{status: response.Code, host: host}
+		}()
+	}
+	close(start)
+	for i := 0; i < setupHashConcurrency; i++ {
+		select {
+		case <-enteredHash:
+		case <-time.After(2 * time.Second):
+			close(releaseHashes)
+			t.Fatal("two setup requests did not enter the bounded hash slots")
+		}
+	}
+	if got := atomic.LoadInt32(&maximum); got != setupHashConcurrency {
+		close(releaseHashes)
+		t.Fatalf("simultaneous setup hash count=%d, want exactly %d", got, setupHashConcurrency)
+	}
+	busy := httptest.NewRequest(http.MethodPost, "/api/v1/setup", strings.NewReader(`{"username":"third-admin","password":"bootstrap-password-03","pin":"0003"}`))
+	busy.RemoteAddr = "198.51.100.23:41000"
+	busy.Header.Set("Content-Type", "application/json")
+	busyResponse := httptest.NewRecorder()
+	h.ServeHTTP(busyResponse, busy)
+	if busyResponse.Code != http.StatusTooManyRequests || busyResponse.Header().Get("Retry-After") == "" {
+		close(releaseHashes)
+		t.Fatalf("busy setup status=%d retry-after=%q, want 429 with Retry-After", busyResponse.Code, busyResponse.Header().Get("Retry-After"))
+	}
+	close(releaseHashes)
+	statuses := map[int]int{busyResponse.Code: 1}
+	for range 2 {
+		select {
+		case got := <-results:
+			statuses[got.status]++
+		case <-time.After(3 * time.Second):
+			t.Fatal("setup request did not finish after hash slots were released")
+		}
+	}
+	if statuses[http.StatusCreated] != 1 || statuses[http.StatusConflict] != 1 || statuses[http.StatusTooManyRequests] != 1 {
+		t.Fatalf("setup statuses=%v, want one 201, one 409, and one 429", statuses)
+	}
+	if got := atomic.LoadInt32(&maximum); got > setupHashConcurrency {
+		t.Fatalf("setup hash concurrency=%d exceeds limit %d", got, setupHashConcurrency)
+	}
+}
+
+func TestSetupRateLimitsRepeatedSource(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "setup-rate.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	h := (&Server{Store: db}).Handler()
+	for attempt := 0; attempt < setupAttemptLimit; attempt++ {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/setup", strings.NewReader("not-json"))
+		req.RemoteAddr = "198.51.100.31:42000"
+		response := httptest.NewRecorder()
+		h.ServeHTTP(response, req)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("setup attempt %d status=%d, want 400 before throttle", attempt+1, response.Code)
+		}
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/setup", strings.NewReader("not-json"))
+	req.RemoteAddr = "198.51.100.31:42000"
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, req)
+	if response.Code != http.StatusTooManyRequests || response.Header().Get("Retry-After") == "" {
+		t.Fatalf("setup rate-limit status=%d retry-after=%q, want 429 with Retry-After", response.Code, response.Header().Get("Retry-After"))
 	}
 }
 
@@ -966,7 +1241,7 @@ func TestMeReturnsCSRFForRestoredSession(t *testing.T) {
 
 func TestBrowserSessionContractHandlesExpiryAndSecrets(t *testing.T) {
 	html := string(indexHTML)
-	for _, required := range []string{"api('/api/v1/me')", "r.status===401", "showSignedOut", "clearSensitiveFields", "Your session expired; please sign in again."} {
+	for _, required := range []string{`api("/api/v1/me")`, "r.status === 401", "showSignedOut", "clearSensitiveFields", "Your session expired; please sign in again."} {
 		if !strings.Contains(html, required) {
 			t.Fatalf("browser session contract missing %q", required)
 		}
@@ -978,11 +1253,13 @@ func TestBrowserAccountTestingContractSeparatesUnsavedAndSavedValues(t *testing.
 	for _, required := range []string{
 		"/api/v1/accounts/validate",
 		"/api/v1/accounts/test",
-		"Current unsaved values authenticated",
-		"Saved account authenticated",
+		"Test edited values",
+		"Test saved settings",
+		"Edited values authenticated; no changes were saved.",
+		"Saved settings authenticated; unsaved edits were ignored.",
 		"Discovered remote folders",
 		"accountActionBusy",
-		"finally{endAccountAction()}",
+		"if (epoch === state.sessionEpoch) endAccountAction();",
 	} {
 		if !strings.Contains(html, required) {
 			t.Fatalf("browser account-test contract missing %q", required)
@@ -1340,3 +1617,8 @@ func TestTOTPReplayAndBackupCodeConcurrency(t *testing.T) {
 		t.Fatalf("backup-code concurrent winners=%d, want 1", winners)
 	}
 }
+
+func (p *syncContextProbe) StartRefreshAccount(_ context.Context, worker context.Context, userID, accountID string) (int64, error) {
+	return 1, p.RefreshAccount(worker, userID, accountID)
+}
+func (*syncContextProbe) WaitManualSyncs() {}

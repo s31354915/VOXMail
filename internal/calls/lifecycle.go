@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -248,6 +249,10 @@ func (s *Service) BeginSIPApply(ctx context.Context) (func(), error) {
 		}
 	}
 	s.mu.Lock()
+	if s.shuttingDown {
+		s.mu.Unlock()
+		return nil, errors.New("call service is shutting down")
+	}
 	if len(s.sessions) != 0 || len(s.pending) != 0 {
 		s.mu.Unlock()
 		return nil, errors.New("active calls are in progress")
@@ -270,4 +275,77 @@ func (s *Service) ActiveCalls() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.sessions) + len(s.pending)
+}
+
+// Drain rejects new calls, cancels session work, hangs up every active call,
+// and waits for Baresip to report the sessions closed. The bridge and its
+// parent context must remain live until Drain returns.
+func (s *Service) Drain(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.mu.Lock()
+	s.shuttingDown = true
+	sessions := make([]*session, 0, len(s.sessions))
+	for _, sess := range s.sessions {
+		if sess == nil {
+			continue
+		}
+		sessions = append(sessions, sess)
+		if sess.Flow != nil {
+			sess.Flow.Close()
+		}
+		for _, cancel := range []context.CancelFunc{
+			sess.eventCancel, sess.inactivityCancel, sess.playCancel,
+			sess.AttachmentCancel, sess.RecordCancel,
+		} {
+			if cancel != nil {
+				cancel()
+			}
+		}
+		sess.eventCancel = nil
+		sess.inactivityCancel = nil
+		sess.playCancel = nil
+		sess.AttachmentCancel = nil
+		sess.RecordCancel = nil
+	}
+	pending := make([]DialRequest, 0, len(s.pending))
+	for requestID, req := range s.pending {
+		pending = append(pending, req)
+		delete(s.pending, requestID)
+	}
+	s.mu.Unlock()
+	s.StopTasks()
+
+	for _, req := range pending {
+		reportDialOutcome(req.Outcome, AlertFailed)
+		signalAlert(req.Done, false)
+	}
+	var sendErr error
+	for _, sess := range sessions {
+		if err := s.sendBridge(nil, bridge.Message{
+			Type: "hangup", CallID: sess.CallID, Code: 503, Reason: "server is shutting down",
+		}); err != nil && sendErr == nil {
+			sendErr = err
+		}
+	}
+	if sendErr != nil {
+		return fmt.Errorf("send shutdown hangup: %w", sendErr)
+	}
+
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if active := s.ActiveCalls(); active == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("timed out waiting for %d active calls to close: %w", s.ActiveCalls(), ctx.Err())
+		case <-ticker.C:
+		}
+	}
 }

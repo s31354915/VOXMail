@@ -2,6 +2,24 @@ package calls
 
 import "github.com/voxmail/voxmail/internal/ivr"
 
+func (s *Service) navigationVersion(callID string) (uint64, bool) {
+	if s == nil || callID == "" {
+		return 0, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess := s.sessions[callID]
+	if sess == nil || sess.Closed {
+		return 0, false
+	}
+	return sess.navigationGeneration, true
+}
+
+func (s *Service) navigationVersionIsCurrent(callID string, version uint64) bool {
+	current, ok := s.navigationVersion(callID)
+	return ok && current == version
+}
+
 func backByContractLocked(sess *session, fallback string) {
 	if sess == nil {
 		return
@@ -11,12 +29,14 @@ func backByContractLocked(sess *session, fallback string) {
 			sess.Flow.State = back
 		}
 		sess.State = string(back)
+		sess.navigationGeneration++
 		return
 	}
 	if sess.Flow != nil {
 		sess.Flow.State = ivr.State(fallback)
 	}
 	sess.State = fallback
+	sess.navigationGeneration++
 }
 
 // ensureFlowLocked keeps sessions created by older callers and tests
@@ -58,6 +78,7 @@ func backUsingFlowLocked(sess *session, fallback string) {
 	if sess.Flow != nil {
 		if err := sess.Flow.Back(); err == nil {
 			sess.State = string(sess.Flow.State)
+			sess.navigationGeneration++
 			return
 		}
 	}
@@ -76,4 +97,5 @@ func transitionLocked(sess *session, next string) {
 		sess.Flow.Enter(ivr.State(next))
 	}
 	sess.State = next
+	sess.navigationGeneration++
 }

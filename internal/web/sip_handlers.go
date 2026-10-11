@@ -99,7 +99,7 @@ func (s *Server) saveSIP(w http.ResponseWriter, r *http.Request) {
 	}
 	st := store.SIPSettings{Domain: body.Domain, Username: body.Username, Password: body.Password, Port: body.RegistrarPort, LocalPort: body.LocalPort, RegistrarPort: body.RegistrarPort, Transport: body.Transport, RegInterval: body.RegInterval, Enabled: body.Enabled}
 	var release func()
-	if s.SIP != nil {
+	if s.SIP != nil && !s.OfflineMode {
 		if gate, ok := s.Calls.(SIPApplyGate); ok {
 			var gateErr error
 			release, gateErr = gate.BeginSIPApply(r.Context())
@@ -114,7 +114,7 @@ func (s *Server) saveSIP(w http.ResponseWriter, r *http.Request) {
 		serverError(w, err)
 		return
 	}
-	if s.SIP != nil {
+	if s.SIP != nil && !s.OfflineMode {
 		// The Baresip supervisor owns its child under the application lifetime;
 		// this request context only bounds the apply operation itself.
 		if err := s.SIP.Apply(r.Context()); err != nil {

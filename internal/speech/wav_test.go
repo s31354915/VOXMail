@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"github.com/voxmail/voxmail/internal/operation"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -217,4 +219,34 @@ type invalidSynth struct{}
 
 func (invalidSynth) Synthesize(_ context.Context, _, output string) error {
 	return os.WriteFile(output, []byte("RIFF"), 0600)
+}
+
+func TestPiperCancellationRetainsChildExitCause(t *testing.T) {
+	root := t.TempDir()
+	marker := filepath.Join(root, "started")
+	piper := writeFakePiper(t, "touch '"+marker+"'\nsleep 30")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- (Piper{Binary: piper, Model: "fixture"}).Synthesize(ctx, "hello", filepath.Join(root, "output.wav"))
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			<-done
+			t.Fatal("child never started")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	err := <-done
+	var exit *exec.ExitError
+	if !errors.Is(err, context.Canceled) || !errors.As(err, &exit) || operation.Classify(err) != operation.Canceled {
+		t.Fatalf("lost controlling or child cause: %v", err)
+	}
 }

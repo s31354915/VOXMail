@@ -1,0 +1,237 @@
+[
+  {
+    "name": "legacy roles, local aliases, nested folders and root pagination",
+    "input": {
+      "folders": {
+        "INBOX": "InboxCustom",
+        "Drafts": "DraftCache",
+        "Sent": "Archive/SentCache",
+        "Projects/2026": "Projects/2026",
+        "Projects/2027": "Projects/2027",
+        "A": "A",
+        "B": "B",
+        "C": "C",
+        "D": "D",
+        "E": "E",
+        "F": "F",
+        "[Gmail]/Inbox": "GmailInbox"
+      },
+      "mapping": {
+        "INBOX": "InboxCustom",
+        "Drafts": "DraftCache",
+        "Sent": "Archive/SentCache",
+        "[Gmail]/Inbox": "GmailInbox"
+      },
+      "roles": {},
+      "policy": {}
+    },
+    "folders": [
+      "InboxCustom",
+      "DraftCache",
+      "Archive/SentCache",
+      "Projects/2026",
+      "Projects/2027",
+      "A",
+      "B",
+      "C",
+      "D",
+      "E",
+      "F",
+      "GmailInbox"
+    ],
+    "roles": {
+      "inbox": "InboxCustom",
+      "drafts": "DraftCache",
+      "sent": "Archive/SentCache"
+    },
+    "pages": [
+      {
+        "prefix": "",
+        "page": 0,
+        "keys": [
+          "InboxCustom",
+          "DraftCache",
+          "Archive/SentCache",
+          "",
+          "A",
+          "Archive",
+          "B",
+          "C"
+        ],
+        "more": true
+      },
+      {
+        "prefix": "",
+        "page": 1,
+        "keys": ["D", "E", "F", "GmailInbox", "Projects"],
+        "more": false
+      },
+      {
+        "prefix": "Archive",
+        "page": 0,
+        "keys": ["Archive/SentCache"],
+        "more": false
+      },
+      {
+        "prefix": "Projects",
+        "page": 0,
+        "keys": ["Projects/2026", "Projects/2027"],
+        "more": false
+      }
+    ]
+  },
+  {
+    "name": "case-distinct conventional folders require an explicit role",
+    "input": {
+      "folders": { "Sent": "Upper", "sent": "Lower" },
+      "mapping": { "Sent": "Upper", "sent": "Lower" },
+      "roles": {},
+      "policy": {}
+    },
+    "folders": ["Upper", "Lower"],
+    "roles": {},
+    "pages": [
+      {
+        "prefix": "",
+        "page": 0,
+        "keys": ["", "", "", "", "Lower", "Upper"],
+        "more": false
+      }
+    ]
+  },
+  {
+    "name": "owner grouping is atomic and an excluded explicit role never falls back",
+    "input": {
+      "folders": {
+        "INBOX": "Inbox",
+        "Alias": "Alias",
+        "ExcludedDrafts": "ExcludedDrafts",
+        "Drafts": "Drafts",
+        "Sent": "Sent"
+      },
+      "mapping": { "ExcludedDrafts": "ExcludedDrafts" },
+      "roles": { "drafts": "ExcludedDrafts" },
+      "policy": {
+        "groups": [
+          {
+            "id": "pair",
+            "name": "Chosen/Inbox",
+            "primary": "Alias",
+            "folders": ["INBOX", "Alias"]
+          }
+        ],
+        "excluded": ["ExcludedDrafts"]
+      }
+    },
+    "folders": ["/groups/pair", "Drafts", "Sent"],
+    "roles": { "inbox": "/groups/pair", "sent": "Sent" },
+    "labels": { "/groups/pair": "Chosen/Inbox" },
+    "pages": [
+      {
+        "prefix": "",
+        "page": 0,
+        "keys": ["/groups/pair", "", "Sent", "", "Drafts"],
+        "more": false
+      },
+      { "prefix": "/groups/pair", "page": 0, "keys": [], "more": false }
+    ]
+  },
+  {
+    "name": "legacy indexed folders remain accessible without a remote inventory",
+    "input": {
+      "folders": {},
+      "mapping": {},
+      "roles": {},
+      "policy": {},
+      "mailboxes": [
+        {
+          "key": "Inbox",
+          "name": "Inbox",
+          "primary_remote": "INBOX",
+          "members": ["Inbox"]
+        },
+        {
+          "key": "Legacy/Nested",
+          "name": "Legacy/Nested",
+          "primary_remote": "Legacy/Nested",
+          "members": ["Legacy/Nested"]
+        }
+      ]
+    },
+    "folders": ["Inbox", "Legacy/Nested"],
+    "roles": { "inbox": "Inbox" },
+    "pages": [
+      {
+        "prefix": "",
+        "page": 0,
+        "keys": ["Inbox", "", "", "", "Legacy"],
+        "more": false
+      },
+      {
+        "prefix": "Legacy",
+        "page": 0,
+        "keys": ["Legacy/Nested"],
+        "more": false
+      }
+    ]
+  },
+  {
+    "name": "retained aliases preserve the phone's legacy role fallback after remap",
+    "input": {
+      "folders": { "Alias": "NewAlias" },
+      "mapping": { "Alias": "NewAlias" },
+      "roles": {},
+      "policy": {},
+      "bindings": { "Drafts": "Alias", "NewAlias": "Alias" }
+    },
+    "folders": ["NewAlias"],
+    "roles": { "drafts": "NewAlias" },
+    "pages": [
+      {
+        "prefix": "",
+        "page": 0,
+        "keys": ["", "NewAlias", "", ""],
+        "more": false
+      }
+    ]
+  },
+  {
+    "name": "canonical local paths keep role keys and nested paths consistent",
+    "input": {
+      "folders": { "Drafts": "Cache/Drafts" },
+      "mapping": { "Drafts": "Cache//./Drafts" },
+      "roles": {},
+      "policy": {}
+    },
+    "folders": ["Cache/Drafts"],
+    "roles": { "drafts": "Cache/Drafts" },
+    "pages": [
+      {
+        "prefix": "",
+        "page": 0,
+        "keys": ["", "Cache/Drafts", "", "", "Cache"],
+        "more": false
+      },
+      { "prefix": "Cache", "page": 0, "keys": ["Cache/Drafts"], "more": false }
+    ]
+  },
+  {
+    "name": "labels use phone ordering for supplementary Unicode characters",
+    "input": {
+      "folders": { "𐀀": "𐀀", "": "" },
+      "mapping": {},
+      "roles": {},
+      "policy": {}
+    },
+    "folders": ["𐀀", ""],
+    "roles": {},
+    "pages": [
+      {
+        "prefix": "",
+        "page": 0,
+        "keys": ["", "", "", "", "", "𐀀"],
+        "more": false
+      }
+    ]
+  }
+]

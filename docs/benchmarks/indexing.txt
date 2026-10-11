@@ -1,0 +1,54 @@
+goos: linux
+goarch: amd64
+pkg: github.com/voxmail/voxmail/internal/mailindex
+cpu: AMD EPYC 7763 64-Core Processor                
+BenchmarkIndexDatabaseOperations/128_messages/0_attachments/new-2         	       3	 105823858 ns/op	       826.7 index-us/msg	         3.008 store-calls/msg	        91.95 store-percent	       760.2 store-us/msg	 1652197 B/op	   28971 allocs/op
+BenchmarkIndexDatabaseOperations/128_messages/0_attachments/new-2         	       3	  90589796 ns/op	       707.7 index-us/msg	         3.008 store-calls/msg	        91.17 store-percent	       645.3 store-us/msg	 1654888 B/op	   28970 allocs/op
+BenchmarkIndexDatabaseOperations/128_messages/0_attachments/new-2         	       3	  92451425 ns/op	       722.3 index-us/msg	         3.008 store-calls/msg	        91.41 store-percent	       660.2 store-us/msg	 1646613 B/op	   28968 allocs/op
+BenchmarkIndexDatabaseOperations/128_messages/0_attachments/unchanged-2   	       3	  55041286 ns/op	       430.0 index-us/msg	         2.008 store-calls/msg	        97.46 store-percent	       419.1 store-us/msg	  187160 B/op	    4783 allocs/op
+BenchmarkIndexDatabaseOperations/128_messages/0_attachments/unchanged-2   	       3	  52487727 ns/op	       410.1 index-us/msg	         2.008 store-calls/msg	        97.31 store-percent	       399.0 store-us/msg	  187160 B/op	    4783 allocs/op
+BenchmarkIndexDatabaseOperations/128_messages/0_attachments/unchanged-2   	       3	  53529281 ns/op	       418.2 index-us/msg	         2.008 store-calls/msg	        97.37 store-percent	       407.2 store-us/msg	  187160 B/op	    4783 allocs/op
+BenchmarkIndexDatabaseOperations/128_messages/0_attachments/reparse-2     	       3	  84512058 ns/op	       660.3 index-us/msg	         3.008 store-calls/msg	        90.19 store-percent	       595.5 store-us/msg	 1661325 B/op	   29608 allocs/op
+BenchmarkIndexDatabaseOperations/128_messages/0_attachments/reparse-2     	       3	  94770747 ns/op	       740.4 index-us/msg	         3.008 store-calls/msg	        90.99 store-percent	       673.7 store-us/msg	 1658602 B/op	   29607 allocs/op
+BenchmarkIndexDatabaseOperations/128_messages/0_attachments/reparse-2     	       3	  90304572 ns/op	       705.5 index-us/msg	         3.008 store-calls/msg	        90.85 store-percent	       640.9 store-us/msg	 1658645 B/op	   29608 allocs/op
+BenchmarkIndexDatabaseOperations/128_messages/1_attachments/new-2         	       3	 144435293 ns/op	      1128 index-us/msg	         3.008 store-calls/msg	        92.98 store-percent	      1049 store-us/msg	 2630426 B/op	   35924 allocs/op
+BenchmarkIndexDatabaseOperations/128_messages/1_attachments/new-2         	       3	 140720266 ns/op	      1099 index-us/msg	         3.008 store-calls/msg	        92.78 store-percent	      1020 store-us/msg	 2633410 B/op	   35927 allocs/op
+BenchmarkIndexDatabaseOperations/128_messages/1_attachments/new-2         	       3	 134397041 ns/op	      1050 index-us/msg	         3.008 store-calls/msg	        92.46 store-percent	       970.8 store-us/msg	 2630426 B/op	   35924 allocs/op
+BenchmarkIndexDatabaseOperations/128_messages/1_attachments/unchanged-2   	       3	  43574519 ns/op	       340.4 index-us/msg	         2.008 store-calls/msg	        96.85 store-percent	       329.7 store-us/msg	  189994 B/op	    4784 allocs/op
+BenchmarkIndexDatabaseOperations/128_messages/1_attachments/unchanged-2   	       3	  44787747 ns/op	       349.9 index-us/msg	         2.008 store-calls/msg	        96.87 store-percent	       339.0 store-us/msg	  190088 B/op	    4785 allocs/op
+BenchmarkIndexDatabaseOperations/128_messages/1_attachments/unchanged-2   	       3	  41281085 ns/op	       322.5 index-us/msg	         2.008 store-calls/msg	        96.73 store-percent	       312.0 store-us/msg	  189994 B/op	    4784 allocs/op
+BenchmarkIndexDatabaseOperations/128_messages/1_attachments/reparse-2     	       3	 126138740 ns/op	       985.5 index-us/msg	         3.008 store-calls/msg	        92.21 store-percent	       908.7 store-us/msg	 2637408 B/op	   36563 allocs/op
+BenchmarkIndexDatabaseOperations/128_messages/1_attachments/reparse-2     	       3	 129101299 ns/op	      1009 index-us/msg	         3.008 store-calls/msg	        91.88 store-percent	       926.7 store-us/msg	 2631965 B/op	   36561 allocs/op
+BenchmarkIndexDatabaseOperations/128_messages/1_attachments/reparse-2     	       3	 130838968 ns/op	      1022 index-us/msg	         3.008 store-calls/msg	        92.16 store-percent	       942.0 store-us/msg	 2631917 B/op	   36561 allocs/op
+BenchmarkIndexDatabaseOperations/1024_messages/0_attachments/new-2        	       3	1047351633 ns/op	      1023 index-us/msg	         3.001 store-calls/msg	        91.92 store-percent	       940.2 store-us/msg	13213410 B/op	  233043 allocs/op
+BenchmarkIndexDatabaseOperations/1024_messages/0_attachments/new-2        	       3	 713960167 ns/op	       697.2 index-us/msg	         3.001 store-calls/msg	        91.04 store-percent	       634.8 store-us/msg	13205200 B/op	  233041 allocs/op
+BenchmarkIndexDatabaseOperations/1024_messages/0_attachments/new-2        	       3	 664184526 ns/op	       648.6 index-us/msg	         3.001 store-calls/msg	        90.70 store-percent	       588.3 store-us/msg	13213416 B/op	  233043 allocs/op
+BenchmarkIndexDatabaseOperations/1024_messages/0_attachments/unchanged-2  	       3	 382773465 ns/op	       373.8 index-us/msg	         2.001 store-calls/msg	        97.20 store-percent	       363.3 store-us/msg	 1509674 B/op	   37941 allocs/op
+BenchmarkIndexDatabaseOperations/1024_messages/0_attachments/unchanged-2  	       3	 324342523 ns/op	       316.7 index-us/msg	         2.001 store-calls/msg	        96.92 store-percent	       307.0 store-us/msg	 1506898 B/op	   37941 allocs/op
+BenchmarkIndexDatabaseOperations/1024_messages/0_attachments/unchanged-2  	       3	 324213231 ns/op	       316.6 index-us/msg	         2.001 store-calls/msg	        96.90 store-percent	       306.8 store-us/msg	 1509685 B/op	   37941 allocs/op
+BenchmarkIndexDatabaseOperations/1024_messages/0_attachments/reparse-2    	       3	 672648874 ns/op	       656.9 index-us/msg	         3.001 store-calls/msg	        90.36 store-percent	       593.6 store-us/msg	13281858 B/op	  238161 allocs/op
+BenchmarkIndexDatabaseOperations/1024_messages/0_attachments/reparse-2    	       3	 716765758 ns/op	       700.0 index-us/msg	         3.001 store-calls/msg	        90.77 store-percent	       635.4 store-us/msg	13273680 B/op	  238159 allocs/op
+BenchmarkIndexDatabaseOperations/1024_messages/0_attachments/reparse-2    	       3	 650861379 ns/op	       635.6 index-us/msg	         3.001 store-calls/msg	        90.50 store-percent	       575.2 store-us/msg	13284650 B/op	  238162 allocs/op
+BenchmarkIndexDatabaseOperations/1024_messages/1_attachments/new-2        	       3	 980186169 ns/op	       957.2 index-us/msg	         3.001 store-calls/msg	        92.05 store-percent	       881.2 store-us/msg	21014600 B/op	  290038 allocs/op
+BenchmarkIndexDatabaseOperations/1024_messages/1_attachments/new-2        	       3	 954845853 ns/op	       932.5 index-us/msg	         3.001 store-calls/msg	        91.80 store-percent	       856.0 store-us/msg	21017304 B/op	  290038 allocs/op
+BenchmarkIndexDatabaseOperations/1024_messages/1_attachments/new-2        	       3	1025085355 ns/op	      1001 index-us/msg	         3.001 store-calls/msg	        92.28 store-percent	       923.8 store-us/msg	21014226 B/op	  290036 allocs/op
+BenchmarkIndexDatabaseOperations/1024_messages/1_attachments/unchanged-2  	       3	 360292978 ns/op	       351.8 index-us/msg	         2.001 store-calls/msg	        97.11 store-percent	       341.7 store-us/msg	 1509637 B/op	   37941 allocs/op
+BenchmarkIndexDatabaseOperations/1024_messages/1_attachments/unchanged-2  	       3	 352173132 ns/op	       343.9 index-us/msg	         2.001 store-calls/msg	        97.08 store-percent	       333.9 store-us/msg	 1506952 B/op	   37941 allocs/op
+BenchmarkIndexDatabaseOperations/1024_messages/1_attachments/unchanged-2  	       3	 435904901 ns/op	       425.7 index-us/msg	         2.001 store-calls/msg	        96.96 store-percent	       412.7 store-us/msg	 1509637 B/op	   37941 allocs/op
+BenchmarkIndexDatabaseOperations/1024_messages/1_attachments/reparse-2    	       3	1067744724 ns/op	      1043 index-us/msg	         3.001 store-calls/msg	        92.19 store-percent	       961.3 store-us/msg	21070413 B/op	  295151 allocs/op
+BenchmarkIndexDatabaseOperations/1024_messages/1_attachments/reparse-2    	       3	 999946239 ns/op	       976.5 index-us/msg	         3.001 store-calls/msg	        91.96 store-percent	       898.0 store-us/msg	21076061 B/op	  295154 allocs/op
+BenchmarkIndexDatabaseOperations/1024_messages/1_attachments/reparse-2    	       3	 931760256 ns/op	       909.9 index-us/msg	         3.001 store-calls/msg	        91.61 store-percent	       833.6 store-us/msg	21075808 B/op	  295152 allocs/op
+BenchmarkIndexParsingOnly/128_messages/0_attachments-2                    	       3	   3806444 ns/op	        29.74 parse-us/msg	  818762 B/op	   10777 allocs/op
+BenchmarkIndexParsingOnly/128_messages/0_attachments-2                    	       3	   3714528 ns/op	        29.02 parse-us/msg	  821501 B/op	   10778 allocs/op
+BenchmarkIndexParsingOnly/128_messages/0_attachments-2                    	       3	   3716616 ns/op	        29.04 parse-us/msg	  821501 B/op	   10778 allocs/op
+BenchmarkIndexParsingOnly/128_messages/1_attachments-2                    	       3	   4775950 ns/op	        37.31 parse-us/msg	 1707176 B/op	   15554 allocs/op
+BenchmarkIndexParsingOnly/128_messages/1_attachments-2                    	       3	   5585340 ns/op	        43.64 parse-us/msg	 1707176 B/op	   15554 allocs/op
+BenchmarkIndexParsingOnly/128_messages/1_attachments-2                    	       3	   4774660 ns/op	        37.30 parse-us/msg	 1707176 B/op	   15554 allocs/op
+BenchmarkIndexParsingOnly/1024_messages/0_attachments-2                   	       3	  27404323 ns/op	        26.76 parse-us/msg	 6531477 B/op	   86076 allocs/op
+BenchmarkIndexParsingOnly/1024_messages/0_attachments-2                   	       3	  28123693 ns/op	        27.46 parse-us/msg	 6534216 B/op	   86076 allocs/op
+BenchmarkIndexParsingOnly/1024_messages/0_attachments-2                   	       3	  27610538 ns/op	        26.96 parse-us/msg	 6534253 B/op	   86076 allocs/op
+BenchmarkIndexParsingOnly/1024_messages/1_attachments-2                   	       3	  38397417 ns/op	        37.50 parse-us/msg	13599053 B/op	  124880 allocs/op
+BenchmarkIndexParsingOnly/1024_messages/1_attachments-2                   	       3	  37814529 ns/op	        36.93 parse-us/msg	13599058 B/op	  124880 allocs/op
+BenchmarkIndexParsingOnly/1024_messages/1_attachments-2                   	       3	  38087009 ns/op	        37.19 parse-us/msg	13598973 B/op	  124880 allocs/op
+PASS
+ok  	github.com/voxmail/voxmail/internal/mailindex	93.380s

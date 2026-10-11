@@ -46,6 +46,7 @@ type Service struct {
 	// uses mailer.SendWithOutcome; tests can verify journaling without a live
 	// SMTP peer.
 	SubmitMail        func(mailer.Config, []string, []byte) mailer.SendResult
+	promptFn          func(*session, string) error
 	InactivityTimeout time.Duration
 	// InactivityHangupDelay allows the goodbye prompt to finish before the
 	// bridge receives hangup. Zero uses the production default.
@@ -56,12 +57,13 @@ type Service struct {
 	pending               map[string]DialRequest
 	ctx                   context.Context
 
-	pinMu       sync.Mutex
-	pinLock     map[string]time.Time
-	taskMu      sync.Mutex
-	taskWG      sync.WaitGroup
-	tasksClosed bool
-	sipApplying bool
+	pinMu        sync.Mutex
+	pinLock      map[string]time.Time
+	taskMu       sync.Mutex
+	taskWG       sync.WaitGroup
+	tasksClosed  bool
+	sipApplying  bool
+	shuttingDown bool
 }
 
 // startTask owns asynchronous call work so shutdown can wait for every
@@ -168,9 +170,13 @@ func (s *Service) Dial(ctx context.Context, req DialRequest) error {
 	s.mu.Lock()
 	c := s.client
 	sipApplying := s.sipApplying
+	shuttingDown := s.shuttingDown
 	s.mu.Unlock()
 	if c == nil {
 		return errors.New("bridge is not connected")
+	}
+	if shuttingDown {
+		return errors.New("call service is shutting down")
 	}
 	if sipApplying {
 		return errors.New("SIP settings are being applied")
@@ -368,8 +374,11 @@ type session struct {
 	Folders              []string
 	FolderPage           int
 	FolderPrefix         string
+	FolderRolePaths      map[string]string
+	FolderLabels         map[string]string
 	SelectedFolder       string
 	MoveFolders          []string
+	MoveFolderLabels     map[string]string
 	MovePage             int
 	AlertFolders         []string
 	AlertFolderSelection map[string]bool
@@ -403,6 +412,7 @@ type session struct {
 	EmailRuntime         *speech.Runtime
 	SendInFlight         bool
 	Flow                 *ivr.Session
+	navigationGeneration uint64
 	Closed               bool
 	eventCtx             context.Context
 	eventCancel          context.CancelFunc
@@ -510,7 +520,13 @@ func (s *Service) greet(sess *session) {
 }
 
 func (s *Service) prompt(sess *session, text string) error {
-	if s.Media == nil || sess == nil || sess.TxPath == "" {
+	if s == nil || sess == nil {
+		return nil
+	}
+	if s.promptFn != nil {
+		return s.promptFn(sess, text)
+	}
+	if s.Media == nil || sess.TxPath == "" {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(s.eventContext(sess), 45*time.Second)
@@ -535,6 +551,26 @@ func (s *Service) prompt(sess *session, text string) error {
 		s.Log.Warn("ivr prompt failed", "error", err)
 	}
 	return err
+}
+
+// interruptPrompt lets the bridge reader stop the current menu audio before
+// its ordered event worker handles a completed DTMF key. Prompt playback is
+// synchronous on that worker, so waiting to cancel from handleMenu would
+// otherwise make every key arrive only after the prompt finishes.
+func (s *Service) interruptPrompt(callID string) {
+	if s == nil || callID == "" {
+		return
+	}
+	s.mu.Lock()
+	sess := s.sessions[callID]
+	var cancel context.CancelFunc
+	if sess != nil && !sess.Closed {
+		cancel = sess.playCancel
+	}
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 func (s *Service) eventContext(sess *session) context.Context {

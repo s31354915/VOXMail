@@ -2,13 +2,12 @@ package calls
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/voxmail/voxmail/internal/maintenance"
 	"net/mail"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -167,11 +166,12 @@ func (s *Service) playAttachment(sess *session, index int) {
 		s.prompt(sess, "I could not prepare that attachment.")
 		return
 	}
-	tmp, err := os.CreateTemp(dir, ".attachment-*")
+	tmp, releaseTmp, err := maintenance.CreateTemp(dir, ".attachment-*")
 	if err != nil {
 		s.prompt(sess, "I could not prepare that attachment.")
 		return
 	}
+	defer releaseTmp()
 	path := tmp.Name()
 	if _, err := tmp.Write(playable[position].Data); err == nil {
 		err = tmp.Close()
@@ -222,30 +222,24 @@ func (s *Service) openMoveMenu(sess *session, message store.MailSummary) {
 		s.prompt(sess, "The message account is unavailable.")
 		return
 	}
-	folders, err := s.Store.ListMailFolders(s.baseContext(), sess.UserID, account.ID)
+	mailboxes, err := s.Store.ListLogicalMailboxes(s.baseContext(), sess.UserID, account.ID)
 	if err != nil {
 		s.prompt(sess, "Folders are temporarily unavailable.")
 		return
 	}
-	seen := make(map[string]bool, len(folders))
-	for _, folder := range folders {
-		seen[folder] = true
+	folders := make([]string, 0, len(mailboxes))
+	labels := make(map[string]string, len(mailboxes))
+	for _, mailbox := range mailboxes {
+		folders = append(folders, mailbox.Key)
+		labels[mailbox.Key] = mailbox.Name
 	}
-	var mapping map[string]string
-	_ = json.Unmarshal([]byte(account.FolderMap), &mapping)
-	for _, local := range mapping {
-		if local != "" && !seen[local] {
-			folders = append(folders, local)
-			seen[local] = true
-		}
-	}
-	sort.Strings(folders)
 	if len(folders) == 0 {
 		s.prompt(sess, "There are no destination folders.")
 		return
 	}
 	s.mu.Lock()
 	sess.MoveFolders = folders
+	sess.MoveFolderLabels = labels
 	sess.MovePage = 0
 	transitionLocked(sess, "move_menu")
 	s.mu.Unlock()
@@ -255,6 +249,7 @@ func (s *Service) openMoveMenu(sess *session, message store.MailSummary) {
 func (s *Service) promptMoveMenu(sess *session) {
 	s.mu.Lock()
 	page := sess.MovePage
+	labels := copyFolderLabels(sess.MoveFolderLabels)
 	folders := append([]string(nil), sess.MoveFolders...)
 	s.mu.Unlock()
 	start := page * 9
@@ -267,7 +262,7 @@ func (s *Service) promptMoveMenu(sess *session) {
 	}
 	parts := make([]string, 0, end-start)
 	for i, folder := range folders[start:end] {
-		parts = append(parts, fmt.Sprintf("Press %d for %s", i+1, folder))
+		parts = append(parts, fmt.Sprintf("Press %d for %s", i+1, folderLabel(store.Account{}, folder, labels)))
 	}
 	next := ""
 	if end < len(folders) {
@@ -284,6 +279,14 @@ func (s *Service) moveCurrent(sess *session, destination string) {
 	}
 	message := sess.Messages[sess.Cursor]
 	s.mu.Unlock()
+	if strings.HasPrefix(destination, "/groups/") {
+		_, local, err := s.Store.GroupDestination(s.baseContext(), sess.UserID, message.AccountID, destination)
+		if err != nil {
+			s.prompt(sess, "That destination is no longer available. Reopen the folder list.")
+			return
+		}
+		destination = local
+	}
 	cleanDestination := filepath.Clean(filepath.FromSlash(destination))
 	if cleanDestination == "." || filepath.IsAbs(cleanDestination) || strings.HasPrefix(cleanDestination, ".."+string(filepath.Separator)) || cleanDestination == ".." {
 		s.prompt(sess, "That destination is not allowed.")
@@ -350,6 +353,8 @@ func (s *Service) toggleRead(sess *session, message store.MailSummary) {
 // IMAP is reserved for operations that Maildir cannot represent safely, such
 // as a cross-folder move.
 func (s *Service) queueLocalReadState(sess *session, message store.MailSummary, read bool) (string, error) {
+	release := s.Store.LockMailReadState()
+	defer release()
 	localPath, err := setMaildirRead(message.Path, read)
 	if err != nil {
 		s.recordMutation(sess, message, "mark_read", message.Folder, message.Folder, "failed", err)
@@ -362,7 +367,21 @@ func (s *Service) queueLocalReadState(sess *session, message store.MailSummary, 
 		s.recordMutation(sess, message, "mark_read", message.Folder, message.Folder, "failed", err)
 		return "", err
 	}
-	s.recordMutation(sess, message, "mark_read", message.Folder, message.Folder, "queued", nil)
+	cleanupCtx, cleanupCancel := lifecycle.CleanupContext(s.baseContext())
+	defer cleanupCancel()
+	queued := message
+	queued.Path = localPath
+	if err := s.Store.RecordQueuedRead(cleanupCtx, sess.UserID, queued, read); err != nil {
+		var rollbackErr error
+		if localPath != message.Path {
+			rollbackErr = os.Rename(localPath, message.Path)
+		}
+		if rollbackErr == nil {
+			rollbackErr = s.Store.MarkConfirmedReadAtPath(cleanupCtx, queued, message.Read, message.Path)
+		}
+		return "", errors.Join(err, rollbackErr)
+	}
+	_ = s.Store.Audit(cleanupCtx, sess.UserID, "mail_mutation", "mark_read:queued")
 	s.mu.Lock()
 	for i := range sess.Messages {
 		if sess.Messages[i].ID == message.ID {
@@ -410,7 +429,7 @@ func (s *Service) deleteCurrent(sess *session) {
 		s.prompt(sess, "A Trash folder has not been mapped for this account.")
 		return
 	}
-	if err := s.moveRemote(sess, m, trashRemote); err != nil {
+	if err := s.moveRemote(sess, m, trashName); err != nil {
 		status := "failed"
 		if errors.Is(err, remoteimap.ErrMutationUncertain) {
 			status = "uncertain"
@@ -634,11 +653,12 @@ func (s *Service) saveDraft(sess *session) {
 		s.prompt(sess, "Draft storage is unavailable.")
 		return
 	}
-	stageDir, err := os.MkdirTemp(dir, ".draft-stage-")
+	stageDir, releaseStageDir, err := maintenance.MkdirTemp(dir, ".draft-stage-")
 	if err != nil {
 		s.prompt(sess, "Draft attachment storage is unavailable.")
 		return
 	}
+	defer releaseStageDir()
 	defer os.RemoveAll(stageDir)
 	for i, attachment := range d.Attachments {
 		if len(attachment.Data) == 0 {

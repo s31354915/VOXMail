@@ -3,13 +3,83 @@ package calls
 import (
 	"context"
 	"errors"
+	"github.com/voxmail/voxmail/internal/bridge"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/voxmail/voxmail/internal/maintenance"
 	"github.com/voxmail/voxmail/internal/speech"
 )
+
+func TestRecorderOwnsTempsThroughoutBlockedConversion(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "recordings")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	raw := filepath.Join(root, "capture.pcm")
+	if err := os.WriteFile(raw, make([]byte, 128), 0600); err != nil {
+		t.Fatal(err)
+	}
+	entered := filepath.Join(root, "conversion-entered")
+	release := filepath.Join(root, "conversion-release")
+	t.Setenv("VOXMAIL_TEST_CONVERSION_ENTERED", entered)
+	t.Setenv("VOXMAIL_TEST_CONVERSION_RELEASE", release)
+	converter := writeMediaTestCommand(t, "#!/bin/sh\nlast=\nfor arg do last=\"$arg\"; done\n: > \"$VOXMAIL_TEST_CONVERSION_ENTERED\"\nwhile [ ! -f \"$VOXMAIL_TEST_CONVERSION_RELEASE\" ]; do sleep 0.01; done\nprintf RIFF > \"$last\"\n")
+	whisper := writeMediaTestCommand(t, "#!/bin/sh\nprintf 'recognized text\\n'\n")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stop := make(chan struct{})
+	close(stop)
+	done := make(chan error, 1)
+	go func() {
+		text, err := (&VoiceRecorder{Binary: converter, Dir: dir, Whisper: speech.Whisper{Binary: whisper, Model: "fixture"}}).RecordAndTranscribeUntil(ctx, raw, 0, stop)
+		if err == nil && text != "recognized text" {
+			err = errors.New("unexpected transcription")
+		}
+		done <- err
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, err := os.Stat(entered); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("conversion did not start")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("recording fixture: entries=%d err=%v", len(entries), err)
+	}
+	if report, err := maintenance.CleanupEphemeral(root, time.Now().Add(48*time.Hour), time.Hour); err != nil || report.RemovedFiles != 0 {
+		t.Fatalf("maintenance removed owned conversion input/output: %+v %v", report, err)
+	}
+	for _, entry := range entries {
+		if _, err := os.Stat(filepath.Join(dir, entry.Name())); err != nil {
+			t.Fatal("conversion lost an active file", err)
+		}
+	}
+	if err := os.WriteFile(release, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("conversion did not finish")
+	}
+	entries, err = os.ReadDir(dir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("recording cleanup failed: entries=%d err=%v", len(entries), err)
+	}
+}
 
 func TestVoiceRecorderCancellationStopsBeforeFilesystemWork(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -95,4 +165,100 @@ func writeMediaTestCommand(t *testing.T, body string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func TestAudioStopFinishesWhileCancellationAborts(t *testing.T) {
+	dir := t.TempDir()
+	raw := filepath.Join(dir, "capture.pcm")
+	if err := os.WriteFile(raw, make([]byte, 128), 0600); err != nil {
+		t.Fatal(err)
+	}
+	converter := writeMediaTestCommand(t, "#!/bin/sh\nlast=\nfor arg do last=\"$arg\"; done\nprintf 'RIFF' > \"$last\"\n")
+	stop := make(chan struct{})
+	close(stop)
+	recorder := &VoiceRecorder{Binary: converter, Dir: dir}
+	data, err := recorder.RecordAudioUntil(context.Background(), raw, 0, stop)
+	if err != nil || string(data) != "RIFF" {
+		t.Fatalf("finished capture=%q err=%v", data, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = recorder.RecordAudioUntil(ctx, filepath.Join(dir, "missing.pcm"), 0, stop)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancel error=%v", err)
+	}
+}
+
+func TestAudioConversionRemainsOwnedByCallContext(t *testing.T) {
+	dir := t.TempDir()
+	raw := filepath.Join(dir, "capture.pcm")
+	if err := os.WriteFile(raw, make([]byte, 128), 0600); err != nil {
+		t.Fatal(err)
+	}
+	converter := writeMediaTestCommand(t, "#!/bin/sh\nsleep 30\n")
+	stop := make(chan struct{})
+	close(stop)
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := (&VoiceRecorder{Binary: converter, Dir: dir}).RecordAudioUntil(ctx, raw, 0, stop)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("conversion error=%v", err)
+	}
+	if time.Since(started) > 2*time.Second {
+		t.Fatal("conversion outlived its call context")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".attachment-") {
+			t.Fatalf("temporary media remains: %s", entry.Name())
+		}
+	}
+}
+
+func TestAudioFinishKeyStopsCaptureWithoutCancelingConversion(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stop := make(chan struct{})
+	sess := &session{CallID: "audio-finish", State: "audio_recording", Authenticated: true, RecordCancel: cancel, RecordStop: stop}
+	svc.sessions[sess.CallID] = sess
+	if err := svc.handleMenu(nil, sess, bridge.Message{Type: "dtmf", CallID: sess.CallID, Digit: "0", Phase: "start"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-stop:
+	default:
+		t.Fatal("finish key did not stop capture")
+	}
+	if ctx.Err() != nil {
+		t.Fatal("finish key canceled conversion ownership")
+	}
+}
+
+func TestAudioConversionRejectsOversizedOutputAndCleansFile(t *testing.T) {
+	dir := t.TempDir()
+	raw := filepath.Join(dir, "capture.pcm")
+	if err := os.WriteFile(raw, make([]byte, 128), 0600); err != nil {
+		t.Fatal(err)
+	}
+	converter := writeMediaTestCommand(t, "#!/bin/sh\nlast=\nfor arg do last=\"$arg\"; done\nprintf '%03145728d' 0 > \"$last\"\n")
+	stop := make(chan struct{})
+	close(stop)
+	data, err := (&VoiceRecorder{Binary: converter, Dir: dir}).RecordAudioUntil(context.Background(), raw, 0, stop)
+	if err == nil || !strings.Contains(err.Error(), "exceeds size limit") || data != nil {
+		t.Fatalf("data length=%d err=%v", len(data), err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".attachment-") {
+			t.Fatalf("oversized temporary file remains: %s", entry.Name())
+		}
+	}
 }
