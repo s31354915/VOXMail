@@ -33,7 +33,7 @@ func TestCIProducerVerifiesExactSourceForEveryCheckout(t *testing.T) {
 		if next >= 0 {
 			assertion = assertion[:len("      - name:")+next]
 		}
-		if !strings.Contains(assertion, `run: test "$(git rev-parse HEAD)" = "$VOXMAIL_CI_SOURCE_SHA"`) {
+		if !strings.Contains(assertion, `run: test "$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)" = "$VOXMAIL_CI_SOURCE_SHA"`) {
 			t.Fatalf("checkout %d never compares the real checkout with the selected source", i+1)
 		}
 	}
