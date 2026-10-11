@@ -12,7 +12,7 @@ details. Wait for a private route before sending the report. No separate securit
 email address is currently advertised by this project.
 
 The private reporting setting must be enabled by a repository administrator.
-At the last configuration check on 2026-10-08 it was disabled, and the automation
+At the last configuration check on 2026-10-11 it was disabled, and the automation
 token could not enable it. The fallback above applies until maintainers enable
 that setting; this policy does not promise that an unavailable form accepts reports.
 

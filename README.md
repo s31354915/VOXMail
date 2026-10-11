@@ -275,3 +275,11 @@ provider compatibility:
 
 See [release readiness](docs/RELEASE-READINESS.md) for the exact evidence
 available in this checkout and the remaining deployment gates.
+
+## License
+
+VOXMail project code is licensed under the [MIT License](LICENSE). Third-party
+dependencies and voice/model assets retain their own licenses; the project
+license does not replace those terms.
+Container images include the project license at
+`/usr/local/share/licenses/voxmail/LICENSE`.

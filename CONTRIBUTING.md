@@ -111,3 +111,8 @@ ownership-file changes within that review boundary. Do not describe those settin
 as enforced until their repository configuration is verified.
 See [GitHub's code owner rules](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners)
 for base-branch selection, owner eligibility and required-review configuration.
+
+## License for contributions
+
+Contributions to VOXMail project code are accepted under the [MIT License](LICENSE).
+Preserve the copyright notices and licenses of third-party code and assets.

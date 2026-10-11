@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+# PR run metadata names the head SHA; test that exact source, not a synthetic merge.
+env:
+  VOXMAIL_CI_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
 jobs:
   unit:
     name: Go unit tests and static checks
@@ -17,6 +21,11 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.VOXMAIL_CI_SOURCE_SHA }}
+          persist-credentials: false
+      - name: Verify exact checked-out source
+        run: test "$(git rev-parse HEAD)" = "$VOXMAIL_CI_SOURCE_SHA"
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: "1.26.x"
@@ -42,6 +51,11 @@ jobs:
       VOXMAIL_E2E_SIP_PEER: '1'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.VOXMAIL_CI_SOURCE_SHA }}
+          persist-credentials: false
+      - name: Verify exact checked-out source
+        run: test "$(git rev-parse HEAD)" = "$VOXMAIL_CI_SOURCE_SHA"
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: "1.26.x"
@@ -71,6 +85,11 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.VOXMAIL_CI_SOURCE_SHA }}
+          persist-credentials: false
+      - name: Verify exact checked-out source
+        run: test "$(git rev-parse HEAD)" = "$VOXMAIL_CI_SOURCE_SHA"
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: '1.26.x'
@@ -89,6 +108,11 @@ jobs:
     container: python:3.11-slim-bookworm@sha256:0a310eeecf4e1f5a0743f9a6520c90c88d089c903ca5fd283f501e3a805f5f89
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.VOXMAIL_CI_SOURCE_SHA }}
+          persist-credentials: false
+      - name: Verify exact checked-out source
+        run: test "$(git rev-parse HEAD)" = "$VOXMAIL_CI_SOURCE_SHA"
       - name: Verify both wheel targets, native imports and tamper rejection
         run: python scripts/check-python-lock.py
 
@@ -98,6 +122,11 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.VOXMAIL_CI_SOURCE_SHA }}
+          persist-credentials: false
+      - name: Verify exact checked-out source
+        run: test "$(git rev-parse HEAD)" = "$VOXMAIL_CI_SOURCE_SHA"
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: "1.26.x"

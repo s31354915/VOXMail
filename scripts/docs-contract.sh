@@ -73,4 +73,10 @@ contains docs/SETTINGS.md "127.0.0.1:8080"
 contains docs/OPERATIONS.md "VOXMAIL_E2E_SIP_PEER=1 scripts/e2e.sh"
 contains docs/RELEASE-READINESS.md "Promotion checklist"
 
+require_file LICENSE
+contains LICENSE "MIT License"
+contains README.md "[MIT License](LICENSE)"
+contains CONTRIBUTING.md "[MIT License](LICENSE)"
+contains Dockerfile "COPY LICENSE /usr/local/share/licenses/voxmail/LICENSE"
+
 echo "documentation contract passed"
