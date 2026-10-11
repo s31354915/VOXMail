@@ -688,7 +688,7 @@ checks enforce this scope across the current workflows.
 
 ### Hashed Python runtime dependency lock
 
-`requirements/python.in` records reviewed runtime roots, including Piper 1.3.0
+`requirements/python.in` records reviewed runtime roots, including Piper 1.8.0
 and the setuptools/jaraco.context/wheel upgrades. `requirements/python.lock`
 freezes the complete Python 3.11 dependency graph and approved amd64/arm64 wheel
 SHA-256 hashes. Docker installs from that file with `--require-hashes` and
