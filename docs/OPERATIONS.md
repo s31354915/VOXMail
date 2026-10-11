@@ -734,10 +734,9 @@ installation avoids an unreviewed source-build dependency graph.
 
 ### Reviewed dependency update proposals
 
-`.github/dependabot.yml` schedules bounded weekly proposals for Docker base
-image tags/digests, immutable action pins, Go modules, both npm projects and
-Python runtime roots. Each ecosystem allows at most five open version-update
-PRs. Python base major/minor updates are held for an explicit interpreter/lock
+`.github/dependabot.yml` groups Docker base image tags/digests, immutable action
+pins, Go modules, both npm projects and Python runtime roots into one weekly
+version-update PR. Python base major/minor updates are held for an explicit interpreter/lock
 port; digest and compatible patch refreshes remain eligible. Dependabot discovers
 Python roots through `requirements/requirements.txt`, which includes `python.in`.
 It does not replace the custom cross-architecture lock: a root-version proposal

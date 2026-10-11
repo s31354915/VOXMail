@@ -16,8 +16,8 @@ func TestDependencyUpdatesCoverManifestsAndRequireReview(t *testing.T) {
 			t.Errorf("dependency update configuration missing %q", value)
 		}
 	}
-	if strings.Count(string(config), "interval: weekly") != 5 || strings.Count(string(config), "open-pull-requests-limit: 5") != 5 {
-		t.Fatal("every ecosystem must have a bounded weekly proposal schedule")
+	if strings.Count(string(config), "interval: weekly") != 1 || strings.Count(string(config), "multi-ecosystem-group: dependencies") != 5 || strings.Count(string(config), `patterns: ["*"]`) != 5 || strings.Count(string(config), "open-pull-requests-limit: 5") != 5 {
+		t.Fatal("every ecosystem must join the bounded weekly dependency group")
 	}
 	manifest, err := os.ReadFile("../requirements/requirements.txt")
 	if err != nil {
