@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.VOXMAIL_CI_SOURCE_SHA }}
           persist-credentials: false
@@ -50,7 +50,7 @@ jobs:
       VOXMAIL_E2E_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
       VOXMAIL_E2E_SIP_PEER: '1'
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.VOXMAIL_CI_SOURCE_SHA }}
           persist-credentials: false
@@ -84,7 +84,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.VOXMAIL_CI_SOURCE_SHA }}
           persist-credentials: false
@@ -111,7 +111,7 @@ jobs:
         run: |
           apt-get update
           apt-get install --no-install-recommends -y git
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.VOXMAIL_CI_SOURCE_SHA }}
           persist-credentials: false
@@ -125,7 +125,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.VOXMAIL_CI_SOURCE_SHA }}
           persist-credentials: false
