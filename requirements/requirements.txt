@@ -1,0 +1,3 @@
+# Discoverable root manifest for Dependabot. The runtime uses python.lock.
+# Regenerate and verify that lock when reviewing a root-version proposal.
+-r python.in

@@ -7,6 +7,7 @@ package netguard
 import (
 	"context"
 	"fmt"
+	"github.com/voxmail/voxmail/internal/operation"
 	"net"
 	"strconv"
 	"strings"
@@ -37,7 +38,7 @@ func DialContext(ctx context.Context, host string, port int, address string, all
 	if lastErr != nil {
 		return nil, lastErr
 	}
-	return nil, fmt.Errorf("host resolves only to disallowed outbound addresses")
+	return nil, operation.Wrap("network", "validate", operation.EndpointPolicy, fmt.Errorf("host resolves only to disallowed outbound addresses"))
 }
 
 // PublicAddresses resolves host once and returns only addresses allowed by
@@ -49,15 +50,15 @@ func PublicAddresses(ctx context.Context, host string, port int, allowPrivate bo
 	}
 	host = strings.TrimSpace(host)
 	if host == "" || port < 1 || port > 65535 {
-		return nil, fmt.Errorf("invalid outbound endpoint")
+		return nil, operation.Wrap("network", "validate", operation.Configuration, fmt.Errorf("invalid outbound endpoint"))
 	}
 	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil {
-		return nil, err
+		return nil, operation.Wrap("network", "resolve", operation.DNS, err)
 	}
 	addresses := allowedAddresses(ips, port, allowPrivate)
 	if len(addresses) == 0 {
-		return nil, fmt.Errorf("host resolves only to disallowed outbound addresses")
+		return nil, operation.Wrap("network", "validate", operation.EndpointPolicy, fmt.Errorf("host resolves only to disallowed outbound addresses"))
 	}
 	return addresses, nil
 }
@@ -95,11 +96,11 @@ func CheckAndPin(ctx context.Context, host string, port int, allowPrivate bool) 
 func ValidateAddress(address string, port int, allowPrivate bool) error {
 	endpointHost, endpointPort, err := net.SplitHostPort(strings.TrimSpace(address))
 	if err != nil || endpointHost == "" || endpointPort != strconv.Itoa(port) {
-		return fmt.Errorf("invalid validated outbound address")
+		return operation.Wrap("network", "validate", operation.Configuration, fmt.Errorf("invalid validated outbound address"))
 	}
 	ip := net.ParseIP(endpointHost)
 	if ip == nil || (!allowPrivate && blocked(ip)) {
-		return fmt.Errorf("outbound address is not allowed")
+		return operation.Wrap("network", "validate", operation.EndpointPolicy, fmt.Errorf("outbound address is not allowed"))
 	}
 	return nil
 }
@@ -112,16 +113,17 @@ func DialAddressContext(ctx context.Context, address string, allowPrivate bool) 
 	}
 	_, portText, err := net.SplitHostPort(strings.TrimSpace(address))
 	if err != nil {
-		return nil, fmt.Errorf("invalid validated outbound address")
+		return nil, operation.Wrap("network", "validate", operation.Configuration, fmt.Errorf("invalid validated outbound address"))
 	}
 	port, err := strconv.Atoi(portText)
 	if err != nil || port < 1 || port > 65535 {
-		return nil, fmt.Errorf("invalid validated outbound address")
+		return nil, operation.Wrap("network", "validate", operation.Configuration, fmt.Errorf("invalid validated outbound address"))
 	}
 	if err := ValidateAddress(address, port, allowPrivate); err != nil {
 		return nil, err
 	}
-	return (&net.Dialer{}).DialContext(ctx, "tcp", address)
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", address)
+	return conn, operation.Wrap("network", "dial", operation.Connection, err)
 }
 
 func allowedAddresses(ips []net.IPAddr, port int, allowPrivate bool) []string {

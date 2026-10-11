@@ -23,6 +23,9 @@ contains() {
 
 for file in \
 	README.md \
+	CONTRIBUTING.md \
+	SECURITY.md \
+	.github/CODEOWNERS \
 	docs/ARCHITECTURE.md \
 	docs/OPERATIONS.md \
 	docs/RELEASE-READINESS.md \
@@ -35,6 +38,9 @@ done
 require_file tests/browser/prepare.sh
 test -x "$root/tests/browser/prepare.sh" || fail "tests/browser/prepare.sh is not executable"
 contains tests/browser/README.md "tests/browser/prepare.sh"
+require_file scripts/browser-test.sh
+test -x "$root/scripts/browser-test.sh" || fail "scripts/browser-test.sh is not executable"
+contains tests/browser/README.md "scripts/browser-test.sh"
 
 # Every environment variable advertised in the example file must be findable
 # in the settings reference. This catches documentation drift when a setting
@@ -53,6 +59,7 @@ for script in \
 	scripts/restore-drill.sh \
 	scripts/runtime-smoke.sh \
 	scripts/real-model-smoke.sh \
+	scripts/model-acceptance.sh \
 	scripts/sip-peer-smoke.sh; do
 	require_file "$script"
 	test -x "$root/$script" || fail "$script is not executable"

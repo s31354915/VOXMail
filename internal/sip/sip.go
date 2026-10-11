@@ -10,6 +10,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/voxmail/voxmail/internal/diagnostics"
+	"github.com/voxmail/voxmail/internal/operation"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -21,6 +24,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/voxmail/voxmail/internal/maintenance"
 	"github.com/voxmail/voxmail/internal/secret"
 	"github.com/voxmail/voxmail/internal/store"
 )
@@ -33,6 +37,7 @@ const (
 	maxRespawnAttempts          = 5
 	initialRespawnBackoff       = 2 * time.Second
 	maxRespawnBackoff           = 30 * time.Second
+	stableRespawnUptime         = time.Minute
 )
 
 const (
@@ -53,10 +58,12 @@ const (
 // Status separates the child-process lifecycle from SIP registration. A
 // running baresip process is not proof that its account is registered.
 type Status struct {
-	Process      string `json:"process"`
-	Registration string `json:"registration"`
-	Enabled      bool   `json:"enabled"`
-	LastError    string `json:"last_error,omitempty"`
+	Process       string `json:"process"`
+	Registration  string `json:"registration"`
+	Enabled       bool   `json:"enabled"`
+	LastError     string `json:"last_error,omitempty"`
+	ErrorCategory string `json:"error_category,omitempty"`
+	ResponseCode  int    `json:"response_code,omitempty"`
 }
 
 // Baresip supervises a single baresip child process.
@@ -68,24 +75,30 @@ type Baresip struct {
 	LogPath       string
 	LogMaxBytes   int64
 	MaxCalls      int
+	Offline       bool
 	Store         *store.Store
 	Secrets       *secret.Box
 	Log           *slog.Logger
 
-	mu           sync.Mutex
-	lifecycle    sync.Mutex
-	cmd          *exec.Cmd
-	waitDone     chan struct{}
-	logHandle    *os.File
-	enabled      bool
-	account      string
-	stopping     bool
-	runCtx       context.Context
-	runCancel    context.CancelFunc
-	lifetime     context.Context
-	process      string
-	registration string
-	lastError    string
+	mu            sync.Mutex
+	lifecycle     sync.Mutex
+	cmd           *exec.Cmd
+	waitDone      chan struct{}
+	logHandle     io.Closer
+	enabled       bool
+	account       string
+	stopping      bool
+	runCtx        context.Context
+	runCancel     context.CancelFunc
+	lifetime      context.Context
+	process       string
+	registration  string
+	lastError     string
+	errorCategory string
+	responseCode  int
+	generation    uint64
+	crashes       uint8
+	restart       restartPolicy
 }
 
 // Apply reads the current SIP settings, rewrites the baresip configuration,
@@ -132,22 +145,32 @@ func (b *Baresip) apply(ctx context.Context) error {
 		b.runCancel()
 	}
 	b.runCtx, b.runCancel = context.WithCancel(supervisorCtx)
+	b.generation++
 	b.mu.Unlock()
 	settings := b.loadSettings(supervisorCtx)
 	settings = envSettings(settings)
+	offline := b.Offline
+	if value, err := strconv.ParseBool(strings.TrimSpace(os.Getenv("VOXMAIL_OFFLINE_MODE"))); err == nil && value {
+		offline = true
+	}
 	envAccount := strings.TrimSpace(os.Getenv("VOXMAIL_SIP_ACCOUNT"))
 	enableCalls := os.Getenv("VOXMAIL_ENABLE_CALLS") == "1"
 
-	account := envAccount
-	if account == "" && settings.Enabled {
-		account = buildAccount(settings)
+	account := ""
+	if !offline {
+		account = envAccount
+		if account == "" && settings.Enabled {
+			account = buildAccount(settings)
+		}
 	}
-	enabled := enableCalls || envAccount != "" || (settings.Enabled && account != "")
+	enabled := !offline && (enableCalls || envAccount != "" || (settings.Enabled && account != ""))
 	b.mu.Lock()
 	b.stopping = false
 	b.account = account
 	b.enabled = enabled
 	b.lastError = ""
+	b.errorCategory = ""
+	b.responseCode = 0
 	if enabled {
 		b.process = ProcessStarting
 		b.registration = RegistrationUnknown
@@ -160,7 +183,7 @@ func (b *Baresip) apply(ctx context.Context) error {
 	if err := b.writeConfig(settings, account != ""); err != nil {
 		b.mu.Lock()
 		b.process = ProcessDegraded
-		b.lastError = err.Error()
+		b.recordErrorLocked(err)
 		b.mu.Unlock()
 		return err
 	}
@@ -259,6 +282,7 @@ func (b *Baresip) Stop() {
 	defer b.lifecycle.Unlock()
 	b.mu.Lock()
 	b.stopping = true
+	b.generation++
 	b.enabled = false
 	b.process = ProcessStopping
 	b.registration = RegistrationDisabled
@@ -312,7 +336,7 @@ func (b *Baresip) Status() Status {
 			registration = RegistrationDisabled
 		}
 	}
-	return Status{Process: process, Registration: registration, Enabled: b.enabled, LastError: b.lastError}
+	return Status{Process: process, Registration: registration, Enabled: b.enabled, LastError: b.lastError, ErrorCategory: b.errorCategory, ResponseCode: b.responseCode}
 }
 
 // SetRegistrationState is called by the Go bridge when the pinned native shim
@@ -333,8 +357,11 @@ func (b *Baresip) SetRegistrationState(phase, reason string) {
 		b.registration = state
 		if state == RegistrationFailed {
 			b.lastError = strings.TrimSpace(reason)
+			b.errorCategory, b.responseCode = registrationFailure(reason)
 		} else {
 			b.lastError = ""
+			b.errorCategory = ""
+			b.responseCode = 0
 		}
 	}
 	b.mu.Unlock()
@@ -429,7 +456,7 @@ func (b *Baresip) startLocked(ctx context.Context) error {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
 			b.process = ProcessDegraded
-			b.lastError = err.Error()
+			b.recordErrorLocked(err)
 			return err
 		}
 	}
@@ -437,94 +464,94 @@ func (b *Baresip) startLocked(ctx context.Context) error {
 	if binary == "" {
 		binary = "baresip"
 	}
-	logFile := os.Stdout
+	var logFile io.Writer = os.Stdout
+	var logHandle io.Closer
 	if b.LogPath != "" {
-		if err := os.MkdirAll(filepath.Dir(b.LogPath), 0700); err != nil {
-			b.process = ProcessDegraded
-			b.lastError = err.Error()
-			return err
+		maxBytes := b.LogMaxBytes
+		if maxBytes <= 0 {
+			maxBytes = defaultLogMaxBytes
 		}
-		if err := b.rotateLogIfNeeded(); err != nil {
-			b.process = ProcessDegraded
-			b.lastError = err.Error()
-			return err
-		}
-		handle, err := os.OpenFile(b.LogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+		handle, err := newBoundedLog(b.LogPath, maxBytes)
 		if err != nil {
 			b.process = ProcessDegraded
-			b.lastError = err.Error()
+			b.recordErrorLocked(err)
 			return err
 		}
 		logFile = handle
+		logHandle = handle
 	}
 	// Baresip is owned by this supervisor, not by the HTTP request that
 	// triggered Apply. Its lifetime is controlled by Stop and respawn.
-	cmd := exec.Command(binary, "-f", b.ConfigDir)
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
+	cmd := exec.Command(binary, diagnostics.ProcessArguments("baresip", []string{"-f", b.ConfigDir})...)
+	safeLog := diagnostics.NewOutput(ctx, "baresip", logFile)
+	cmd.Stdout = safeLog
+	cmd.Stderr = safeLog
 	cmd.Env = append(os.Environ(),
 		"VOXMAIL_CONTROL_SOCKET="+b.ControlSocket,
 		"VOXMAIL_AUDIO_DIR="+b.AudioDir,
+		"VOXMAIL_VERBOSE="+strconv.FormatBool(diagnostics.Enabled()),
 	)
+	// The native child creates call paths before publishing their events.
+	// Protect its tree before exec, including the graceful teardown window.
+	releaseAudio := maintenance.Protect(b.AudioDir)
 	if err := cmd.Start(); err != nil {
-		if logFile != os.Stdout {
-			_ = logFile.Close()
+		releaseAudio()
+		if logHandle != nil {
+			_ = logHandle.Close()
 		}
-		err = fmt.Errorf("start baresip: %w", err)
+		err = operation.Wrap("baresip", "start", operation.Failed, err)
 		b.process = ProcessDegraded
-		b.lastError = err.Error()
+		b.recordErrorLocked(err)
 		return err
 	}
 	b.cmd = cmd
 	b.process = ProcessRunning
 	b.lastError = ""
-	if logFile != os.Stdout {
-		b.logHandle = logFile
-	}
+	b.errorCategory = ""
+	b.responseCode = 0
+	b.logHandle = logHandle
 	waitDone := make(chan struct{})
 	b.waitDone = waitDone
+	generation := b.generation
+	runCtx := b.runCtx
+	if runCtx == nil {
+		runCtx = ctx
+	}
+	if runCtx == nil {
+		runCtx = context.Background()
+	}
 	if b.Log != nil {
 		b.Log.Info("baresip started", "dir", b.ConfigDir, "account", accountForLog(b.account))
 	}
+	go b.resetAfterStableUptime(cmd, waitDone, runCtx, generation, b.restart.policy().stable)
 	go func() {
-		_ = cmd.Wait()
-		b.onExit(cmd, waitDone)
+		err := cmd.Wait()
+		_ = safeLog.Flush()
+		releaseAudio()
+		b.onExit(cmd, waitDone, runCtx, generation, err)
 	}()
 	return nil
 }
 
-func (b *Baresip) rotateLogIfNeeded() error {
-	maxBytes := b.LogMaxBytes
-	if maxBytes <= 0 {
-		maxBytes = defaultLogMaxBytes
-	}
-	info, err := os.Stat(b.LogPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	if info.Size() < maxBytes {
-		return nil
-	}
-	rotated := b.LogPath + ".1"
-	if err := os.Remove(rotated); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	return os.Rename(b.LogPath, rotated)
-}
-
-func (b *Baresip) onExit(cmd *exec.Cmd, waitDone chan struct{}) {
+func (b *Baresip) onExit(cmd *exec.Cmd, waitDone chan struct{}, runCtx context.Context,
+	generation uint64, exitErr error) {
 	b.mu.Lock()
 	current := b.cmd == cmd
 	account := accountForLog(b.account)
-	shouldRespawn := current && !b.stopping && b.enabled
+	shouldRespawn := current && !b.stopping && b.enabled &&
+		generation == b.generation && runCtx.Err() == nil
 	if current {
 		b.cmd = nil
 		if shouldRespawn {
+			b.recordCrashLocked()
 			b.process = ProcessDegraded
 			b.registration = RegistrationUnknown
+			b.lastError = "baresip exited unexpectedly"
+			b.errorCategory = string(operation.ProcessExit)
+			b.responseCode = 0
+			if exitErr != nil {
+				b.recordErrorLocked(operation.Wrap("baresip", "wait", operation.ProcessExit, exitErr))
+			}
 		} else if b.enabled {
 			b.process = ProcessStopped
 			b.registration = RegistrationUnknown
@@ -533,9 +560,11 @@ func (b *Baresip) onExit(cmd *exec.Cmd, waitDone chan struct{}) {
 			b.registration = RegistrationDisabled
 		}
 	}
-	if current && b.logHandle != nil {
-		_ = b.logHandle.Close()
-		b.logHandle = nil
+	if current {
+		if b.logHandle != nil {
+			_ = b.logHandle.Close()
+			b.logHandle = nil
+		}
 		b.waitDone = nil
 	}
 	b.mu.Unlock()
@@ -549,57 +578,60 @@ func (b *Baresip) onExit(cmd *exec.Cmd, waitDone chan struct{}) {
 		b.Log.Info("baresip exited", "account", account)
 	}
 	if shouldRespawn {
-		b.respawn()
+		b.respawn(runCtx, generation)
 	}
 }
 
-func (b *Baresip) respawn() {
-	backoff := initialRespawnBackoff
+func (b *Baresip) respawn(runCtx context.Context, generation uint64) {
 	for attempt := 1; attempt <= maxRespawnAttempts; attempt++ {
 		b.mu.Lock()
-		runCtx := b.runCtx
+		if generation != b.generation || b.cmd != nil || b.stopping || !b.enabled {
+			b.mu.Unlock()
+			return
+		}
+		backoff := b.restart.policy().delay(b.crashes)
 		b.mu.Unlock()
-		if runCtx == nil {
-			runCtx = context.Background()
+		if b.Log != nil {
+			b.Log.Warn("waiting to restart baresip", "delay", backoff, "attempt", attempt)
 		}
 		timer := time.NewTimer(backoff)
 		select {
 		case <-runCtx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
+			timer.Stop()
 			return
 		case <-timer.C:
 		}
 
 		b.lifecycle.Lock()
 		b.mu.Lock()
-		if b.cmd != nil || b.stopping || !b.enabled {
+		if generation != b.generation || b.cmd != nil || b.stopping || !b.enabled || runCtx.Err() != nil {
 			b.mu.Unlock()
 			b.lifecycle.Unlock()
 			return
 		}
 		err := b.startLocked(runCtx)
+		if err != nil && runCtx.Err() == nil {
+			b.recordCrashLocked()
+		}
 		b.mu.Unlock()
 		b.lifecycle.Unlock()
 		if err == nil {
 			return
 		}
+		if runCtx.Err() != nil {
+			return
+		}
 		if b.Log != nil {
 			b.Log.Error("baresip restart failed", "attempt", attempt, "max_attempts", maxRespawnAttempts, "error", err)
-		}
-		if backoff < maxRespawnBackoff {
-			backoff *= 2
-			if backoff > maxRespawnBackoff {
-				backoff = maxRespawnBackoff
-			}
 		}
 	}
 	if b.Log != nil {
 		b.Log.Error("baresip restart abandoned after repeated failures", "attempts", maxRespawnAttempts)
 	}
 	b.mu.Lock()
-	b.process = ProcessDegraded
+	if generation == b.generation && b.cmd == nil && b.enabled && !b.stopping {
+		b.process = ProcessDegraded
+	}
 	b.mu.Unlock()
 }
 
@@ -758,4 +790,33 @@ func writeFileAtomic(dir, name, content string) error {
 		return err
 	}
 	return os.Rename(path, filepath.Join(dir, name))
+}
+
+// recordErrorLocked stores typed process/storage facts; callers own b.mu.
+func (b *Baresip) recordErrorLocked(err error) {
+	b.lastError = err.Error()
+	b.errorCategory = string(operation.Classify(err))
+	b.responseCode = 0
+}
+
+// The native bridge supplies a response code as the leading token. Arbitrary
+// provider prose is retained only for restricted logs, never for classification.
+func registrationFailure(reason string) (string, int) {
+	category, code := operation.Protocol, 0
+	fields := strings.Fields(reason)
+	if len(fields) > 0 && len(fields[0]) == 3 {
+		parsed, err := strconv.Atoi(fields[0])
+		if err == nil && parsed >= 300 && parsed <= 699 {
+			code = parsed
+		}
+	}
+	switch code {
+	case 401, 403, 407:
+		category = operation.Authentication
+	case 408, 504:
+		category = operation.Timeout
+	case 404:
+		category = operation.SIPAccount
+	}
+	return string(category), code
 }

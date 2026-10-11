@@ -1,0 +1,36 @@
+goos: linux
+goarch: amd64
+pkg: github.com/voxmail/voxmail/internal/mailsync
+cpu: AMD EPYC 7763 64-Core Processor                
+BenchmarkSequentialAccountDelay/startup/baseline-2         	       3	  13209269 ns/op	         5.485 middle-start-ms/op	  216117 B/op	     902 allocs/op
+BenchmarkSequentialAccountDelay/startup/baseline-2         	       3	   8394135 ns/op	         3.505 middle-start-ms/op	  218106 B/op	     902 allocs/op
+BenchmarkSequentialAccountDelay/startup/baseline-2         	       3	   8535973 ns/op	         3.549 middle-start-ms/op	  217149 B/op	     902 allocs/op
+BenchmarkSequentialAccountDelay/startup/slow_first_50ms-2  	       3	  60112941 ns/op	        55.46 middle-start-ms/op	  217512 B/op	     898 allocs/op
+BenchmarkSequentialAccountDelay/startup/slow_first_50ms-2  	       3	  61023540 ns/op	        56.11 middle-start-ms/op	  216909 B/op	     896 allocs/op
+BenchmarkSequentialAccountDelay/startup/slow_first_50ms-2  	       3	  60595809 ns/op	        55.55 middle-start-ms/op	  218026 B/op	     901 allocs/op
+BenchmarkSequentialAccountDelay/startup/slow_last_50ms-2   	       3	  60322120 ns/op	         3.825 middle-start-ms/op	  217578 B/op	     901 allocs/op
+BenchmarkSequentialAccountDelay/startup/slow_last_50ms-2   	       3	  61448333 ns/op	         4.145 middle-start-ms/op	  218093 B/op	     902 allocs/op
+BenchmarkSequentialAccountDelay/startup/slow_last_50ms-2   	       3	  60173312 ns/op	         3.866 middle-start-ms/op	  216925 B/op	     897 allocs/op
+BenchmarkSequentialAccountDelay/startup/slow_first_200ms-2 	       3	 210641537 ns/op	       205.7 middle-start-ms/op	  216981 B/op	     895 allocs/op
+BenchmarkSequentialAccountDelay/startup/slow_first_200ms-2 	       3	 210875682 ns/op	       205.6 middle-start-ms/op	  217064 B/op	     896 allocs/op
+BenchmarkSequentialAccountDelay/startup/slow_first_200ms-2 	       3	 210259305 ns/op	       205.6 middle-start-ms/op	  217085 B/op	     897 allocs/op
+BenchmarkSequentialAccountDelay/startup/slow_last_200ms-2  	       3	 209559478 ns/op	         3.441 middle-start-ms/op	  216992 B/op	     897 allocs/op
+BenchmarkSequentialAccountDelay/startup/slow_last_200ms-2  	       3	 210297219 ns/op	         3.922 middle-start-ms/op	  216909 B/op	     896 allocs/op
+BenchmarkSequentialAccountDelay/startup/slow_last_200ms-2  	       3	 210223033 ns/op	         3.665 middle-start-ms/op	  217546 B/op	     900 allocs/op
+BenchmarkSequentialAccountDelay/due/baseline-2             	       3	   8067295 ns/op	         3.491 middle-start-ms/op	  222880 B/op	    1079 allocs/op
+BenchmarkSequentialAccountDelay/due/baseline-2             	       3	   7748654 ns/op	         3.502 middle-start-ms/op	  223557 B/op	    1081 allocs/op
+BenchmarkSequentialAccountDelay/due/baseline-2             	       3	   8306645 ns/op	         3.860 middle-start-ms/op	  223496 B/op	    1082 allocs/op
+BenchmarkSequentialAccountDelay/due/slow_first_50ms-2      	       3	  66396608 ns/op	        59.78 middle-start-ms/op	  224138 B/op	    1078 allocs/op
+BenchmarkSequentialAccountDelay/due/slow_first_50ms-2      	       3	  60234160 ns/op	        55.52 middle-start-ms/op	  224693 B/op	    1081 allocs/op
+BenchmarkSequentialAccountDelay/due/slow_first_50ms-2      	       3	  61093731 ns/op	        55.92 middle-start-ms/op	  224077 B/op	    1079 allocs/op
+BenchmarkSequentialAccountDelay/due/slow_last_50ms-2       	       3	  60412754 ns/op	         3.865 middle-start-ms/op	  223994 B/op	    1078 allocs/op
+BenchmarkSequentialAccountDelay/due/slow_last_50ms-2       	       3	  61280767 ns/op	         4.808 middle-start-ms/op	  224104 B/op	    1080 allocs/op
+BenchmarkSequentialAccountDelay/due/slow_last_50ms-2       	       3	  60438654 ns/op	         3.931 middle-start-ms/op	  225098 B/op	    1081 allocs/op
+BenchmarkSequentialAccountDelay/due/slow_first_200ms-2     	       3	 223546014 ns/op	       214.7 middle-start-ms/op	  224920 B/op	    1081 allocs/op
+BenchmarkSequentialAccountDelay/due/slow_first_200ms-2     	       3	 210651656 ns/op	       205.8 middle-start-ms/op	  225085 B/op	    1083 allocs/op
+BenchmarkSequentialAccountDelay/due/slow_first_200ms-2     	       3	 210335971 ns/op	       205.6 middle-start-ms/op	  224693 B/op	    1080 allocs/op
+BenchmarkSequentialAccountDelay/due/slow_last_200ms-2      	       3	 211054154 ns/op	         4.389 middle-start-ms/op	  224856 B/op	    1084 allocs/op
+BenchmarkSequentialAccountDelay/due/slow_last_200ms-2      	       3	 210665813 ns/op	         3.653 middle-start-ms/op	  224138 B/op	    1078 allocs/op
+BenchmarkSequentialAccountDelay/due/slow_last_200ms-2      	       3	 211054760 ns/op	         4.331 middle-start-ms/op	  225346 B/op	    1084 allocs/op
+PASS
+ok  	github.com/voxmail/voxmail/internal/mailsync	16.283s

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/voxmail/voxmail/internal/operation"
 	"io"
 	"net/http"
 	"os"
@@ -313,14 +314,14 @@ func ResolveConfiguredModel(voiceDir, configured string) string {
 // voices have no download metadata, so browser input can never turn this into
 // an arbitrary remote download.
 func ResolveVoice(voiceDir, name string) (VoiceSpec, bool) {
-	if voice, ok := FindTrustedVoice(name); ok {
-		return voice, true
-	}
 	name, ok := normalizeVoiceName(name)
-	if !ok || !IsInstalledVoice(voiceDir, name) {
+	if !ok {
 		return VoiceSpec{}, false
 	}
-	return VoiceSpec{Voice: name}, true
+	if IsInstalledVoice(voiceDir, name) {
+		return VoiceSpec{Voice: name}, true
+	}
+	return FindTrustedVoice(name)
 }
 
 func writeActiveVoiceManifest(voiceDir string, manifest activeVoiceManifest) error {
@@ -402,6 +403,12 @@ func InstallVoice(ctx context.Context, voiceDir, name string) error {
 }
 
 func installVoiceLocked(ctx context.Context, voiceDir string, voice VoiceSpec) error {
+	return installVoiceWithDownload(ctx, voiceDir, voice, downloadVerified, nil)
+}
+
+type voiceDownload func(context.Context, string, string, string) error
+
+func installVoiceWithDownload(ctx context.Context, voiceDir string, voice VoiceSpec, fetch voiceDownload, validate func(context.Context, string) error) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -414,6 +421,9 @@ func installVoiceLocked(ctx context.Context, voiceDir string, voice VoiceSpec) e
 	targetModel := filepath.Join(target, voice.Voice+".onnx")
 	targetConfig := targetModel + ".json"
 	activate := func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		return writeActiveVoiceManifest(voiceDir, activeVoiceManifest{
 			Version:      1,
 			Voice:        voice.Voice,
@@ -423,7 +433,7 @@ func installVoiceLocked(ctx context.Context, voiceDir string, voice VoiceSpec) e
 			ConfigSHA256: voice.ConfigSHA256,
 		})
 	}
-	if usableVoicePair(targetModel, targetConfig, voice.ModelSHA256, voice.ConfigSHA256) {
+	if validSHA256(voice.ModelSHA256) && validSHA256(voice.ConfigSHA256) && usableVoicePair(targetModel, targetConfig, voice.ModelSHA256, voice.ConfigSHA256) {
 		if err := activate(); err != nil {
 			return fmt.Errorf("activate voice pointer (version retained at %s): %w", target, err)
 		}
@@ -449,15 +459,50 @@ func installVoiceLocked(ctx context.Context, voiceDir string, voice VoiceSpec) e
 			return err
 		}
 	} else {
-		if err := downloadVerified(ctx, voice.ModelURL, stageModel, voice.ModelSHA256); err != nil {
+		if err := fetch(ctx, voice.ModelURL, stageModel, voice.ModelSHA256); err != nil {
 			return err
 		}
-		if err := downloadVerified(ctx, voice.ConfigURL, stageConfig, voice.ConfigSHA256); err != nil {
+		if err := fetch(ctx, voice.ConfigURL, stageConfig, voice.ConfigSHA256); err != nil {
 			return err
 		}
 	}
 	if !usableVoicePair(stageModel, stageConfig, voice.ModelSHA256, voice.ConfigSHA256) {
-		return fmt.Errorf("voice sidecar is not valid JSON")
+		return &VoiceInstallError{Reason: "voice model is empty or its metadata is not valid JSON"}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if validate != nil {
+		if err := validate(ctx, stageModel); err != nil {
+			return &VoiceInstallError{Reason: "Piper could not load the downloaded voice", Cause: err}
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// An explicit administrator source can lack pre-pinned checksums. Record
+	// the actual pair's digests before deriving its immutable version and
+	// publishing the pointer; optional supplied checksums were verified above.
+	if voice.ModelSHA256 == "" {
+		var err error
+		voice.ModelSHA256, err = ModelSHA256(stageModel)
+		if err != nil {
+			return err
+		}
+	}
+	if voice.ConfigSHA256 == "" {
+		var err error
+		voice.ConfigSHA256, err = ModelSHA256(stageConfig)
+		if err != nil {
+			return err
+		}
+	}
+	version = voice.ModelSHA256 + "-" + voice.ConfigSHA256
+	target = versionDir(voiceDir, voice.Voice, version)
+	targetModel = filepath.Join(target, voice.Voice+".onnx")
+	targetConfig = targetModel + ".json"
+	if usableVoicePair(targetModel, targetConfig, voice.ModelSHA256, voice.ConfigSHA256) {
+		return activate()
 	}
 	if _, err := os.Stat(target); err == nil {
 		if recovery, preserveErr := preserveVoicePath(target, versionRoot, ".voice-version-failed-"); preserveErr != nil {
@@ -507,6 +552,15 @@ func download(ctx context.Context, url, destination string) error {
 }
 
 func downloadVerified(ctx context.Context, url, destination, expectedSHA256 string) error {
+	return downloadVerifiedWithClient(ctx, &http.Client{}, url, destination, expectedSHA256)
+}
+
+func downloadVerifiedWithClient(ctx context.Context, client *http.Client, url, destination, expectedSHA256 string) error {
+	return downloadVerifiedLimit(ctx, client, url, destination, expectedSHA256, maxModelDownload)
+}
+
+func downloadVerifiedLimit(ctx context.Context, client *http.Client, url, destination, expectedSHA256 string, limit int64) (retErr error) {
+	defer func() { retErr = operation.Wrap("models", "download", operation.Protocol, retErr) }()
 	if info, err := os.Stat(destination); err == nil && info.Size() > 0 {
 		if expectedSHA256 == "" || artifactMatches(destination, expectedSHA256) {
 			return nil
@@ -519,13 +573,13 @@ func downloadVerified(ctx context.Context, url, destination, expectedSHA256 stri
 	if err != nil {
 		return err
 	}
-	resp, err := (&http.Client{}).Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("download model: %w", err)
+		return &VoiceInstallError{Reason: "voice download failed", Cause: err}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download model: HTTP %s", resp.Status)
+		return &VoiceInstallError{Reason: fmt.Sprintf("voice download returned HTTP %d", resp.StatusCode)}
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(destination), ".model-")
 	if err != nil {
@@ -534,18 +588,18 @@ func downloadVerified(ctx context.Context, url, destination, expectedSHA256 stri
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
 	hash := sha256.New()
-	n, err := io.Copy(io.MultiWriter(tmp, hash), io.LimitReader(resp.Body, maxModelDownload))
+	n, err := io.Copy(io.MultiWriter(tmp, hash), io.LimitReader(resp.Body, limit))
 	if err != nil {
 		tmp.Close()
 		return err
 	}
-	if n >= maxModelDownload {
+	if n >= limit {
 		tmp.Close()
-		return fmt.Errorf("download model: file exceeds size limit")
+		return operation.Wrap("models", "download", operation.ResourceLimit, &VoiceInstallError{Reason: "voice download exceeds its size limit"})
 	}
 	if expectedSHA256 != "" && hex.EncodeToString(hash.Sum(nil)) != strings.ToLower(strings.TrimSpace(expectedSHA256)) {
 		tmp.Close()
-		return fmt.Errorf("download model: SHA-256 checksum mismatch")
+		return operation.Wrap("models", "verify", operation.Integrity, &VoiceInstallError{Reason: "voice download SHA-256 checksum mismatch"})
 	}
 	if err = tmp.Chmod(0600); err != nil {
 		tmp.Close()

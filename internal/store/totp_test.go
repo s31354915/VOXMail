@@ -55,16 +55,22 @@ func TestTypedTOTPMethodsResetReplayAndConsumeLegacyCodes(t *testing.T) {
 	if err := db.DB.QueryRowContext(ctx, `SELECT backup_codes FROM users WHERE id=?`, "totp-store-user").Scan(&legacyJSON); err != nil {
 		t.Fatal(err)
 	}
-	if legacyJSON != `["legacy-two"]` {
-		t.Fatalf("remaining legacy JSON=%q", legacyJSON)
+	if legacyJSON != "" {
+		t.Fatalf("legacy JSON was not cleared after migration: %q", legacyJSON)
 	}
 	var migrated int
-	if err := db.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM totp_backup_codes WHERE user_id=?`, "totp-store-user").Scan(&migrated); err != nil {
+	if err := db.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM totp_backup_codes WHERE user_id=? AND used_at IS NULL`, "totp-store-user").Scan(&migrated); err != nil {
 		t.Fatal(err)
 	}
 	if migrated != 1 {
 		t.Fatalf("migrated backup rows=%d, want 1", migrated)
 	}
+	for i := 0; i < 2; i++ {
+		if ok, err := db.ConsumeBackupCode(ctx, "totp-store-user", "legacy-two", verify, now); err != nil || ok != (i == 0) {
+			t.Fatalf("migrated code use %d: ok=%v err=%v", i, ok, err)
+		}
+	}
+
 	if err := db.DisableTOTP(ctx, "totp-store-user"); err != nil {
 		t.Fatal(err)
 	}

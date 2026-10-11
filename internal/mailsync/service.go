@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/voxmail/voxmail/internal/diagnostics"
+	"github.com/voxmail/voxmail/internal/maintenance"
+	"github.com/voxmail/voxmail/internal/operation"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -23,9 +26,16 @@ import (
 	"github.com/voxmail/voxmail/internal/store"
 )
 
+var ErrSyncBusy = errors.New("account synchronization is already running")
+var ErrSyncCapacity = errors.New("manual synchronization capacity is full")
+
+const maxManualSyncJobs = 8
+
 type Service struct {
-	Store SyncStore
-	Root  string
+	manualWG    sync.WaitGroup
+	manualSlots chan struct{}
+	Store       SyncStore
+	Root        string
 	// QuarantineRoot optionally receives stale local messages before their
 	// index rows are removed. An empty value preserves direct removal.
 	QuarantineRoot string
@@ -42,6 +52,7 @@ type Service struct {
 	busy             map[string]bool
 	deleting         map[string]bool
 	activeCancel     map[string]context.CancelFunc
+	activeKind       map[string]string
 	activeDone       map[string]chan struct{}
 	last             map[string]time.Time
 	running          atomic.Bool
@@ -59,11 +70,22 @@ type SyncStore interface {
 	BeginSyncRun(context.Context, string, string) (int64, error)
 	FinishSyncRun(context.Context, int64, bool, bool, error) error
 	ListFolderRoles(context.Context, string, string) ([]store.FolderRole, error)
+	BindSyncFolders(context.Context, string, string, int) error
+	RecordFolderDiscovery(context.Context, string, string, int, []string) error
+	PhysicalFoldersForRemote(context.Context, string, string, string) ([]string, error)
 	UpsertRemoteFolder(context.Context, string, string, string, string) error
 	PruneRemoteFolders(context.Context, string, []string) error
 	UpdateMailIdentity(context.Context, string, string, string, uint32, uint32, []string) error
 	UpdateMailIdentityByUID(context.Context, string, string, uint32, uint32, []string) error
-	MarkQueuedMutationsSynchronized(context.Context, string) error
+	QueuedMutationWatermark(context.Context, string) (int64, error)
+	QueuedReadMutations(context.Context, string, int64) ([]store.QueuedReadMutation, error)
+	LatestReadForIdentity(context.Context, string, []string, uint32, uint32) (store.QueuedReadMutation, error)
+	FinishQueuedRead(context.Context, store.QueuedReadMutation, error) error
+	LockMailReadState() func()
+	ReadIdentityCopies(context.Context, string, []string, uint32, uint32) ([]store.MailSummary, error)
+	MarkConfirmedReadAtPath(context.Context, store.MailSummary, bool, string) error
+	RemoteFolderForLocal(context.Context, string, string, string) (string, error)
+	MarkQueuedMutationsSynchronized(context.Context, string, int64, []string) error
 	Audit(context.Context, string, string, string) error
 	ListIndexedMail(context.Context, string) ([]store.IndexedMail, error)
 	UpdateIndexedMailUID(context.Context, string, int64, uint32, uint32) error
@@ -96,6 +118,17 @@ func (s *Service) Run(ctx context.Context) error {
 // Account-level failures remain visible through durable sync_runs records.
 func (s *Service) Healthy() bool {
 	return s != nil && s.running.Load()
+}
+
+// SyncRunning reports live ownership of an account's synchronization work.
+// An unfinished database record alone does not prove that a worker is alive.
+func (s *Service) SyncRunning(accountID string) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.busy[accountID]
 }
 
 func (s *Service) SyncAll(ctx context.Context) error {
@@ -189,9 +222,66 @@ func (s *Service) RefreshAccount(ctx context.Context, userID, accountID string) 
 	return fmt.Errorf("account not found")
 }
 
+// StartRefreshAccount admits a durable run before returning its ID. The
+// request context owns validation/waiting; workerCtx owns the admitted job.
+// Callers must close admission before WaitManualSyncs, as Server.Close does.
+func (s *Service) StartRefreshAccount(requestCtx, workerCtx context.Context, userID, accountID string) (int64, error) {
+	if s.Store == nil || userID == "" || accountID == "" {
+		return 0, fmt.Errorf("user, account, and store are required")
+	}
+	accounts, err := s.Store.ListAccounts(requestCtx, userID)
+	if err != nil {
+		return 0, err
+	}
+	var owned *store.Account
+	for i := range accounts {
+		if accounts[i].ID == accountID {
+			owned = &accounts[i]
+			break
+		}
+	}
+	if owned == nil {
+		return 0, fmt.Errorf("account not found")
+	}
+	if workerCtx == nil {
+		return 0, fmt.Errorf("manual sync worker context is required")
+	}
+	s.ensureState()
+	select {
+	case s.manualSlots <- struct{}{}:
+	default:
+		return 0, ErrSyncCapacity
+	}
+	type admission struct {
+		id  int64
+		err error
+	}
+	started := make(chan admission, 1)
+	s.manualWG.Add(1)
+	go func() {
+		defer s.manualWG.Done()
+		defer func() { <-s.manualSlots }()
+		err := s.syncAccountStarted(workerCtx, *owned, "manual", func(id int64, err error) { started <- admission{id, err} })
+		if err != nil && s.Log != nil {
+			s.Log.Warn("manual synchronization failed", "account", accountID, "category", operation.Classify(err))
+		}
+	}()
+	select {
+	case result := <-started:
+		return result.id, result.err
+	case <-requestCtx.Done():
+		return 0, requestCtx.Err()
+	}
+}
+
+func (s *Service) WaitManualSyncs() { s.manualWG.Wait() }
+
 func (s *Service) ensureState() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.manualSlots == nil {
+		s.manualSlots = make(chan struct{}, maxManualSyncJobs)
+	}
 	if s.busy == nil {
 		s.busy = make(map[string]bool)
 	}
@@ -204,9 +294,33 @@ func (s *Service) ensureState() {
 	if s.activeCancel == nil {
 		s.activeCancel = make(map[string]context.CancelFunc)
 	}
+	if s.activeKind == nil {
+		s.activeKind = make(map[string]string)
+	}
 	if s.activeDone == nil {
 		s.activeDone = make(map[string]chan struct{})
 	}
+}
+
+// CancelManualSync requests cancellation only for an explicitly requested
+// account refresh. Scheduled work remains owned by the background worker.
+func (s *Service) CancelManualSync(ctx context.Context, accountID string) (bool, error) {
+	if s == nil || strings.TrimSpace(accountID) == "" {
+		return false, fmt.Errorf("account identity is required")
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+	s.ensureState()
+	s.mu.Lock()
+	cancel := s.activeCancel[accountID]
+	manual := s.activeKind[accountID] == "manual"
+	s.mu.Unlock()
+	if !manual || cancel == nil {
+		return false, nil
+	}
+	cancel()
+	return true, nil
 }
 
 // StopAccount prevents new synchronization, cancels the active run, and
@@ -268,7 +382,19 @@ func (s *Service) currentTime() time.Time {
 	return time.Now().UTC()
 }
 
-func (s *Service) syncAccount(ctx context.Context, account store.Account, kind string) (retErr error) {
+func (s *Service) syncAccount(ctx context.Context, account store.Account, kind string) error {
+	return s.syncAccountStarted(ctx, account, kind, nil)
+}
+
+func (s *Service) syncAccountStarted(ctx context.Context, account store.Account, kind string, started func(int64, error)) (retErr error) {
+	reported := false
+	defer func() {
+		if started != nil && !reported {
+			started(0, retErr)
+		}
+	}()
+	finishTrace := diagnostics.Start(ctx, "mailsync", kind, "account_id", account.ID)
+	defer func() { finishTrace(retErr) }()
 	s.ensureState()
 	s.mu.Lock()
 	if s.deleting[account.ID] {
@@ -277,12 +403,16 @@ func (s *Service) syncAccount(ctx context.Context, account store.Account, kind s
 	}
 	if s.busy[account.ID] {
 		s.mu.Unlock()
+		if started != nil {
+			return ErrSyncBusy
+		}
 		return nil
 	}
 	s.busy[account.ID] = true
 	accountCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	s.activeCancel[account.ID] = cancel
+	s.activeKind[account.ID] = kind
 	s.activeDone[account.ID] = done
 	s.mu.Unlock()
 	ctx = accountCtx
@@ -291,6 +421,7 @@ func (s *Service) syncAccount(ctx context.Context, account store.Account, kind s
 		s.mu.Lock()
 		delete(s.busy, account.ID)
 		delete(s.activeCancel, account.ID)
+		delete(s.activeKind, account.ID)
 		delete(s.activeDone, account.ID)
 		close(done)
 		s.mu.Unlock()
@@ -307,6 +438,10 @@ func (s *Service) syncAccount(ctx context.Context, account store.Account, kind s
 			retErr = finishErr
 		}
 	}()
+	if started != nil {
+		reported = true
+		started(runID, nil)
+	}
 	root := filepath.Join(s.Root, "mail", account.ID)
 	if err := os.MkdirAll(root, 0700); err != nil {
 		return err
@@ -320,13 +455,23 @@ func (s *Service) syncAccount(ctx context.Context, account store.Account, kind s
 	}
 	imapAddress, err := s.EndpointResolver(ctx, account.IMAPHost, port)
 	if err != nil {
-		return fmt.Errorf("IMAP endpoint rejected by outbound policy: %w", err)
+		return operation.Wrap("mailsync", "endpoint", operation.EndpointPolicy, err)
 	}
 	var folderMap map[string]string
 	if account.FolderMap != "" {
 		_ = json.Unmarshal([]byte(account.FolderMap), &folderMap)
 	}
-	configText, err := mailconfig.Generate(mailconfig.Account{ID: account.ID, IMAPHost: account.IMAPHost, IMAPAddress: imapAddress, IMAPPort: account.IMAPPort, IMAPSecurity: account.IMAPSecurity, IMAPUser: account.IMAPUser, MaildirRoot: root, FolderMap: folderMap})
+	remoteFolders, err := s.discoverSyncFolders(ctx, account, imapAddress)
+	if err != nil {
+		return err
+	}
+	if remoteFolders != nil {
+		if err := s.Store.RecordFolderDiscovery(ctx, account.UserID, account.ID, account.ConfigVersion, remoteFolders); err != nil {
+			return fmt.Errorf("retain sync discovery: %w", err)
+		}
+	}
+	syncAccount := mailconfig.Account{ID: account.ID, IMAPHost: account.IMAPHost, IMAPAddress: imapAddress, IMAPPort: account.IMAPPort, IMAPSecurity: account.IMAPSecurity, IMAPUser: account.IMAPUser, MaildirRoot: root, FolderMap: folderMap, RemoteFolders: remoteFolders}
+	configText, err := mailconfig.Generate(syncAccount)
 	if err != nil {
 		return err
 	}
@@ -335,10 +480,11 @@ func (s *Service) syncAccount(ctx context.Context, account store.Account, kind s
 		return err
 	}
 	configPath := filepath.Join(configDir, account.ID+".conf")
-	tmp, err := os.CreateTemp(configDir, ".conf-")
+	tmp, releaseTmp, err := maintenance.CreateTemp(configDir, ".conf-")
 	if err != nil {
 		return err
 	}
+	defer releaseTmp()
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
 	if _, err := tmp.WriteString(configText); err != nil {
@@ -355,12 +501,31 @@ func (s *Service) syncAccount(ctx context.Context, account store.Account, kind s
 	if err := os.Rename(tmpName, configPath); err != nil {
 		return err
 	}
-	channels := mailconfig.ChannelNames(mailconfig.Account{ID: account.ID, IMAPHost: account.IMAPHost, IMAPPort: account.IMAPPort, IMAPSecurity: account.IMAPSecurity, IMAPUser: account.IMAPUser, MaildirRoot: root, FolderMap: folderMap})
+	channels := mailconfig.ChannelNames(syncAccount)
+	if err := s.Store.BindSyncFolders(ctx, account.UserID, account.ID, account.ConfigVersion); err != nil {
+		return fmt.Errorf("retain sync folder identities: %w", err)
+	}
+	mutationWatermark, err := s.Store.QueuedMutationWatermark(ctx, account.ID)
+	if err != nil {
+		return fmt.Errorf("snapshot queued mail mutations: %w", err)
+	}
 	result, err := s.Runner.SyncChannels(ctx, configPath, channels...)
 	if err != nil {
+		// mbsync can download complete messages before failing. Import those
+		// files without retention, stale-row purging, remote reconciliation,
+		// or acknowledging mutations. Keep the original failure durable.
+		// Use the account context so shutdown/deletion still stops this work.
+		if s.Index != nil {
+			if indexErr := s.Index.IndexAvailable(ctx, account.ID, root); indexErr != nil {
+				return errors.Join(err, operation.Wrap("mailindex", "partial_sync", operation.MailIndex, indexErr))
+			}
+		}
 		return err
 	}
 	changed = result.Changed
+	// Retry retained folders before indexing/reconciliation can refresh flags.
+	// Import downloaded mail even when a retry fails, then report that failure.
+	retainedReadErr := s.retryRetainedReads(ctx, account, mutationWatermark, mailconfig.LocalFolders(syncAccount), imapAddress)
 	// The cutoff is an initial-import boundary, not a permanent retention
 	// boundary. Applying it to every incremental run would silently remove old
 	// mail whenever mbsync re-indexed it. Local retention is the only policy
@@ -376,7 +541,7 @@ func (s *Service) syncAccount(ctx context.Context, account store.Account, kind s
 		}
 		changed = changed || pruned
 		if err := s.Index.Index(ctx, account.ID, root); err != nil {
-			return err
+			return operation.Wrap("mailindex", "sync", operation.MailIndex, err)
 		}
 	}
 	// mbsync owns ordinary incremental UID/flag propagation. The authenticated
@@ -388,8 +553,11 @@ func (s *Service) syncAccount(ctx context.Context, account store.Account, kind s
 			return err
 		}
 	}
-	if err := s.Store.MarkQueuedMutationsSynchronized(ctx, account.ID); err != nil {
+	if err := s.Store.MarkQueuedMutationsSynchronized(ctx, account.ID, mutationWatermark, mailconfig.LocalFolders(syncAccount)); err != nil {
 		return fmt.Errorf("record synchronized mail mutations: %w", err)
+	}
+	if retainedReadErr != nil {
+		return fmt.Errorf("synchronize retained read changes: %w", retainedReadErr)
 	}
 	s.mu.Lock()
 	s.last[account.ID] = time.Now()
@@ -425,6 +593,30 @@ func initialCutoff(account store.Account, kind string) (*time.Time, error) {
 		return nil, fmt.Errorf("account %s initial cutoff: %w", account.ID, err)
 	}
 	return &parsed, nil
+}
+
+func (s *Service) discoverSyncFolders(ctx context.Context, account store.Account, imapAddress string) ([]string, error) {
+	// Isolated runner tests can omit a secret box. Production supplies one.
+	if s.Secrets == nil || strings.TrimSpace(account.IMAPPassword) == "" {
+		return nil, nil
+	}
+	password, err := s.Secrets.Open(account.IMAPPassword)
+	if err != nil {
+		return nil, fmt.Errorf("open IMAP secret for discovery: %w", err)
+	}
+	connection, err := remoteimap.Open(ctx, remoteimap.Config{Host: account.IMAPHost, Address: imapAddress, Port: account.IMAPPort, Security: account.IMAPSecurity, Username: account.IMAPUser, Password: password})
+	if err != nil {
+		return nil, err
+	}
+	defer connection.Close()
+	folders, err := connection.ListFolders()
+	if err != nil {
+		return nil, fmt.Errorf("discover IMAP folders before sync: %w", err)
+	}
+	if folders == nil {
+		folders = []string{}
+	}
+	return folders, nil
 }
 
 func (s *Service) reconcileRemoteIdentity(ctx context.Context, account store.Account, mapping map[string]string, imapAddress string) error {
@@ -474,15 +666,16 @@ func (s *Service) reconcileRemoteIdentity(ctx context.Context, account store.Acc
 		if err != nil {
 			return fmt.Errorf("reconcile IMAP folder %q: %w", remoteFolder, err)
 		}
+		physicalFolders, err := s.Store.PhysicalFoldersForRemote(ctx, account.UserID, account.ID, remoteFolder)
+		if err != nil {
+			return err
+		}
 		for _, identity := range identities {
 			// UIDVALIDITY+UID is the authoritative identity when available.
 			// Keep a Message-ID alias only as a conservative bridge for index
 			// rows created before the next sync recorded their IMAP UID. An alias
 			// may preserve a stale duplicate, but it must never cause deletion.
-			remoteIdentities[remoteIdentityKey(localFolder, identity)] = struct{}{}
-			if strings.TrimSpace(identity.MessageID) != "" {
-				remoteIdentities[remoteMessageIDKey(localFolder, identity.MessageID)] = struct{}{}
-			}
+			retainRemoteIdentity(remoteIdentities, physicalFolders, identity)
 			var updateErr error
 			if strings.TrimSpace(identity.MessageID) != "" {
 				updateErr = s.Store.UpdateMailIdentity(ctx, account.ID, localFolder, identity.MessageID, identity.UID, identity.UIDValidity, identity.Flags)
@@ -509,6 +702,15 @@ func remoteIdentityKey(folder string, identity remoteimap.MessageIdentity) strin
 		return fmt.Sprintf("%s\x00uid\x00%d\x00%d", folder, identity.UIDValidity, identity.UID)
 	}
 	return remoteMessageIDKey(folder, identity.MessageID)
+}
+
+func retainRemoteIdentity(snapshot map[string]struct{}, folders []string, identity remoteimap.MessageIdentity) {
+	for _, folder := range folders {
+		snapshot[remoteIdentityKey(folder, identity)] = struct{}{}
+		if strings.TrimSpace(identity.MessageID) != "" {
+			snapshot[remoteMessageIDKey(folder, identity.MessageID)] = struct{}{}
+		}
+	}
 }
 
 func remoteMessageIDKey(folder, messageID string) string {

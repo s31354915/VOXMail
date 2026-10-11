@@ -3,11 +3,11 @@ package calls
 import (
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 
 	remoteimap "github.com/voxmail/voxmail/internal/imap"
 	"github.com/voxmail/voxmail/internal/lifecycle"
+	"github.com/voxmail/voxmail/internal/mailparse"
 	"github.com/voxmail/voxmail/internal/store"
 )
 
@@ -51,7 +51,10 @@ func (s *Service) setRemoteSeen(sess *session, message store.MailSummary, seen b
 		return err
 	}
 	defer connection.Close()
-	remoteFolderName := remoteFolder(account, message.Folder)
+	remoteFolderName, err := s.Store.RemoteFolderForLocal(s.eventContext(sess), sess.UserID, account.ID, message.Folder)
+	if err != nil {
+		return err
+	}
 	var mutationErr error
 	if message.UID != 0 && message.UIDValidity != 0 {
 		// A failed UID mutation is not safe to reinterpret as a Message-ID
@@ -76,7 +79,14 @@ func (s *Service) moveRemote(sess *session, message store.MailSummary, destinati
 		return err
 	}
 	defer connection.Close()
-	source, target := remoteFolder(account, message.Folder), remoteFolder(account, destination)
+	source, err := s.Store.RemoteFolderForLocal(s.eventContext(sess), sess.UserID, account.ID, message.Folder)
+	if err != nil {
+		return err
+	}
+	target, err := s.Store.RemoteFolderForLocal(s.eventContext(sess), sess.UserID, account.ID, destination)
+	if err != nil {
+		return err
+	}
 	var mutationErr error
 	if message.UID != 0 && message.UIDValidity != 0 {
 		mutationErr = connection.MoveByUID(source, target, message.UID, message.UIDValidity)
@@ -98,7 +108,10 @@ func (s *Service) reconcileRemoteSeen(sess *session, message store.MailSummary, 
 		return fmt.Errorf("%w: read-state confirmation connection failed after %v: %v", remoteimap.ErrMutationUncertain, original, err)
 	}
 	defer connection.Close()
-	folder := remoteFolder(account, message.Folder)
+	folder, err := s.Store.RemoteFolderForLocal(s.eventContext(sess), sess.UserID, account.ID, message.Folder)
+	if err != nil {
+		return fmt.Errorf("%w: read-state identity resolution failed: %v", remoteimap.ErrMutationUncertain, err)
+	}
 	var state remoteimap.MutationState
 	if message.UID != 0 && message.UIDValidity != 0 {
 		state, err = connection.ReconcileSeenByUID(folder, message.UID, message.UIDValidity, seen)
@@ -126,7 +139,14 @@ func (s *Service) reconcileRemoteMove(sess *session, message store.MailSummary, 
 		return fmt.Errorf("%w: move confirmation connection failed after %v: %v", remoteimap.ErrMutationUncertain, original, err)
 	}
 	defer connection.Close()
-	source, target := remoteFolder(account, message.Folder), remoteFolder(account, destination)
+	source, err := s.Store.RemoteFolderForLocal(s.eventContext(sess), sess.UserID, account.ID, message.Folder)
+	if err != nil {
+		return fmt.Errorf("%w: move source identity resolution failed: %v", remoteimap.ErrMutationUncertain, err)
+	}
+	target, err := s.Store.RemoteFolderForLocal(s.eventContext(sess), sess.UserID, account.ID, destination)
+	if err != nil {
+		return fmt.Errorf("%w: move destination identity resolution failed: %v", remoteimap.ErrMutationUncertain, err)
+	}
 	var state remoteimap.MutationState
 	if message.UID != 0 && message.UIDValidity != 0 {
 		// Keep reconciliation on the same stable identity used by the
@@ -163,36 +183,8 @@ func (s *Service) recordMutation(sess *session, message store.MailSummary, opera
 	_ = s.Store.Audit(cleanupCtx, sess.UserID, "mail_mutation", operation+":"+status)
 }
 
-// setMaildirRead updates the Maildir info suffix without touching the message
-// body. Maildir flags are the local cache's durable read-state representation;
-// changing SQLite alone would be overwritten by the next index pass.
 func setMaildirRead(path string, read bool) (string, error) {
-	if strings.TrimSpace(path) == "" {
-		return "", errors.New("maildir path is empty")
-	}
-	marker := ":2,"
-	base, flags := path, ""
-	if index := strings.LastIndex(path, marker); index >= 0 {
-		base, flags = path[:index], path[index+len(marker):]
-	}
-	var kept strings.Builder
-	for _, flag := range flags {
-		if flag != 'S' && flag != 's' {
-			kept.WriteRune(flag)
-		}
-	}
-	flags = kept.String()
-	if read {
-		flags += "S"
-	}
-	target := base + marker + flags
-	if target == path {
-		return path, nil
-	}
-	if err := os.Rename(path, target); err != nil {
-		return "", err
-	}
-	return target, nil
+	return mailparse.SetMaildirRead(path, read)
 }
 
 // rollbackRemoteMove is best effort.  IMAP MOVE can change the UID, so the

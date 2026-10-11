@@ -27,6 +27,7 @@
 #include "call_dispatch.h"
 #include "client_owner.h"
 #include "command_wakeup.h"
+#include "event_shutdown.h"
 #include "frame_parser.h"
 #include "json_output.h"
 #include "nonblocking_pipe.h"
@@ -40,6 +41,8 @@ enum { SOCKET_PATH_MAX = 108, EVENT_BUFFER = 2048, AUDIO_PATH_MAX = 256,
 	VOXMAIL_SAMPLE_RATE = 8000, VOXMAIL_CHANNELS = 1,
 	VOXMAIL_MAX_CAPTURE_BYTES = 64 * 1024 * 1024 };
 
+static bool verbose_logging;
+
 struct session {
 	struct le le;
 	struct call *call;
@@ -49,6 +52,7 @@ struct session {
 	bool closed;
 	bool ringing;
 	bool established;
+	char active_dtmf;
 };
 
 struct dial_item {
@@ -623,11 +627,37 @@ static void call_dtmf_handler(struct call *call, char key, void *arg)
 	char digit[2] = {(char)(unsigned char)key, '\0'};
 	size_t used = 0;
 	(void)call;
+	if (verbose_logging)
+		info("voxmail: DTMF callback call_id=%s phase=%s (value redacted)\n",
+		     session->id, (key == KEYCODE_NONE || key == KEYCODE_REL) ? "end" : "start");
+	/* Baresip reports a keypad key on press and a release sentinel afterward.
+	 * Keep the release as a valueless phase event so the Go dispatcher can
+	 * deduplicate overlapping press callbacks without treating release as a
+	 * second IVR key. */
+	if (key == KEYCODE_NONE || key == KEYCODE_REL) {
+		bool was_active;
+		pthread_mutex_lock(&session_lock);
+		was_active = session->active_dtmf != 0;
+		session->active_dtmf = 0;
+		pthread_mutex_unlock(&session_lock);
+		if (was_active)
+			emit_event("dtmf", session, ",\"phase\":\"end\"");
+		return;
+	}
+	if (!((key >= '0' && key <= '9') || key == '*' || key == '#'))
+		return;
+	pthread_mutex_lock(&session_lock);
+	if (session->active_dtmf == key) {
+		pthread_mutex_unlock(&session_lock);
+		return;
+	}
+	session->active_dtmf = key;
+	pthread_mutex_unlock(&session_lock);
 	{
 		char escaped_digit[sizeof(digit) * 6 + 1];
 		if (!voxmail_json_escape(escaped_digit, sizeof(escaped_digit), digit) ||
 		    !voxmail_json_append(extra, sizeof(extra), &used,
-		                         ",\"digit\":\"%s\",\"phase\":\"end\"",
+		                         ",\"digit\":\"%s\",\"phase\":\"start\"",
 		                         escaped_digit))
 			return;
 	}
@@ -997,6 +1027,8 @@ static void execute_command(struct voxmail_command *item)
 
 	if (!item)
 		return;
+	if (verbose_logging)
+		info("voxmail: execute command type=%d\n", (int)item->type);
 	if (item->type == VOXMAIL_COMMAND_DIAL) {
 		dial_uri(item->request_id, item->uri);
 		return;
@@ -1089,6 +1121,7 @@ static void baresip_event_handler(enum bevent_ev event, struct bevent *bevent,
 						 void *arg)
 {
 	struct call *call;
+	struct session *session;
 	const char *id;
 	int err;
 
@@ -1105,6 +1138,33 @@ static void baresip_event_handler(enum bevent_ev event, struct bevent *bevent,
 		break;
 	case BEVENT_CALL_OUTGOING:
 		(void)new_session(bevent_get_call(bevent), true);
+		break;
+	case BEVENT_SHUTDOWN:
+		/* ua_destroy emits SHUTDOWN before flushing its call list. Our
+		 * sessions retain calls, so release them here while the UA still
+		 * owns each call; otherwise SIP shutdown waits for module teardown,
+		 * which itself cannot run until the SIP stack has finished. */
+		for (;;) {
+			struct le *le;
+			session = NULL;
+			pthread_mutex_lock(&session_lock);
+			for (le = sessions.head; le; le = le->next) {
+				struct session *candidate = le->data;
+				if (!candidate->closed &&
+				    call_get_ua(candidate->call) == bevent_get_ua(bevent)) {
+					session = mem_ref(candidate);
+					break;
+				}
+			}
+			pthread_mutex_unlock(&session_lock);
+			if (!session)
+				break;
+			call_set_handlers(session->call, ignore_call_event_handler,
+			                  NULL, NULL);
+			call_hangup(session->call, 0, "User-Agent shutdown");
+			session_close(session);
+			mem_deref(session);
+		}
 		break;
 	case BEVENT_CALL_LOCAL_SDP:
 		/* Baresip emits CALL_OUTGOING/CALL_INCOMING before allocating the
@@ -1316,9 +1376,21 @@ static int open_socket(void)
 	return 0;
 }
 
+static void stop_worker_threads(void *arg)
+{
+	(void)arg;
+	re_atomic_rlx_set(&running, false);
+}
+
 static void module_cleanup(void)
 {
-	re_atomic_rlx_set(&running, false);
+	/* The event worker tests running and enters its condition wait while
+	 * holding event_lock. Stop and wake it under that same mutex, otherwise
+	 * cleanup can broadcast just before the worker starts waiting forever. */
+	int stop_err = voxmail_event_shutdown(&event_lock, &event_cond,
+	                                     stop_worker_threads, NULL);
+	if (stop_err)
+		warning("voxmail: event shutdown failed (%m)\n", stop_err);
 	if (command_queue.items)
 		voxmail_command_queue_stop(&command_queue);
 	if (bevent_started) {
@@ -1327,7 +1399,6 @@ static void module_cleanup(void)
 	}
 	pcm_ausrc = mem_deref(pcm_ausrc);
 	pcm_auplay = mem_deref(pcm_auplay);
-	pthread_cond_broadcast(&event_cond);
 	voxmail_client_owner_request_shutdown(&client_owner);
 	if (socket_thread_started) {
 		int join_err = voxmail_pthread_join(&socket_thread,
@@ -1378,6 +1449,11 @@ static int module_init(void)
 {
 	int err;
 	const char *root = getenv("VOXMAIL_AUDIO_DIR");
+	const char *verbose = getenv("VOXMAIL_VERBOSE");
+	verbose_logging = verbose && (!strcmp(verbose, "true") ||
+		!strcmp(verbose, "TRUE") || !strcmp(verbose, "True") || !strcmp(verbose, "1"));
+	if (verbose_logging)
+		info("voxmail: verbose bridge diagnostics enabled\n");
 
 	if (root && strlen(root) < sizeof(audio_root))
 		re_snprintf(audio_root, sizeof(audio_root), "%s", root);

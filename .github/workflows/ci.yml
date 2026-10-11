@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
 permissions:
@@ -13,9 +14,10 @@ jobs:
   unit:
     name: Go unit tests and static checks
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: "1.26.x"
           cache: true
@@ -33,21 +35,25 @@ jobs:
   e2e:
     name: End-to-end container tests
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
     needs: unit
     env:
       VOXMAIL_E2E_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+      VOXMAIL_E2E_SIP_PEER: '1'
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: "1.26.x"
       - name: Run E2E suite (builds image, container, restart persistence, cleanup)
         env:
           VOXMAIL_E2E_ARTIFACT_DIR: ${{ runner.temp }}/voxmail-e2e-artifacts
         run: scripts/e2e.sh
+      - name: Verify effective build context and production Go builder
+        run: python3 scripts/check-build-context.py
       - name: Upload redacted E2E diagnostics
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: voxmail-e2e-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/voxmail-e2e-artifacts
@@ -58,3 +64,68 @@ jobs:
           test -z "$(docker ps -aqf name=^/voxmail-e2e-${VOXMAIL_E2E_RUN_ID}$)" || { docker ps -aqf name=^/voxmail-e2e-${VOXMAIL_E2E_RUN_ID}$; exit 1; }
           test -z "$(docker volume ls -qf name=^voxmail-e2e-data-${VOXMAIL_E2E_RUN_ID}$)" || { docker volume ls -qf name=^voxmail-e2e-data-${VOXMAIL_E2E_RUN_ID}$; exit 1; }
           if docker image inspect "voxmail-e2e:${VOXMAIL_E2E_RUN_ID}" >/dev/null 2>&1; then echo "image voxmail-e2e:${VOXMAIL_E2E_RUN_ID} was not removed"; exit 1; fi
+
+  providers:
+    name: Controlled IMAP and SMTP integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26.x'
+          cache: true
+      - name: Install real mbsync
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y isync
+      - name: Exercise loopback providers with verified private CA
+        run: go test -race -count=1 -tags integration -timeout 5m -v ./tests/providers
+
+  python-dependencies:
+    name: Hashed Python runtime dependencies
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    container: python:3.11-slim-bookworm@sha256:0a310eeecf4e1f5a0743f9a6520c90c88d089c903ca5fd283f501e3a805f5f89
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Verify both wheel targets, native imports and tamper rejection
+        run: python scripts/check-python-lock.py
+
+  browser:
+    name: Chromium console flows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: tests/browser/package-lock.json
+      - name: Install locked browser dependencies
+        working-directory: tests/browser
+        run: npm ci
+      - name: Verify generated console matches its modules
+        run: |
+          npm ci --prefix internal/web/console
+          npm run --prefix internal/web/console check
+          node --test internal/web/console/folder-preview.test.mjs
+      - name: Install Chromium and system dependencies
+        working-directory: tests/browser
+        run: npx playwright install --with-deps chromium
+      - name: Test disposable offline console
+        run: scripts/browser-test.sh
+      - name: Upload browser failure evidence
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: voxmail-browser-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            tests/browser/test-results
+            tests/browser/playwright-report
+          if-no-files-found: ignore

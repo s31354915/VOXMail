@@ -3,6 +3,7 @@ package mailconfig
 import (
 	"fmt"
 	"net/url"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,11 +24,14 @@ type Account struct {
 	IMAPUser     string
 	MaildirRoot  string
 	FolderMap    map[string]string
+	// RemoteFolders is an authenticated LIST snapshot. A non-nil snapshot
+	// selects explicit pairs so retained local aliases cannot become remote names.
+	RemoteFolders []string
 }
 
-// Generate creates a channel that mirrors every existing remote folder while
-// allowing only local folder creation. Mappings are deliberately not used as
-// patterns: they are semantic aliases consumed by the application.
+// Generate mirrors provider folders while allowing only local folder creation.
+// Production supplies an authenticated snapshot for explicit mailbox pairs;
+// callers without a snapshot retain wildcard discovery for compatibility.
 func Generate(a Account) (string, error) {
 	if a.ID == "" || a.IMAPHost == "" || a.IMAPUser == "" || a.MaildirRoot == "" {
 		return "", fmt.Errorf("account id, host, user, and maildir root are required")
@@ -54,6 +58,11 @@ func Generate(a Account) (string, error) {
 			return "", fmt.Errorf("invalid local folder mapping for %q", remote)
 		}
 	}
+	for _, remote := range a.RemoteFolders {
+		if strings.TrimSpace(remote) == "" || strings.ContainsAny(remote, "\x00\r\n") || strings.HasPrefix(remote, "/") || strings.Contains(remote, "..") {
+			return "", fmt.Errorf("invalid discovered remote folder")
+		}
+	}
 	name := safe(a.ID)
 	root := strings.TrimRight(a.MaildirRoot, "/") + "/"
 	inbox := root + "Inbox"
@@ -73,6 +82,12 @@ func Generate(a Account) (string, error) {
 	if len(exclusions) > 0 {
 		sort.Strings(exclusions)
 		patterns += " " + strings.Join(exclusions, " ")
+	}
+	patternLine := "Patterns " + patterns + "\n"
+	if a.RemoteFolders != nil {
+		// An exact INBOX pattern also makes mbsync LIST the server and learn
+		// its hierarchy delimiter before opening explicit nested pairs.
+		patternLine = "Patterns INBOX\n"
 	}
 	remotes := mappedRemotes(a)
 	base := fmt.Sprintf(`IMAPAccount %s
@@ -94,15 +109,17 @@ SubFolders Verbatim
 Channel %s
 Master :%s-remote:
 Slave :%s-local:
-Patterns %s
-Create Slave
+%sCreate Slave
 Remove None
 Sync All
 Expunge None
 SyncState *
-	`, name, quote(a.IMAPHost), a.IMAPPort, tunnel, quote(a.IMAPUser), name, security, name, name, name, quote(root), quote(inbox), name, name, name, patterns)
+	`, name, quote(a.IMAPHost), a.IMAPPort, tunnel, quote(a.IMAPUser), name, security, name, name, name, quote(root), quote(inbox), name, name, name, patternLine)
 	for i, remote := range remotes {
 		local := a.FolderMap[remote]
+		if local == "" {
+			local = remote
+		}
 		channel := safe(fmt.Sprintf("%s-folder-%d", name, i+1))
 		base += fmt.Sprintf(`
 Channel %s
@@ -137,10 +154,9 @@ func mbsyncSecurity(value string, port int) (string, error) {
 	}
 }
 
-// ChannelNames returns the exact channels emitted by Generate.  The main
-// channel mirrors the unmapped folders; each mapped non-Inbox folder gets its
-// own channel so its local alias is preserved. Numeric suffixes avoid channel
-// collisions when two remote names sanitize to the same value.
+// ChannelNames returns the exact channels emitted by Generate. With a snapshot,
+// the main channel selects INBOX and each discovered/mapped non-Inbox folder
+// gets an explicit pair. Numeric suffixes avoid sanitized-name collisions.
 func ChannelNames(a Account) []string {
 	name := safe(a.ID)
 	remotes := mappedRemotes(a)
@@ -152,12 +168,50 @@ func ChannelNames(a Account) []string {
 	return channels
 }
 
+// LocalFolders identifies physical directories covered by the generated plan.
+// nil represents the compatibility wildcard; production snapshots are explicit.
+func LocalFolders(a Account) []string {
+	if a.RemoteFolders == nil {
+		return nil
+	}
+	inbox := "Inbox"
+	for remote, local := range a.FolderMap {
+		if strings.EqualFold(remote, "INBOX") && local != "" {
+			inbox = local
+			break
+		}
+	}
+	selected := map[string]bool{path.Clean(inbox): true}
+	for _, remote := range mappedRemotes(a) {
+		local := a.FolderMap[remote]
+		if local == "" {
+			local = remote
+		}
+		selected[path.Clean(local)] = true
+	}
+	folders := make([]string, 0, len(selected))
+	for folder := range selected {
+		folders = append(folders, folder)
+	}
+	sort.Strings(folders)
+	return folders
+}
+
 func mappedRemotes(a Account) []string {
-	remotes := make([]string, 0, len(a.FolderMap))
+	selected := make(map[string]bool)
 	for remote, local := range a.FolderMap {
 		if strings.EqualFold(remote, "INBOX") || strings.TrimSpace(remote) == "" || strings.TrimSpace(local) == "" {
 			continue
 		}
+		selected[remote] = true
+	}
+	for _, remote := range a.RemoteFolders {
+		if !strings.EqualFold(remote, "INBOX") && remote != "" {
+			selected[remote] = true
+		}
+	}
+	remotes := make([]string, 0, len(selected))
+	for remote := range selected {
 		remotes = append(remotes, remote)
 	}
 	sort.Strings(remotes)

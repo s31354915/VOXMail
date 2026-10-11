@@ -2,6 +2,8 @@ package calls
 
 import (
 	"fmt"
+	"github.com/voxmail/voxmail/internal/diagnostics"
+	"log/slog"
 	"net"
 	"strings"
 
@@ -16,6 +18,9 @@ func (s *Service) handleDTMF(conn net.Conn, message bridge.Message) error {
 	if sess == nil || sess.Closed {
 		s.mu.Unlock()
 		return nil
+	}
+	if diagnostics.Enabled() {
+		slog.Debug("DTMF received", "call_id", message.CallID, "authenticated", sess.Authenticated, "state", sess.State, "phase", message.Phase)
 	}
 	s.armInactivityTimeoutLocked(sess)
 	if sess.Authenticated {
@@ -59,9 +64,10 @@ func (s *Service) handleDTMF(conn net.Conn, message bridge.Message) error {
 	sess.Failures = 0
 	if sess.Flow == nil {
 		sess.Flow = ivr.NewSession(sess.CallID)
-		sess.Flow.State = ivr.StatePIN
+		if sess.State != "" {
+			sess.Flow.State = ivr.State(sess.State)
+		}
 	}
-	sess.Flow.Enter(ivr.StateMain)
 	transitionLocked(sess, "main")
 	phone := sess.Phone
 	s.mu.Unlock()
@@ -112,7 +118,11 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
-		if string(stateLocked(sess)) != previousState {
+		nextState := string(stateLocked(sess))
+		if diagnostics.Enabled() {
+			slog.Debug("IVR menu completed", "call_id", message.CallID, "previous_state", previousState, "state", nextState)
+		}
+		if nextState != previousState {
 			ensureFlowLocked(sess)
 		}
 		s.mu.Unlock()
@@ -127,8 +137,9 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 		if state == "attachment_playback" && sess.AttachmentCancel != nil {
 			sess.AttachmentCancel()
 		}
-		if state == "audio_recording" && sess.RecordCancel != nil {
-			sess.RecordCancel()
+		if state == "audio_recording" && sess.RecordStop != nil {
+			close(sess.RecordStop)
+			sess.RecordStop = nil
 		}
 		if (state == "recording" || state == "recording_subject") && sess.RecordCancel != nil {
 			sess.RecordCancel()
@@ -504,8 +515,9 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 	case "audio_recording":
 		if key == "0" {
 			s.mu.Lock()
-			if sess.RecordCancel != nil {
-				sess.RecordCancel()
+			if sess.RecordStop != nil {
+				close(sess.RecordStop)
+				sess.RecordStop = nil
 			}
 			s.mu.Unlock()
 		}

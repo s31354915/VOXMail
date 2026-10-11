@@ -30,6 +30,8 @@ services:
       VOXMAIL_MAX_CALLS: 10
       VOXMAIL_CONTROL_SOCKET: /data/run/baresip.sock
       VOXMAIL_PROVISION_MODELS: "${VOXMAIL_PROVISION_MODELS:-0}"
+      VOXMAIL_VERBOSE: "${VOXMAIL_VERBOSE:-false}"
+      VOXMAIL_OFFLINE_MODE: "${VOXMAIL_OFFLINE_MODE:-0}"
     ports:
       # Host publication is fixed to loopback. VOXMAIL_HTTP_ADDR controls the
       # container listener only; use an SSH tunnel or explicitly change this

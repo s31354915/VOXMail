@@ -133,3 +133,117 @@ func TestPruneHistoryKeepsInFlightRowsAndBoundsTerminalHistory(t *testing.T) {
 		}
 	}
 }
+
+func TestRetentionBoundsBacklogAndResumesAfterCanceledPass(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "bounded-retention.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	if err := db.CreateUser(ctx, User{ID: "owner", Username: "owner", PasswordHash: "p", PINHash: "p", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	old := now.Add(-48 * time.Hour).Format(time.RFC3339Nano)
+	const total = 5 * MaintenanceBatchRows
+	tx, err := db.DB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	for i := 0; i < total; i++ {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO audit_log(user_id,action,detail,created_at) VALUES('owner','test','',?)`, old); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO recovery_tokens(user_id,email,token_hash,purpose,expires_at,created_at) VALUES('owner','owner@example.com',?,'password',?,?)`, fmt.Sprintf("token-%d", i), old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	policy := HistoryRetentionPolicy{MaxAge: 24 * time.Hour, MaxRows: 1}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := db.PruneHistory(canceled, now, policy); err == nil {
+		t.Fatal("canceled history pass succeeded")
+	}
+	if err := db.PruneEphemeral(canceled, now); err == nil {
+		t.Fatal("canceled security pass succeeded")
+	}
+	var audit, security int
+	readCounts := func() {
+		t.Helper()
+		if err := db.DB.QueryRow(`SELECT COUNT(*) FROM audit_log`).Scan(&audit); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.DB.QueryRow(`SELECT COUNT(*) FROM recovery_tokens`).Scan(&security); err != nil {
+			t.Fatal(err)
+		}
+	}
+	readCounts()
+	if audit != total || security != total {
+		t.Fatal("canceled pass deleted rows")
+	}
+	if err := db.PruneHistory(ctx, now, policy); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PruneEphemeral(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	readCounts()
+	if audit != total-2*MaintenanceBatchRows || security != total-MaintenanceBatchRows {
+		t.Fatalf("unbounded pass: audit=%d security=%d", audit, security)
+	}
+	for range 6 {
+		if err := db.PruneHistory(ctx, now, policy); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.PruneEphemeral(ctx, now); err != nil {
+			t.Fatal(err)
+		}
+		// An unrelated read remains usable between bounded passes on the same
+		// single-connection store; no maintenance transaction spans passes.
+		readCtx, cancel := context.WithTimeout(ctx, time.Second)
+		if _, err := db.UserByID(readCtx, "owner"); err != nil {
+			t.Fatal(err)
+		}
+		cancel()
+	}
+	readCounts()
+	if audit != 0 || security != 0 {
+		t.Fatalf("backlog failed to converge: audit=%d security=%d", audit, security)
+	}
+}
+
+func TestRetentionFailureIsReportedAndCanRetry(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "retention-fault.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	old := now.Add(-48 * time.Hour).Format(time.RFC3339Nano)
+	if _, err := db.DB.Exec(`INSERT INTO audit_log(action,detail,created_at) VALUES('test','',?)`, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`CREATE TRIGGER fail_audit_prune BEFORE DELETE ON audit_log BEGIN SELECT RAISE(ABORT,'injected retention failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	policy := HistoryRetentionPolicy{MaxAge: 24 * time.Hour, MaxRows: 1}
+	if err := db.PruneHistory(ctx, now, policy); err == nil {
+		t.Fatal("injected maintenance failure was hidden")
+	}
+	if _, err := db.DB.Exec(`DROP TRIGGER fail_audit_prune`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PruneHistory(ctx, now, policy); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM audit_log`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("retry failed: count=%d err=%v", count, err)
+	}
+}

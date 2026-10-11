@@ -1,0 +1,24 @@
+goos: linux
+goarch: amd64
+pkg: github.com/voxmail/voxmail/internal/speech
+cpu: AMD EPYC 7763 64-Core Processor                
+BenchmarkCallPreviewSpeechContention/one_call/0_previews-2         	       3	  42039565 ns/op	        42.00 call-max-ms/burst	        42.00 call-mean-ms/op	   70392 B/op	     233 allocs/op
+BenchmarkCallPreviewSpeechContention/one_call/0_previews-2         	       3	  42195095 ns/op	        42.16 call-max-ms/burst	        42.16 call-mean-ms/op	   79952 B/op	     234 allocs/op
+BenchmarkCallPreviewSpeechContention/one_call/0_previews-2         	       3	  42132440 ns/op	        42.10 call-max-ms/burst	        42.10 call-mean-ms/op	   83501 B/op	     236 allocs/op
+BenchmarkCallPreviewSpeechContention/one_call/4_previews-2         	       3	 126599932 ns/op	        96.28 call-max-ms/burst	        96.28 call-mean-ms/op	       118.5 preview-mean-ms/op	  339346 B/op	    1135 allocs/op
+BenchmarkCallPreviewSpeechContention/one_call/4_previews-2         	       3	 129164675 ns/op	       115.8 call-max-ms/burst	       115.8 call-mean-ms/op	       117.9 preview-mean-ms/op	  333352 B/op	    1130 allocs/op
+BenchmarkCallPreviewSpeechContention/one_call/4_previews-2         	       3	 127469507 ns/op	       120.2 call-max-ms/burst	       120.2 call-mean-ms/op	       111.4 preview-mean-ms/op	  334384 B/op	    1138 allocs/op
+BenchmarkCallPreviewSpeechContention/four_calls_shared_voice_speed/0_previews-2         	       3	 169713175 ns/op	       169.6 call-max-ms/burst	       105.6 call-mean-ms/op	  281309 B/op	     910 allocs/op
+BenchmarkCallPreviewSpeechContention/four_calls_shared_voice_speed/0_previews-2         	       3	 171339319 ns/op	       171.3 call-max-ms/burst	       107.0 call-mean-ms/op	  269122 B/op	     908 allocs/op
+BenchmarkCallPreviewSpeechContention/four_calls_shared_voice_speed/0_previews-2         	       3	 168574297 ns/op	       168.5 call-max-ms/burst	       105.4 call-mean-ms/op	  269005 B/op	     909 allocs/op
+BenchmarkCallPreviewSpeechContention/four_calls_shared_voice_speed/4_previews-2         	       3	 248083394 ns/op	       243.6 call-max-ms/burst	       180.4 call-mean-ms/op	       124.0 preview-mean-ms/op	  537168 B/op	    1807 allocs/op
+BenchmarkCallPreviewSpeechContention/four_calls_shared_voice_speed/4_previews-2         	       3	 265964660 ns/op	       264.1 call-max-ms/burst	       199.8 call-mean-ms/op	       121.6 preview-mean-ms/op	  535637 B/op	    1812 allocs/op
+BenchmarkCallPreviewSpeechContention/four_calls_shared_voice_speed/4_previews-2         	       3	 249293637 ns/op	       247.4 call-max-ms/burst	       183.3 call-mean-ms/op	       121.2 preview-mean-ms/op	  537754 B/op	    1805 allocs/op
+BenchmarkCallPreviewSpeechContention/four_calls_distinct_speeds/0_previews-2            	       3	 118039521 ns/op	       116.8 call-max-ms/burst	       101.2 call-mean-ms/op	  271648 B/op	     910 allocs/op
+BenchmarkCallPreviewSpeechContention/four_calls_distinct_speeds/0_previews-2            	       3	 101826913 ns/op	       101.0 call-max-ms/burst	        96.97 call-mean-ms/op	  271741 B/op	     911 allocs/op
+BenchmarkCallPreviewSpeechContention/four_calls_distinct_speeds/0_previews-2            	       3	 103677164 ns/op	       103.2 call-max-ms/burst	        90.87 call-mean-ms/op	  269144 B/op	     911 allocs/op
+BenchmarkCallPreviewSpeechContention/four_calls_distinct_speeds/4_previews-2            	       3	 203795035 ns/op	       201.3 call-max-ms/burst	       194.7 call-mean-ms/op	       194.8 preview-mean-ms/op	  539709 B/op	    1813 allocs/op
+BenchmarkCallPreviewSpeechContention/four_calls_distinct_speeds/4_previews-2            	       3	 219449928 ns/op	       213.5 call-max-ms/burst	       203.1 call-mean-ms/op	       198.5 preview-mean-ms/op	  538181 B/op	    1815 allocs/op
+BenchmarkCallPreviewSpeechContention/four_calls_distinct_speeds/4_previews-2            	       3	 230034132 ns/op	       226.3 call-max-ms/burst	       207.2 call-mean-ms/op	       212.5 preview-mean-ms/op	  537944 B/op	    1812 allocs/op
+PASS
+ok  	github.com/voxmail/voxmail/internal/speech	13.475s

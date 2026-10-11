@@ -6,7 +6,9 @@ package imapcheck
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
+	"github.com/voxmail/voxmail/internal/operation"
 	"net"
 	"strconv"
 	"strings"
@@ -41,7 +43,14 @@ const (
 	cleanupTimeout   = 2 * time.Second
 )
 
-func Check(ctx context.Context, cfg Config) ([]string, error) {
+func Check(ctx context.Context, cfg Config) (_ []string, retErr error) {
+	stage, category := "settings", operation.Configuration
+	defer func() {
+		if retErr != nil && ctx != nil && ctx.Err() != nil {
+			retErr = errors.Join(retErr, ctx.Err())
+		}
+		retErr = operation.Wrap("imap", stage, category, retErr)
+	}()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -63,6 +72,7 @@ func Check(ctx context.Context, cfg Config) ([]string, error) {
 	}
 	setupCtx, setupCancel := context.WithTimeout(operationCtx, commandTimeout)
 	defer setupCancel()
+	stage, category = "dial", operation.Connection
 	dialCtx, dialCancel := context.WithTimeout(operationCtx, connectionTimeout)
 	defer dialCancel()
 	dialer := &net.Dialer{Timeout: connectionTimeout}
@@ -82,6 +92,7 @@ func Check(ctx context.Context, cfg Config) ([]string, error) {
 		return nil, err
 	}
 	if security == "implicit_tls" {
+		stage, category = "tls_handshake", operation.TLS
 		tlsConn := tls.Client(conn, cfg.tlsConfig())
 		if err := tlsConn.HandshakeContext(setupCtx); err != nil {
 			_ = raw.Close()
@@ -93,6 +104,7 @@ func Check(ctx context.Context, cfg Config) ([]string, error) {
 		_ = raw.Close()
 		return nil, err
 	}
+	stage, category = "greeting", operation.Protocol
 	c, err := client.New(conn)
 	if err != nil {
 		_ = raw.Close()
@@ -101,13 +113,16 @@ func Check(ctx context.Context, cfg Config) ([]string, error) {
 	c.Timeout = commandTimeout
 	defer boundedLogout(c, raw)
 	if security == "starttls" {
+		stage, category = "starttls", operation.TLS
 		if err := c.StartTLS(cfg.tlsConfig()); err != nil {
 			return nil, fmt.Errorf("IMAP STARTTLS failed: %w", err)
 		}
 	}
+	stage, category = "authenticate", operation.Authentication
 	if err := c.Login(cfg.Username, cfg.Password); err != nil {
 		return nil, fmt.Errorf("IMAP authentication failed: %w", err)
 	}
+	stage, category = "list_folders", operation.Protocol
 	ch := make(chan *imap.MailboxInfo, 32)
 	// The package uses the imap.MailboxInfo type for List results; importing
 	// it directly keeps the returned contract independent of the client.

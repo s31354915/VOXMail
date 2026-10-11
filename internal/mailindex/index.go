@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/mail"
 	"os"
 	"path/filepath"
@@ -25,7 +26,10 @@ type IndexStore interface {
 	PurgeUnseenMailIndex(context.Context, string, string, string) error
 }
 
-type Indexer struct{ Store IndexStore }
+type Indexer struct {
+	Store IndexStore
+	Log   *slog.Logger
+}
 
 // PruneLocal applies the account's local retention policy. It intentionally
 // removes only files below root; it never issues an IMAP delete or expunge.
@@ -67,9 +71,19 @@ func (i Indexer) PruneLocal(root string, cutoff *time.Time, retentionDays *int) 
 }
 
 func (i Indexer) Index(ctx context.Context, accountID, root string) error {
+	return i.index(ctx, accountID, root, true)
+}
+
+// IndexAvailable imports local messages after an incomplete synchronization.
+// Missing files are not proof of remote deletion, so existing rows are retained.
+func (i Indexer) IndexAvailable(ctx context.Context, accountID, root string) error {
+	return i.index(ctx, accountID, root, false)
+}
+
+func (i Indexer) index(ctx context.Context, accountID, root string, purge bool) error {
 	scanID := newScanID()
 	modTime := func(info os.FileInfo) string { return info.ModTime().UTC().Format(time.RFC3339Nano) }
-	err := mailparse.ScanMetadataEachContextWithFilter(ctx, root, func(path string, info os.FileInfo) (bool, error) {
+	err := mailparse.ScanMetadataEachContextWithFilterAndErrors(ctx, root, func(path string, info os.FileInfo) (bool, error) {
 		record, err := i.Store.FindMailIndex(ctx, accountID, path)
 		if errors.Is(err, sql.ErrNoRows) {
 			return true, nil
@@ -103,9 +117,27 @@ func (i Indexer) Index(ctx context.Context, accountID, root string) error {
 			return err
 		}
 		return nil
+	}, func(path string, parseErr error) error {
+		logger := i.Log
+		if logger == nil {
+			logger = slog.Default()
+		}
+		logger.Warn("mail index skipped malformed message", "account_id", accountID, "path", path, "error", parseErr)
+		if _, err := i.Store.FindMailIndex(ctx, accountID, path); errors.Is(err, sql.ErrNoRows) {
+			return nil
+		} else if err != nil {
+			return err
+		}
+		// Preserve the previous record for this still-present message. Otherwise
+		// the successful end-of-scan purge would mistake an unparseable file for
+		// a deleted message and remove its last usable metadata.
+		return i.Store.MarkMailIndexSeen(ctx, accountID, path, scanID)
 	})
 	if err != nil {
 		return err
+	}
+	if !purge {
+		return nil
 	}
 	return i.purgeStale(ctx, accountID, root, scanID)
 }

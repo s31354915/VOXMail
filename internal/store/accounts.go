@@ -5,9 +5,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"path"
 	"strings"
 	"time"
 
+	"github.com/voxmail/voxmail/internal/folderpolicy"
 	"github.com/voxmail/voxmail/internal/mailsecurity"
 	"github.com/voxmail/voxmail/internal/secret"
 )
@@ -102,6 +104,9 @@ func (s *Store) saveAccountTx(ctx context.Context, tx *sql.Tx, box *secret.Box, 
 		return err
 	}
 	var selectedFolders []string
+	if err := validateFolderDestinationsTx(ctx, tx, account.ID, folderMap); err != nil {
+		return err
+	}
 	if json.Unmarshal([]byte(alertFolders), &selectedFolders) != nil {
 		selectedFolders = nil
 	}
@@ -141,14 +146,14 @@ func validateAccountFolderMap(raw string) (map[string]string, error) {
 		remote := strings.TrimSpace(rawRemote)
 		local := strings.TrimSpace(rawLocal)
 		normalizedLocal := strings.ReplaceAll(local, "\\", "/")
-		if remote == "" || local == "" || strings.ContainsAny(remote+local, "\x00\r\n") || strings.Contains(remote, "..") || strings.Contains(local, "..") || strings.HasPrefix(remote, "/") || strings.HasPrefix(normalizedLocal, "/") {
+		if remote == "" || local == "" || path.Clean(normalizedLocal) == "." || strings.ContainsAny(remote+local, "\x00\r\n") || strings.Contains(remote, "..") || strings.Contains(local, "..") || strings.HasPrefix(remote, "/") || strings.HasPrefix(normalizedLocal, "/") {
 			return nil, fmt.Errorf("%w: folder mappings must be relative, non-empty names", ErrInvalidAccountConfig)
 		}
-		remoteKey := strings.ToLower(remote)
+		remoteKey := folderpolicy.RemoteKey(remote)
 		if _, exists := seenRemote[remoteKey]; exists {
 			return nil, fmt.Errorf("%w: remote folder %q is duplicated", ErrInvalidAccountConfig, remote)
 		}
-		localKey := strings.ToLower(local)
+		localKey := strings.ToLower(path.Clean(strings.ReplaceAll(local, "\\", "/")))
 		if _, exists := seenLocal[localKey]; exists {
 			return nil, fmt.Errorf("%w: local alias %q is duplicated", ErrInvalidAccountConfig, local)
 		}

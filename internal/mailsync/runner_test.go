@@ -78,6 +78,22 @@ func TestSyncTimesOut(t *testing.T) {
 	}
 }
 
+func TestSyncWithoutRunnerTimeoutStillHonorsCallerCancellation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell shim is unix-only")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := (Runner{Binary: fakeMbsync(t, 0, "2")}).Sync(ctx, "config", "initial")
+	if err == nil || !strings.Contains(err.Error(), context.DeadlineExceeded.Error()) {
+		t.Fatalf("Sync error=%v, want caller deadline", err)
+	}
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("caller cancellation was not honored promptly (took %v)", elapsed)
+	}
+}
+
 func TestSyncSignalExitIsFailure(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell shim is unix-only")
@@ -117,7 +133,7 @@ func TestSyncBoundsSubprocessOutput(t *testing.T) {
 	}
 }
 
-func TestSyncDefaultBinaryAndTimeout(t *testing.T) {
+func TestSyncDefaultBinaryWithoutImplicitTimeout(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell shim is unix-only")
 	}
@@ -130,7 +146,7 @@ func TestSyncDefaultBinaryAndTimeout(t *testing.T) {
 	started := time.Now()
 	_, err := (Runner{}).Sync(context.Background(), "config", "home")
 	// The default binary name must be resolved from PATH and a non-zero exit
-	// must be reported without depending on whether the host has real mbsync.
+	// must be reported without imposing an implicit per-run timeout.
 	if err == nil {
 		t.Fatal("Sync with defaults unexpectedly succeeded")
 	}

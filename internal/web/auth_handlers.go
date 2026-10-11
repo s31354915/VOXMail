@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/mail"
-	"strconv"
 	"strings"
 	"time"
 
@@ -22,9 +21,20 @@ type setupRequest struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
 	PIN      string `json:"pin"`
+	// The console explicitly transitions to sign-in after bootstrap. Legacy
+	// API clients retain automatic sign-in unless they opt out.
+	SignIn *bool `json:"sign_in,omitempty"`
 }
 
 func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
+	if s.rejectCompletedSetup(w, r) {
+		return
+	}
+	s.initSetupGuard()
+	if retry := s.reserveSetupAttempt(s.clientHost(r), time.Now()); retry > 0 {
+		writeSetupRateLimit(w, retry, "too many setup attempts; try again later")
+		return
+	}
 	var req setupRequest
 	if !decode(w, r, &req) {
 		return
@@ -33,12 +43,25 @@ func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	pw, err := auth.Hash(req.Password)
+	select {
+	case s.setupHashSem <- struct{}{}:
+		defer func() { <-s.setupHashSem }()
+	default:
+		writeSetupRateLimit(w, time.Second, "setup is busy; try again shortly")
+		return
+	}
+	// Concurrent first-run requests may have passed the initial check while the
+	// installation was empty. Recheck after obtaining a hash slot so losers do
+	// not spend CPU after another request has claimed bootstrap.
+	if s.rejectCompletedSetup(w, r) {
+		return
+	}
+	pw, err := s.hashSetupCredential(req.Password)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "password cannot be hashed")
 		return
 	}
-	pin, err := auth.Hash(req.PIN)
+	pin, err := s.hashSetupCredential(req.PIN)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "PIN cannot be hashed")
 		return
@@ -54,7 +77,9 @@ func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = s.Store.Audit(r.Context(), id, "setup_completed", "")
-	s.issueSession(w, r, id)
+	if (req.SignIn == nil || *req.SignIn) && !s.issueSession(w, r, id) {
+		return
+	}
 	writeJSON(w, http.StatusCreated, publicUser(u))
 }
 
@@ -74,46 +99,43 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "credential fields are too long")
 		return
 	}
-	keys := loginKeysForHost(s.clientHost(r), req.Username)
-	for _, key := range keys {
-		if retry := s.loginBlocked(key); retry > 0 {
-			w.Header().Set("Retry-After", strconv.Itoa(int(retry.Seconds())+1))
-			writeError(w, http.StatusTooManyRequests, "too many sign-in attempts; try again later")
-			return
-		}
+	attempt, retry := s.reserveLoginAttempt(s.clientHost(r), req.Username)
+	if retry > 0 {
+		writeLoginRateLimit(w, retry)
+		return
 	}
+	credentialFailure := false
+	defer func() { attempt.finish(!credentialFailure) }()
 	u, err := s.Store.UserByUsername(r.Context(), strings.TrimSpace(req.Username))
-	if err != nil || !u.Enabled || !auth.Check(u.PasswordHash, req.Password) {
-		for _, key := range keys {
-			s.loginFailure(key)
-		}
+	if err != nil || !u.Enabled || !s.checkLoginPassword(u.PasswordHash, req.Password) {
+		credentialFailure = true
 		writeError(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
+	grant, ok := s.reserveSession(w, u.ID)
+	if !ok {
+		return
+	}
+	defer grant.cancel()
 	totpSecret := s.openTOTPSecret(u.TOTPSecret)
 	if totpSecret != "" {
 		step, valid := auth.TOTPWithStep(totpSecret, req.TOTP, time.Now().UTC())
 		if valid {
 			if !s.consumeTOTPReplay(r.Context(), u.ID, step) {
-				for _, key := range keys {
-					s.loginFailure(key)
-				}
+				credentialFailure = true
 				writeError(w, http.StatusUnauthorized, "authenticator or backup code required")
 				return
 			}
 		} else if !s.consumeBackupCode(r.Context(), u.ID, req.BackupCode) {
-			for _, key := range keys {
-				s.loginFailure(key)
-			}
+			credentialFailure = true
 			writeError(w, http.StatusUnauthorized, "authenticator or backup code required")
 			return
 		}
 	}
-	for _, key := range keys {
-		s.loginSuccess(key)
-	}
 	_ = s.Store.Audit(r.Context(), u.ID, "login_succeeded", "")
-	s.issueSession(w, r, u.ID)
+	if !grant.commit(w, r) {
+		return
+	}
 	writeJSON(w, http.StatusOK, publicUser(u))
 }
 
@@ -188,6 +210,9 @@ func (s *Server) invalidateRecoveryToken(ctx context.Context, id int64) {
 // is known or not. Mailbox ownership is the alternate factor, so this path is
 // rate limited and never exposes account enumeration information.
 func (s *Server) requestRecovery(w http.ResponseWriter, r *http.Request) {
+	if !s.requireOnline(w, "mailbox recovery") {
+		return
+	}
 	var req recoveryRequest
 	if !decode(w, r, &req) {
 		return
@@ -284,9 +309,16 @@ func (s *Server) requestRecovery(w http.ResponseWriter, r *http.Request) {
 		if buildErr != nil {
 			err = fmt.Errorf("recovery message could not be constructed: %w", buildErr)
 		} else {
-			result := mailer.SendWithOutcome(mailer.Config{Host: account.SMTPHost, Port: account.SMTPPort, Security: account.SMTPSecurity, Username: account.SMTPUser, Password: password, From: account.Email}, []string{account.Email}, raw)
+			send := s.SendRecovery
+			if send == nil {
+				send = mailer.SendWithOutcomeContext
+			}
+			result := send(r.Context(), mailer.Config{Host: account.SMTPHost, Port: account.SMTPPort, Security: account.SMTPSecurity, Username: account.SMTPUser, Password: password, From: account.Email}, []string{account.Email}, raw)
 			if result.Status != mailer.SendAccepted {
 				err = result.Err
+				if err == nil {
+					err = errors.New("recovery SMTP delivery was not accepted")
+				}
 			} else if result.CleanupError != nil && s.Log != nil {
 				s.Log.Warn("recovery SMTP accepted message but QUIT cleanup failed", "error", result.CleanupError)
 			}
@@ -355,6 +387,15 @@ func (s *Server) confirmRecovery(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		var passwordHash string
+		var grant *sessionGrant
+		if req.Purpose == "bypass_2fa" {
+			var ok bool
+			grant, ok = s.reserveSession(w, candidate.UserID)
+			if !ok {
+				return
+			}
+			defer grant.cancel()
+		}
 		if req.Purpose == "reset_password" {
 			passwordHash, err = auth.Hash(req.NewPassword)
 			if err != nil {
@@ -372,6 +413,7 @@ func (s *Server) confirmRecovery(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !redeemed.Redeemed {
+			grant.cancel()
 			continue
 		}
 		if req.Purpose == "reset_password" {
@@ -385,7 +427,9 @@ func (s *Server) confirmRecovery(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusUnauthorized, "invalid or expired recovery code")
 			return
 		}
-		s.issueSession(w, r, candidate.UserID)
+		if !grant.commit(w, r) {
+			return
+		}
 		_ = s.Store.Audit(r.Context(), candidate.UserID, "two_factor_bypassed", "mailbox OTP")
 		writeJSON(w, http.StatusOK, map[string]any{"status": "signed_in", "user": publicUser(u)})
 		return
@@ -424,11 +468,11 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !auth.Check(u.PasswordHash, req.Current) {
-		writeError(w, http.StatusUnauthorized, "current password is incorrect")
+		writeFieldError(w, "current_password", "current password is incorrect")
 		return
 	}
 	if err := validatePassword(req.New); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeFieldError(w, "new_password", err.Error())
 		return
 	}
 	hash, err := auth.Hash(req.New)
@@ -441,8 +485,9 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = s.Store.Audit(r.Context(), u.ID, "password_changed", "")
-	s.Sessions.DeleteUser(u.ID)
-	s.issueSession(w, r, u.ID)
+	if !s.replaceUserSession(w, r, u.ID) {
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "changed"})
 }
 
@@ -461,11 +506,11 @@ func (s *Server) changePIN(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !auth.Check(u.PasswordHash, req.CurrentPassword) {
-		writeError(w, http.StatusUnauthorized, "current password is incorrect")
+		writeFieldError(w, "current_password", "current password is incorrect")
 		return
 	}
 	if err := validatePIN(req.NewPIN); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeFieldError(w, "new_pin", err.Error())
 		return
 	}
 	hash, err := auth.Hash(req.NewPIN)

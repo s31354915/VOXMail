@@ -44,6 +44,31 @@ func TestGenerateRejectsEscapingFolderAlias(t *testing.T) {
 	}
 }
 
+func TestDiscoveredSnapshotUsesExplicitPairsWithoutLocalWildcard(t *testing.T) {
+	a := Account{ID: "one", IMAPHost: "imap.example", IMAPUser: "u", MaildirRoot: "/data/mail/one", FolderMap: map[string]string{"INBOX": "Inbox", "[Gmail]/Inbox": "NewInbox"}, RemoteFolders: []string{"INBOX", "[Gmail]/Inbox", "Projects/2026", "Empty", "Empty"}}
+	text, err := Generate(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(text, "Patterns *") || !strings.Contains(text, "Patterns INBOX\n") {
+		t.Fatalf("discovery plan still selects local aliases through a wildcard:\n%s", text)
+	}
+	for _, pair := range []string{"Master :one-remote:\"[Gmail]/Inbox\"\nSlave :one-local:\"NewInbox\"", "Master :one-remote:\"Projects/2026\"\nSlave :one-local:\"Projects/2026\"", "Master :one-remote:\"Empty\"\nSlave :one-local:\"Empty\""} {
+		if !strings.Contains(text, pair) {
+			t.Fatalf("missing explicit mapped/unmapped pair %q:\n%s", pair, text)
+		}
+	}
+	if len(ChannelNames(a)) != 4 || strings.Count(text, "Master :one-remote:\"Empty\"") != 1 {
+		t.Fatalf("snapshot duplicates created duplicate channels: %v", ChannelNames(a))
+	}
+	for _, remote := range []string{"../escape", "/absolute", "broken\nChannel injected"} {
+		a.RemoteFolders = []string{remote}
+		if _, err := Generate(a); err == nil {
+			t.Fatalf("unsafe discovered path accepted: %q", remote)
+		}
+	}
+}
+
 func TestChannelNamesMatchGeneratedMappedChannels(t *testing.T) {
 	account := Account{ID: "gmail/one", IMAPHost: "imap.example", IMAPUser: "u", MaildirRoot: "/data/mail/one", FolderMap: map[string]string{
 		"INBOX":             "Inbox",
@@ -156,5 +181,22 @@ func TestSavedAccountUsesCanonicalSecurityInGeneratedConfig(t *testing.T) {
 	}
 	if !strings.Contains(text, "SSLType IMAPS") || strings.Contains(text, "SSLType IMPLICIT_TLS") {
 		t.Fatalf("saved account generated invalid TLS configuration:\n%s", text)
+	}
+}
+
+func TestLocalFoldersReportsOnlyDirectoriesInExplicitPlan(t *testing.T) {
+	a := Account{FolderMap: map[string]string{"iNbOx": "NewInbox", "[Gmail]/Inbox": "Aliases//./Inbox", "Sent": "Upper", "sent": "Lower"}, RemoteFolders: []string{"INBOX", "[Gmail]/Inbox", "Projects/2026"}}
+	got := LocalFolders(a)
+	want := []string{"Aliases/Inbox", "Lower", "NewInbox", "Projects/2026", "Upper"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("local plan=%v want %v", got, want)
+	}
+	a.RemoteFolders = nil
+	if LocalFolders(a) != nil {
+		t.Fatal("compatibility wildcard lost")
+	}
+	a = Account{RemoteFolders: []string{}}
+	if got := LocalFolders(a); len(got) != 1 || got[0] != "Inbox" {
+		t.Fatalf("empty discovery must retain INBOX channel: %v", got)
 	}
 }

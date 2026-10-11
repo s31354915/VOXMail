@@ -33,6 +33,10 @@ func TestVoiceInstallJobsPersistRestartStateAndRetention(t *testing.T) {
 	if job.UserID != "voice-owner" || job.Voice != "voice-a" || job.Status != "running" || job.Progress != 10 {
 		t.Fatalf("persisted job=%+v", job)
 	}
+	active, err := db.ActiveVoiceInstallJob(ctx)
+	if err != nil || active.ID != job.ID || active.Status != "running" {
+		t.Fatalf("active voice job=%+v err=%v", active, err)
+	}
 	if err := db.MarkInterruptedVoiceInstallJobs(ctx, time.Date(2026, 9, 29, 10, 2, 0, 0, time.UTC)); err != nil {
 		t.Fatal(err)
 	}
@@ -42,6 +46,9 @@ func TestVoiceInstallJobsPersistRestartStateAndRetention(t *testing.T) {
 	}
 	if job.Stage != "failed" || job.Status != "failed" || job.Progress != 100 || job.Error == "" {
 		t.Fatalf("interrupted job=%+v", job)
+	}
+	if _, err := db.ActiveVoiceInstallJob(ctx); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("interrupted job still appeared active: %v", err)
 	}
 	if err := db.PurgeVoiceInstallJobs(ctx, time.Date(2026, 9, 29, 10, 3, 0, 0, time.UTC)); err != nil {
 		t.Fatal(err)

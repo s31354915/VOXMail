@@ -199,12 +199,18 @@ def choose_codec(payloads: Iterable[int]) -> tuple[int, str]:
     raise SmokeFailure(f"peer did not offer PCMU or PCMA: {sorted(offered)}")
 
 
-def make_sdp(port: int, codec: int, codec_name: str, event_pt: int = TELEPHONE_EVENT) -> str:
+def make_sdp(
+    port: int,
+    codec: int,
+    codec_name: str,
+    event_pt: int = TELEPHONE_EVENT,
+    address: str = "127.0.0.1",
+) -> str:
     return (
         "v=0\r\n"
-        "o=voxmail-test 1 1 IN IP4 127.0.0.1\r\n"
+        f"o=voxmail-test 1 1 IN IP4 {address}\r\n"
         "s=VOXMail local SIP peer\r\n"
-        "c=IN IP4 127.0.0.1\r\n"
+        f"c=IN IP4 {address}\r\n"
         "t=0 0\r\n"
         f"m=audio {port} RTP/AVP {codec} {event_pt}\r\n"
         f"a=rtpmap:{codec} {codec_name}/8000\r\n"
@@ -309,16 +315,23 @@ class Call:
 
 
 class SIPPeer:
-    def __init__(self, port: int, username: str = "voxmail", password: str = "secret"):
+    def __init__(
+        self,
+        port: int,
+        username: str = "voxmail",
+        password: str = "secret",
+        host: str = "127.0.0.1",
+    ):
         self.port = port
         self.username = username
         self.password = password
+        self.host = host
         self.realm = "voxmail-local"
         self.nonce = uuid.uuid4().hex
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind(("127.0.0.1", port))
+        self.sock.bind((host, port))
         self.rtp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.rtp_sock.bind(("127.0.0.1", 0))
+        self.rtp_sock.bind((host, 0))
         self.rtp_port = self.rtp_sock.getsockname()[1]
         self.running = threading.Event()
         self.registered = threading.Event()
@@ -406,7 +419,7 @@ class SIPPeer:
                     request,
                     200,
                     "OK",
-                    extra=[("Contact", f"<sip:{self.username}@127.0.0.1:{self.port}>"), ("Expires", "300")],
+                    extra=[("Contact", f"<sip:{self.username}@{self.host}:{self.port}>"), ("Expires", "300")],
                 ),
                 address,
             )
@@ -462,7 +475,7 @@ class SIPPeer:
             self.calls[call_id] = call
         self._send(response_for(request, 100, "Trying"), address)
         self._send(response_for(request, 180, "Ringing", to_tag=call.local_tag), address)
-        body = make_sdp(self.rtp_port, codec, codec_name, event_pt or TELEPHONE_EVENT)
+        body = make_sdp(self.rtp_port, codec, codec_name, event_pt or TELEPHONE_EVENT, self.host)
         self._send(
             response_for(
                 request,
@@ -470,7 +483,7 @@ class SIPPeer:
                 "OK",
                 to_tag=call.local_tag,
                 body=body,
-                extra=[("Contact", f"<sip:{self.username}@127.0.0.1:{self.port}>")],
+                extra=[("Contact", f"<sip:{self.username}@{self.host}:{self.port}>")],
             ),
             address,
         )
@@ -494,17 +507,17 @@ class SIPPeer:
         if ack_uri.startswith("<") and ack_uri.endswith(">"):
             ack_uri = ack_uri[1:-1]
         if not ack_uri:
-            ack_uri = f"sip:{self.username}@127.0.0.1:{address[1]}"
+            ack_uri = f"sip:{self.username}@{self.host}:{address[1]}"
         invite = call.invite
         if not invite:
             raise SmokeFailure("inbound call has no original INVITE")
         fields = [
-            ("Via", f"SIP/2.0/UDP 127.0.0.1:{self.port};branch=z9hG4bK{uuid.uuid4().hex}"),
+            ("Via", f"SIP/2.0/UDP {self.host}:{self.port};branch=z9hG4bK{uuid.uuid4().hex}"),
             ("From", invite.header("from")),
             ("To", response.header("to")),
             ("Call-ID", call.call_id),
             ("CSeq", f"{call.cseq} ACK"),
-            ("Contact", f"<sip:{self.username}@127.0.0.1:{self.port}>"),
+            ("Contact", f"<sip:{self.username}@{self.host}:{self.port}>"),
             ("Content-Length", "0"),
         ]
         self._send(sip_bytes(f"ACK {ack_uri} SIP/2.0", fields), address)
@@ -553,15 +566,15 @@ class SIPPeer:
 
     def _new_inbound_call(self, local_port: int) -> Call:
         call_id = f"voxmail-peer-{uuid.uuid4().hex}"
-        from_header = f"<sip:{self.username}@127.0.0.1:{self.port}>;tag={uuid.uuid4().hex[:12]}"
-        to_header = f"<sip:voxmail@127.0.0.1:{local_port}>"
-        body = make_sdp(self.rtp_port, PCMU, "PCMU", TELEPHONE_EVENT)
+        from_header = f"<sip:{self.username}@{self.host}:{self.port}>;tag={uuid.uuid4().hex[:12]}"
+        to_header = f"<sip:voxmail@{self.host}:{local_port}>"
+        body = make_sdp(self.rtp_port, PCMU, "PCMU", TELEPHONE_EVENT, self.host)
         call = Call(
             call_id=call_id,
             direction="inbound",
             from_header=from_header,
             to_header=to_header,
-            remote_target=("127.0.0.1", local_port),
+            remote_target=(self.host, local_port),
             codec=PCMU,
             codec_name="PCMU",
             event_pt=TELEPHONE_EVENT,
@@ -572,20 +585,20 @@ class SIPPeer:
         with self.lock:
             self.calls[call_id] = call
         fields = [
-            ("Via", f"SIP/2.0/UDP 127.0.0.1:{self.port};branch=z9hG4bK{uuid.uuid4().hex}"),
+            ("Via", f"SIP/2.0/UDP {self.host}:{self.port};branch=z9hG4bK{uuid.uuid4().hex}"),
             ("Max-Forwards", "70"),
             ("From", from_header),
             ("To", to_header),
             ("Call-ID", call_id),
             ("CSeq", "1 INVITE"),
-            ("Contact", f"<sip:{self.username}@127.0.0.1:{self.port}>"),
+            ("Contact", f"<sip:{self.username}@{self.host}:{self.port}>"),
             ("Supported", "replaces,100rel"),
             ("Content-Type", "application/sdp"),
             ("Content-Length", str(len(body.encode("latin-1")))),
         ]
-        request_bytes = sip_bytes(f"INVITE sip:voxmail@127.0.0.1:{local_port} SIP/2.0", fields, body)
+        request_bytes = sip_bytes(f"INVITE sip:voxmail@{self.host}:{local_port} SIP/2.0", fields, body)
         call.invite = parse_sip(request_bytes)
-        self._send(request_bytes, ("127.0.0.1", local_port))
+        self._send(request_bytes, (self.host, local_port))
         self.events.put(("inbound_invite", call))
         return call
 
@@ -599,7 +612,7 @@ class SIPPeer:
         if not target:
             raise SmokeFailure("cannot send BYE without a dialog target")
         fields = [
-            ("Via", f"SIP/2.0/UDP 127.0.0.1:{self.port};branch=z9hG4bK{uuid.uuid4().hex}"),
+            ("Via", f"SIP/2.0/UDP {self.host}:{self.port};branch=z9hG4bK{uuid.uuid4().hex}"),
             ("Max-Forwards", "70"),
             ("From", call.from_header),
             ("To", add_tag(call.to_header, call.remote_tag) if call.remote_tag else call.to_header),
@@ -607,7 +620,7 @@ class SIPPeer:
             ("CSeq", str(call.cseq + 1) + " BYE"),
             ("Content-Length", "0"),
         ]
-        self._send(sip_bytes(f"BYE sip:voxmail@127.0.0.1:{target[1]} SIP/2.0", fields), target)
+        self._send(sip_bytes(f"BYE sip:voxmail@{self.host}:{target[1]} SIP/2.0", fields), target)
 
     def send_dtmf(self, call: Call, digit: str = "5") -> None:
         if not call.remote_rtp:
@@ -799,6 +812,7 @@ class Baresip:
         self.process = None
         if not process:
             return
+        failure = None
         if process.poll() is None:
             process.terminate()
             try:
@@ -806,9 +820,14 @@ class Baresip:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=3)
+                failure = SmokeFailure("Baresip shutdown exceeded five seconds and required SIGKILL")
+        if failure is None and process.returncode != 0:
+            failure = SmokeFailure(f"Baresip exited uncleanly during shutdown: {process.returncode}")
         if self.log_thread:
             self.log_thread.join(timeout=1)
             self.log_thread = None
+        if failure is not None:
+            raise failure
 
 
 def write_config(
@@ -937,8 +956,13 @@ def run_call_audio_and_dtmf(peer: SIPPeer, bridge: Bridge, event: dict, label: s
         assert_rx_audio(rx_path)
         peer.send_dtmf(peer_call, "5")
         dtmf = bridge.wait_for("dtmf", call_id=call_id, timeout=TIMEOUT)
-        if dtmf.get("digit") != "5" or dtmf.get("phase") != "end":
+        if dtmf.get("digit") != "5" or dtmf.get("phase") != "start":
             raise SmokeFailure(f"unexpected {label} DTMF event: {dtmf}")
+        dtmf_events = [message for message in bridge.drain(0.15) if message.get("type") == "dtmf" and message.get("call_id") == call_id]
+        release_events = [message for message in dtmf_events if message.get("phase") == "end"]
+        duplicate_digits = [message for message in dtmf_events if message.get("phase") != "end"]
+        if duplicate_digits or len(release_events) != 1 or release_events[0].get("digit"):
+            raise SmokeFailure(f"unexpected {label} DTMF release/duplicate events: {dtmf_events}")
     finally:
         stop.set()
         try:
@@ -949,10 +973,63 @@ def run_call_audio_and_dtmf(peer: SIPPeer, bridge: Bridge, event: dict, label: s
     return call_id
 
 
+def shutdown_stress(binary: str, cycles: int) -> dict:
+    """Repeat real module teardown with empty, queued, and consumed events."""
+    longest = 0.0
+    with tempfile.TemporaryDirectory(prefix="voxmail-shutdown-stress-") as raw_dir:
+        root = Path(raw_dir)
+        for cycle in range(cycles):
+            case = cycle % 3
+            current = root / str(cycle)
+            config = current / "config"
+            audio = current / "audio"
+            config.mkdir(parents=True, mode=0o700)
+            audio.mkdir(mode=0o700)
+            peer_port, local_port = free_udp_port(), free_udp_port()
+            write_config(config, peer_port, local_port, 20000)
+            if case == 0:
+                # No registration notifications: the event worker is asleep
+                # in its condition wait when cleanup changes the predicate.
+                accounts = config / "accounts"
+                accounts.write_text(accounts.read_text().replace("regint=300", "regint=0"))
+            peer = SIPPeer(peer_port)
+            peer.start()
+            control = current / "baresip.sock"
+            baresip = Baresip(binary, config, control, audio, current / "baresip.log")
+            bridge = Bridge(control)
+            try:
+                baresip.start()
+                if case != 0:
+                    peer.wait_event("registered")
+                if case == 2:
+                    bridge.connect()
+                    bridge.wait_for("registration")
+                    bridge.close()
+                # case 1 leaves registration queued without a bridge reader.
+                started = now()
+                baresip.stop()
+                longest = max(longest, now() - started)
+                if not control_socket_is_dead(control):
+                    raise SmokeFailure(f"shutdown cycle {cycle} left a live control listener")
+            except (SmokeFailure, OSError, subprocess.SubprocessError) as exc:
+                tail = (current / "baresip.log").read_text(errors="replace").splitlines()[-40:]
+                raise SmokeFailure(f"shutdown cycle {cycle} (case {case}) failed: {exc}\n" + "\n".join(tail)) from exc
+            finally:
+                bridge.close()
+                try:
+                    baresip.stop()
+                finally:
+                    peer.close()
+    return {"cycles": cycles, "longest_stop_seconds": round(longest, 3)}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baresip", default="baresip")
+    parser.add_argument("--shutdown-cycles", type=int, default=12)
     args = parser.parse_args()
+    if args.shutdown_cycles < 1 or args.shutdown_cycles > 1000:
+        raise SmokeFailure("shutdown cycles must be between 1 and 1000")
     if not shutil.which(args.baresip) and not Path(args.baresip).is_file():
         raise SmokeFailure(f"Baresip binary not found: {args.baresip}")
 
@@ -1030,9 +1107,12 @@ def main() -> int:
             restart_event = bridge.wait_for("call_incoming")
             bridge.send({"type": "answer", "call_id": restart_event["call_id"]})
             bridge.wait_for("call_established", call_id=restart_event["call_id"])
-            del restart_peer_call
             bridge.close()
             baresip.stop()
+            if not restart_peer_call.closed.is_set():
+                raise SmokeFailure("shutdown did not close the active SIP dialog")
+            if any(audio_dir.iterdir()):
+                raise SmokeFailure("shutdown left per-call audio files behind")
             # The pinned Baresip process can leave a stale AF_UNIX pathname
             # after SIGTERM; it must not leave a live listener.  The next
             # startup removes the stale pathname before binding.
@@ -1042,6 +1122,16 @@ def main() -> int:
             peer.wait_event("registered")
             bridge.wait_for("registration", timeout=TIMEOUT)
             summary["restart"] = True
+            native_logs = (root / "baresip.log").read_text(encoding="utf-8", errors="replace")
+            verbose_enabled = os.environ.get("VOXMAIL_VERBOSE", "").strip().lower() in ("true", "1")
+            native_verbose = "verbose bridge diagnostics enabled" in native_logs
+            if native_verbose != verbose_enabled:
+                raise SmokeFailure("native bridge verbose mode does not match environment")
+            if verbose_enabled:
+                for marker in ("DTMF callback", "execute command type="):
+                    if marker not in native_logs:
+                        raise SmokeFailure(f"missing native diagnostic: {marker}")
+            summary["native_verbose"] = native_verbose
         except (SmokeFailure, OSError, subprocess.SubprocessError) as exc:
             try:
                 log_tail = (root / "baresip.log").read_text(encoding="utf-8", errors="replace").splitlines()[-80:]
@@ -1053,9 +1143,12 @@ def main() -> int:
             raise SmokeFailure(detail) from exc
         finally:
             bridge.close()
-            baresip.stop()
-            peer.close()
-        print(json.dumps(summary, sort_keys=True))
+            try:
+                baresip.stop()
+            finally:
+                peer.close()
+    summary["shutdown_stress"] = shutdown_stress(args.baresip, args.shutdown_cycles)
+    print(json.dumps(summary, sort_keys=True))
     return 0
 
 

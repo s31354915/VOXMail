@@ -47,7 +47,14 @@ async function stableTotpCode(page, secret, previous = '') {
   }
 }
 
+async function navigate(page, task) {
+  const link = page.locator(`[data-task="${task}"]`);
+  await link.click();
+  await expect(link).toHaveAttribute('aria-current', 'page');
+}
+
 async function fillAccount(page, name, email, order) {
+  await navigate(page, 'mailboxes');
   await page.locator('#new-account').click();
   const form = page.locator('#account-form');
   await form.locator('[name="canonical_name"]').fill(name);
@@ -60,7 +67,6 @@ async function fillAccount(page, name, email, order) {
   await form.locator('[name="smtp_user"]').fill(email);
   await form.locator('[name="smtp_password"]').fill('smtp-password');
   await form.locator('[name="display_order"]').fill(String(order));
-  await form.locator('[name="folder_map"]').fill('INBOX=Inbox\nSent=Sent');
 
   const validate = async route => {
     if (route.request().method() === 'POST') {
@@ -76,6 +82,7 @@ async function fillAccount(page, name, email, order) {
 }
 
 async function fillContact(page, name, email) {
+  await navigate(page, 'caller-access');
   const form = page.locator('#contact-form');
   await form.locator('[name="name"]').fill(name);
   await form.locator('[name="email"]').fill(email);
@@ -93,6 +100,9 @@ async function logoutAndWait(page) {
 }
 
 test('covers setup, refresh, roles, account ordering, alerts, recovery, and CSP', async ({ page }) => {
+  // This complete lifecycle scenario also waits for real 30-second TOTP
+  // windows. Preserve short assertion deadlines but allow those clock waits.
+  test.setTimeout(120_000);
   const pageErrors = [];
   page.on('pageerror', error => pageErrors.push(error));
 
@@ -105,9 +115,46 @@ test('covers setup, refresh, roles, account ordering, alerts, recovery, and CSP'
   await page.locator('#setup [name="password"]').fill(admin.password);
   await page.locator('#setup [name="pin"]').fill(admin.pin);
   await page.locator('#setup button[type="submit"]').click();
+  await expect(page.locator('#login')).toBeVisible();
+  await expect(page.locator('body')).toHaveAttribute('data-setup-available', 'false');
+  await page.locator('#login [name="password"]').fill(admin.password);
+  await page.locator('#login button[type="submit"]').click();
   await expect(page.locator('#app')).toBeVisible();
+  await navigate(page, 'administration');
   await expect(page.locator('#users-panel')).toBeVisible();
   await expect(page.locator('#sip-panel')).toBeVisible();
+
+  // The existing model field accepts unlisted Piper names and custom model
+  // URLs for administrators. Job transport is controlled here; actual TLS
+  // download, publication and authorization are exercised by backend tests.
+  const voiceRequests = [];
+  const jobVoices = new Map();
+  const installModel = async route => {
+    const payload = route.request().postDataJSON();
+    voiceRequests.push(payload);
+    const id = `browser-voice-${voiceRequests.length}`;
+    const voice = payload.voice.startsWith('https:') ? 'custom' : payload.voice;
+    jobVoices.set(id, voice);
+    await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: id, status: 'queued' }) });
+  };
+  const modelStatus = async route => {
+    const id = new URL(route.request().url()).pathname.split('/').pop();
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: id, voice: jobVoices.get(id), stage: 'complete', status: 'complete', progress: 100 }) });
+  };
+  await page.route('**/api/v1/voices/install', installModel);
+  await page.route('**/api/v1/voices/jobs/browser-voice-*', modelStatus);
+  await navigate(page, 'voice-alerts');
+  await expect(page.locator('#install-voice')).toBeVisible();
+  for (const source of ['en_US-lessac-low', 'https://models.example/custom.onnx?download=true']) {
+    await page.locator('#settings-form [name="tts_voice"]').fill(source);
+    await page.locator('#install-voice').click();
+    await expect(page.locator('#voice-status')).toContainText('Installed.');
+    await expect(page.locator('#settings-form [name="tts_voice"]')).toHaveValue(source.startsWith('https:') ? 'custom' : source);
+  }
+  expect(voiceRequests).toEqual([{ voice: 'en_US-lessac-low' }, { voice: 'https://models.example/custom.onnx?download=true' }]);
+  await page.unroute('**/api/v1/voices/install', installModel);
+  await page.unroute('**/api/v1/voices/jobs/browser-voice-*', modelStatus);
+  await page.locator('#settings-form [name="tts_voice"]').fill('en_US-hfc_male-medium');
 
   await fillAccount(page, 'First account', 'first@example.test', 0);
   await fillAccount(page, 'Second account', 'second@example.test', 1);
@@ -148,10 +195,41 @@ test('covers setup, refresh, roles, account ordering, alerts, recovery, and CSP'
   await page.locator('#accounts button[data-test-account]').first().click();
   await expect.poll(() => savedTestPayloads.length).toBe(1);
   expect(savedTestPayloads[0]).toEqual({ account_id: savedAccountID });
-  await page.unroute('**/api/v1/accounts/test', captureSavedTest);
 
-  // A new-account test must send the values currently in the form, including
-  // an unsaved host, rather than silently testing a saved account.
+  await page.locator(`#accounts button[data-edit-account="${savedAccountID}"]`).click();
+  const editForm = page.locator('#account-form');
+  await expect(editForm.locator('#test-account')).toHaveText('Test edited values');
+  await expect(editForm.locator('#test-saved-account')).toBeVisible();
+  await expect(page.locator('#account-test-help')).toContainText('ignores unsaved changes');
+  await editForm.locator('[name="imap_host"]').fill('edited-imap.example.test');
+  await editForm.locator('[name="smtp_host"]').fill('edited-smtp.example.test');
+  const editedValidationPayloads = [];
+  const captureEditedValidation = async route => {
+    if (route.request().method() === 'POST') {
+      editedValidationPayloads.push(route.request().postDataJSON());
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ folders: ['INBOX'] }) });
+    } else {
+      await route.continue();
+    }
+  };
+  await page.route('**/api/v1/accounts/validate', captureEditedValidation);
+  await editForm.locator('#test-account').click();
+  await expect.poll(() => editedValidationPayloads.length).toBe(1);
+  expect(editedValidationPayloads[0].id).toBe(savedAccountID);
+  expect(editedValidationPayloads[0].imap_host).toBe('edited-imap.example.test');
+  expect(editedValidationPayloads[0].smtp_host).toBe('edited-smtp.example.test');
+  expect(editedValidationPayloads[0].imap_password).toBe('');
+  expect(editedValidationPayloads[0].smtp_password).toBe('');
+
+  await editForm.locator('#test-saved-account').click();
+  await expect.poll(() => savedTestPayloads.length).toBe(2);
+  expect(savedTestPayloads[1]).toEqual({ account_id: savedAccountID });
+  await page.unroute('**/api/v1/accounts/test', captureSavedTest);
+  await page.unroute('**/api/v1/accounts/validate', captureEditedValidation);
+  await page.locator('#cancel-account').click();
+
+  // A new-account test also sends current form values and never tests an
+  // unrelated saved account.
   await page.locator('#new-account').click();
   const unsavedForm = page.locator('#account-form');
   await unsavedForm.locator('[name="canonical_name"]').fill('Unsaved test account');
@@ -172,16 +250,18 @@ test('covers setup, refresh, roles, account ordering, alerts, recovery, and CSP'
     }
   };
   await page.route('**/api/v1/accounts/validate', captureValidation);
-  await page.locator('#test-account').click();
+  await unsavedForm.locator('#test-account').click();
   await expect.poll(() => validationPayloads.length).toBe(1);
+  expect(validationPayloads[0].id).toBe('');
   expect(validationPayloads[0].imap_host).toBe('edited-imap.example.test');
   expect(validationPayloads[0].smtp_host).toBe('edited-smtp.example.test');
   await page.unroute('**/api/v1/accounts/validate', captureValidation);
   await page.locator('#cancel-account').click();
-
+  await navigate(page, 'administration');
   await page.locator('#global-alerts-available').uncheck();
   await page.locator('#save-global-alerts').click();
   await expect(page.locator('#alert-controls-extra')).toHaveClass(/hidden/);
+  await navigate(page, 'voice-alerts');
   await expect(page.locator('#settings-form button[type="submit"]')).toBeVisible();
   await page.locator('#settings-form [name="tts_voice"]').fill('en_US-hfc_male-medium');
   await page.locator('#settings-form button[type="submit"]').click();
@@ -217,9 +297,11 @@ test('covers setup, refresh, roles, account ordering, alerts, recovery, and CSP'
   expect(tabTargets.some(target => target.tag === 'BUTTON' && target.type === 'submit')).toBeTruthy();
   expect(tabTargets.some(target => target.hiddenAlert && target.id !== 'global-alerts-available')).toBeFalsy();
 
+  await navigate(page, 'administration');
   await page.locator('#global-alerts-available').check();
   await page.locator('#save-global-alerts').click();
   await expect(page.locator('#alert-controls-extra')).not.toHaveClass(/hidden/);
+  await navigate(page, 'administration');
   await page.locator('#global-alerts-available').uncheck();
   await page.locator('#save-global-alerts').click();
   await expect(page.locator('#alert-controls-extra')).toHaveClass(/hidden/);
@@ -274,6 +356,16 @@ test('covers setup, refresh, roles, account ordering, alerts, recovery, and CSP'
   await expect(page.locator('#contacts')).not.toContainText('Admin-only contact');
   await expect(page.locator('#users-panel')).toHaveClass(/hidden/);
   await expect(page.locator('#sip-panel')).toHaveClass(/hidden/);
+  await expect(page.locator('#install-voice')).toHaveClass(/hidden/);
+  const forbiddenInstall = await page.evaluate(async () => {
+    const me = await fetch('/api/v1/me');
+    return fetch('/api/v1/voices/install', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': me.headers.get('X-CSRF-Token') },
+      body: JSON.stringify({ voice: 'en_US-lessac-low' }),
+    }).then(response => response.status);
+  });
+  expect(forbiddenInstall).toBe(403);
   await expect(page.locator('#alert-controls-extra')).toHaveClass(/hidden/);
 
   await fillContact(page, 'User-only contact', 'user-contact@example.test');
@@ -293,16 +385,97 @@ test('covers setup, refresh, roles, account ordering, alerts, recovery, and CSP'
   await expect(page.locator('#contacts')).toContainText('Admin-only contact');
   await expect(page.locator('#contacts')).not.toContainText('User-only contact');
 
+  await navigate(page, 'security');
   await page.locator('#twofa-form [name="current_password"]').fill(admin.password);
   await page.locator('#twofa-setup').click();
   const secretField = page.locator('#twofa-form [name="secret"]');
   await expect(secretField).not.toHaveValue('');
   const totpSecret = await secretField.inputValue();
   expect(totpSecret).toMatch(/^[A-Z2-7]+$/);
+  await expect(page.locator('#twofa-qr')).toBeVisible();
+  await expect(page.locator('#twofa-qr')).toHaveAttribute('src', /^data:image\/png;base64,/);
+  await page.locator('#twofa-next').click();
   const enableCode = await stableTotpCode(page, totpSecret);
   await page.locator('#twofa-form [name="code"]').fill(enableCode);
   await page.locator('#twofa-enable').click();
   await expect(page.locator('#twofa-status')).toContainText('Enabled');
+  const oldTwoFactorOutput = await page.locator('#twofa-status').textContent();
+  expect(oldTwoFactorOutput).toContain('backup codes');
+  await expect(page.locator('#twofa-backup-codes')).not.toBeEmpty();
+  await expect(page.locator('#twofa-done')).toBeDisabled();
+
+  let releaseOldContacts;
+  let finishOldContacts;
+  let firstContactsRead = true;
+  let markOldContactsStarted;
+  const oldContactsStarted = new Promise(resolve => { markOldContactsStarted = resolve; });
+  const oldContactsSettled = new Promise(resolve => { finishOldContacts = resolve; });
+  const oldContactsGate = new Promise(resolve => { releaseOldContacts = resolve; });
+  const expireWithStaleContacts = async route => {
+    const request = route.request();
+    if (request.method() === 'GET' && firstContactsRead) {
+      firstContactsRead = false;
+      markOldContactsStarted();
+      await oldContactsGate;
+      try {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify([{ id: 987654, name: 'Stale admin response', email: 'stale@example.test', display_order: 0 }]),
+        });
+      } catch (_) {
+        // Session abort may already have discarded this response.
+      } finally {
+        finishOldContacts();
+      }
+      return;
+    }
+    if (request.method() === 'POST' && request.postDataJSON().name === 'Expire admin session') {
+      await route.fulfill({ status: 401, contentType: 'application/json', body: JSON.stringify({ error: 'session expired' }) });
+      return;
+    }
+    await route.continue();
+  };
+  await page.route('**/api/v1/contacts', expireWithStaleContacts);
+  await navigate(page, 'caller-access');
+  await page.locator('#contact-form [name="name"]').fill('Start stale contact read');
+  await page.locator('#contact-form [name="email"]').fill('pending@example.test');
+  await page.locator('#contact-form [name="display_order"]').fill('0');
+  await page.locator('#contact-form button[type="submit"]').click();
+  await oldContactsStarted;
+  // The contact mutation is deliberately still pending and its submit button
+  // is disabled. Trigger expiry through a separate mutation so this test also
+  // verifies that a pending form cannot be submitted twice.
+  await page.route('**/api/v1/settings', async route => {
+    if (route.request().method() === 'PUT') {
+      await route.fulfill({ status: 401, contentType: 'application/json', body: JSON.stringify({ error: 'session expired' }) });
+      return;
+    }
+    await route.continue();
+  });
+  await navigate(page, 'voice-alerts');
+  await page.locator('#settings-form [name="menu_speed"]').fill('4');
+  await page.locator('#settings-form button[type="submit"]').click();
+  await expect(page.locator('#login')).toBeVisible();
+  await expect(page.locator('#twofa-status')).toBeEmpty();
+  await expect(page.locator('#twofa-backup-codes')).toBeEmpty();
+  await expect(page.locator('#twofa-qr')).not.toHaveAttribute('src');
+  const expiredSensitiveFields = await page.locator('input[type="password"], input[name="pin"], input[name="totp"], input[name="backup_code"], input[name="code"], input[name="secret"]').evaluateAll(elements => elements.filter(element => element.value !== '').length);
+  expect(expiredSensitiveFields).toBe(0);
+
+  await page.locator('#login [name="username"]').fill(user.username);
+  await page.locator('#login [name="password"]').fill(user.password);
+  await page.locator('#login button[type="submit"]').click();
+  await expect(page.locator('#app')).toBeVisible();
+  await expect(page.locator('#contacts')).toContainText('User-only contact');
+  await expect(page.locator('#contacts')).not.toContainText('Stale admin response');
+  releaseOldContacts();
+  await oldContactsSettled;
+  await page.unroute('**/api/v1/contacts', expireWithStaleContacts);
+  await page.unroute('**/api/v1/settings');
+  await expect(page.locator('#twofa-status')).toBeEmpty();
+  await expect(page.locator('#twofa-status')).not.toContainText(oldTwoFactorOutput);
+  await expect(page.locator('#contacts')).not.toContainText('Stale admin response');
 
   await logoutAndWait(page);
   const acceptedCode = await stableTotpCode(page, totpSecret);
@@ -326,9 +499,10 @@ test('covers setup, refresh, roles, account ordering, alerts, recovery, and CSP'
   await expect(page.locator('#app')).toBeVisible();
 
   await logoutAndWait(page);
+  await page.getByRole('button', { name: 'Reset password', exact: true }).click();
   await expect(page.locator('#recovery-request')).toBeVisible();
   await page.locator('#recovery-request [name="email"]').fill('unknown@example.invalid');
   await page.locator('#recovery-request button[type="submit"]').click();
-  await expect(page.locator('#auth-status')).toContainText('If the address is configured');
+  await expect(page.locator('#auth-status')).toContainText('mailbox recovery is unavailable in offline mode');
   expect(pageErrors).toEqual([]);
 });

@@ -35,6 +35,8 @@ mail content. Treat the Docker host and the `/data` volume as sensitive.
 
 ## Documentation
 
+- [Contributing](CONTRIBUTING.md) — development setup, relevant checks and review.
+- [Security reporting](SECURITY.md) — private vulnerability reporting and scope.
 - [Operations](docs/OPERATIONS.md) — installation, models, upgrades, backups,
   health checks, networking, troubleshooting, and release procedures.
 - [Settings reference](docs/SETTINGS.md) — environment variables, API fields,
@@ -97,7 +99,10 @@ curl -fsS http://127.0.0.1:8080/readyz
 
 `healthz` means the HTTP process responds. `readyz` also checks the database
 and application readiness, and can remain not ready while synchronization,
-speech, or the managed call client initializes.
+speech models, or the managed call client and SIP registration initialize.
+Readiness does not prove each mailbox sync or end-to-end call succeeds. See
+[health and first-run checks](docs/OPERATIONS.md#health-and-first-run-checks)
+for exact conditions, HTTP statuses and offline behavior.
 
 ## Telephone setup
 
@@ -118,6 +123,9 @@ relying on the service.
 The web console is the normal source of SIP credentials. The optional
 `VOXMAIL_SIP_ACCOUNT` environment override exists for deployments that need a
 complete Baresip account line; never commit that value.
+`VOXMAIL_ENABLE_CALLS=0` removes forced enablement; it does not override enabled
+stored SIP settings. For maintenance/restore isolation use offline mode. See
+[call enablement precedence](docs/SETTINGS.md#call-enablement-precedence).
 
 ## Mail and speech setup
 
@@ -134,9 +142,11 @@ VOXMAIL_PROVISION_MODELS=1
 
 The default Piper voice and Whisper base-English model are stored in the
 persistent volume. Remove the flag after provisioning if you want startup to
-be fully explicit. Custom voices must contain both a trusted voice name's
-`.onnx` file and its matching Piper JSON metadata. Callers cannot cause
-arbitrary model downloads.
+be fully explicit. Administrators can install other Piper voices by name or
+by an HTTPS `.onnx` URL through the console. Each voice includes its matching
+Piper JSON metadata and is checked with Piper before its digest-identified pair
+is activated. Regular users can select and preview installed voices;
+installation requires an administrator. See [voice settings](docs/WEB-CONSOLE.md#voice-settings).
 
 The image ships a static greeting and fixed signed-in menu generated with the
 pinned Piper voice. Dynamic account, folder, contact, attachment, and message
@@ -161,6 +171,7 @@ Useful checks:
 go test ./...
 go test -race ./...
 go vet ./...
+python3 scripts/check-build-context.py
 
 cmake -S baresip/shim -B /tmp/voxmail-native \
   -DVOXMAIL_BUILD_NATIVE_TESTS=ON
@@ -173,6 +184,15 @@ ctest --test-dir /tmp/voxmail-native --output-on-failure
 `VOXMAIL_ENCRYPTION_KEY`. The standalone native command tests do not require
 Baresip private headers; the production module is built by the pinned Baresip
 image stage.
+
+The build-context check runs Docker against a disposable source fixture with
+harmless markers representing backups, databases, local environment files,
+browser artifacts and review notes. It verifies their exclusion from the
+effective context, compiles the production Go builder and inspects its source
+tree. It does not load or publish an image or use actual private data. The Go
+builder copies only `cmd/` and `internal/` after its module files; runtime assets
+and smoke-test tools are copied explicitly by their owning stages. Keep custom
+operator artifacts outside the repository or add their paths to `.dockerignore`.
 
 The opt-in integration layers are documented in [Operations](docs/OPERATIONS.md):
 

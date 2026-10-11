@@ -3,6 +3,7 @@ package calls
 import (
 	"context"
 	"fmt"
+	"github.com/voxmail/voxmail/internal/process"
 	"net/mail"
 	"os"
 	"strings"
@@ -147,18 +148,21 @@ func (s *Service) startAudioAttachment(sess *session) {
 		s.prompt(sess, "Audio recording is not ready yet.")
 		return
 	}
-	ctx, cancel := context.WithTimeout(s.eventContext(sess), 35*time.Second)
+	ctx, cancel := context.WithTimeout(s.eventContext(sess), s.Recorder.audioWindow()+process.ConversionTimeout)
+	stop := make(chan struct{})
 	s.mu.Lock()
 	transitionLocked(sess, "audio_recording")
 	sess.RecordCancel = cancel
+	sess.RecordStop = stop
 	offset := info.Size()
 	s.mu.Unlock()
 	s.prompt(sess, fmt.Sprintf("Speak after the tone. Press 0 when finished. The recording is limited to %d seconds.", int(s.Recorder.audioWindow()/time.Second)))
 	s.startTask(func() {
-		data, recordErr := s.Recorder.RecordAudio(ctx, sess.RxPath, offset)
+		data, recordErr := s.Recorder.RecordAudioUntil(ctx, sess.RxPath, offset, stop)
 		cancel()
 		s.mu.Lock()
 		sess.RecordCancel = nil
+		sess.RecordStop = nil
 		if string(stateLocked(sess)) == "audio_recording" && !sess.Closed {
 			if recordErr == nil {
 				sess.Draft.Attachments = append(sess.Draft.Attachments, mailer.Attachment{Filename: fmt.Sprintf("voxmail-audio-%d.wav", time.Now().Unix()), ContentType: "audio/wav", Data: data})

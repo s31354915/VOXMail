@@ -1,16 +1,18 @@
 package mailsync
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"os/exec"
+	"github.com/voxmail/voxmail/internal/operation"
+	"github.com/voxmail/voxmail/internal/process"
 	"strings"
 	"time"
 )
 
 type Runner struct {
-	Binary  string
+	Binary string
+	// Timeout optionally caps one mbsync invocation. Zero leaves its lifetime
+	// to the caller context, which is important for large initial mailboxes.
 	Timeout time.Duration
 }
 
@@ -20,38 +22,7 @@ type Result struct {
 	Changed bool
 }
 
-const maxMbsyncOutput = 1 << 20
-
-type cappedBuffer struct {
-	buf       bytes.Buffer
-	limit     int
-	truncated bool
-}
-
-func (b *cappedBuffer) Write(p []byte) (int, error) {
-	if b.limit <= 0 {
-		b.limit = maxMbsyncOutput
-	}
-	remaining := b.limit - b.buf.Len()
-	if remaining > 0 {
-		if len(p) > remaining {
-			_, _ = b.buf.Write(p[:remaining])
-			b.truncated = true
-		} else {
-			_, _ = b.buf.Write(p)
-		}
-	} else if len(p) > 0 {
-		b.truncated = true
-	}
-	return len(p), nil
-}
-
-func (b *cappedBuffer) Bytes() []byte {
-	if !b.truncated {
-		return b.buf.Bytes()
-	}
-	return append(append([]byte(nil), b.buf.Bytes()...), []byte("\n[mbsync output truncated]\n")...)
-}
+const maxMbsyncOutput = process.MaxOutput
 
 func (r Runner) Sync(ctx context.Context, configPath, channel string) (Result, error) {
 	return r.SyncChannels(ctx, configPath, channel)
@@ -85,24 +56,26 @@ func (r Runner) run(ctx context.Context, account string, args ...string) (Result
 	if r.Binary == "" {
 		r.Binary = "mbsync"
 	}
-	if r.Timeout <= 0 {
-		r.Timeout = 10 * time.Minute
-	}
-	work, cancel := context.WithTimeout(ctx, r.Timeout)
-	defer cancel()
-	cmd := exec.CommandContext(work, r.Binary, args...)
-	var capture cappedBuffer
-	cmd.Stdout = &capture
-	cmd.Stderr = &capture
-	err := cmd.Run()
-	output := capture.Bytes()
+	cmd := process.New(ctx, "mbsync", r.Binary, r.Timeout, args...)
+	output, err := cmd.CombinedOutput()
 	result := Result{Account: account, Output: output}
-	if work.Err() != nil {
-		return result, work.Err()
-	}
 	if err == nil {
 		result.Changed = true
 		return result, nil
 	}
-	return result, fmt.Errorf("mbsync %s: %w: %s", account, err, output)
+	cause := fmt.Errorf("mbsync %s: %w: %s", account, err, output)
+	category := operation.Classify(err)
+	// mbsync exposes text rather than a typed protocol API. Interpret known
+	// CLI signals once at this adapter; never override cancellation/timeout or
+	// expose its output as a user-facing reason.
+	if category == operation.ProcessExit {
+		lower := strings.ToLower(string(output))
+		switch {
+		case strings.Contains(lower, "authentication failed"), strings.Contains(lower, "authenticationfailed"), strings.Contains(lower, "login failed"):
+			category = operation.Authentication
+		case strings.Contains(lower, "certificate verification failed"), strings.Contains(lower, "ssl error"), strings.Contains(lower, "tls handshake"):
+			category = operation.TLS
+		}
+	}
+	return result, &operation.Error{Category: category, Component: "mbsync", Operation: "sync", Cause: cause}
 }

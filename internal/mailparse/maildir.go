@@ -55,11 +55,23 @@ func ScanMetadataEachContextWithFilter(ctx context.Context, root string, shouldP
 	return scanContextWithFilter(ctx, root, ParseMetadata, shouldParse, visit)
 }
 
+// ScanMetadataEachContextWithFilterAndErrors continues after a message fails
+// to parse when onMessageError handles that failure. Filesystem, filter,
+// visitor, and cancellation errors still stop the scan so callers can avoid
+// treating an incomplete walk as a complete snapshot.
+func ScanMetadataEachContextWithFilterAndErrors(ctx context.Context, root string, shouldParse func(path string, info os.FileInfo) (bool, error), visit func(MaildirMessage) error, onMessageError func(path string, err error) error) error {
+	return scanContextWithFilterAndErrors(ctx, root, ParseMetadata, shouldParse, visit, onMessageError)
+}
+
 func scanContext(ctx context.Context, root string, parser func(io.Reader) (Message, error), visit func(MaildirMessage) error) error {
 	return scanContextWithFilter(ctx, root, parser, nil, visit)
 }
 
 func scanContextWithFilter(ctx context.Context, root string, parser func(io.Reader) (Message, error), shouldParse func(path string, info os.FileInfo) (bool, error), visit func(MaildirMessage) error) error {
+	return scanContextWithFilterAndErrors(ctx, root, parser, shouldParse, visit, nil)
+}
+
+func scanContextWithFilterAndErrors(ctx context.Context, root string, parser func(io.Reader) (Message, error), shouldParse func(path string, info os.FileInfo) (bool, error), visit func(MaildirMessage) error, onMessageError func(path string, err error) error) error {
 	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		select {
 		case <-ctx.Done():
@@ -92,6 +104,15 @@ func scanContextWithFilter(ctx context.Context, root string, parser func(io.Read
 		msg, parseErr := parser(contextReader{ctx: ctx, reader: file})
 		_ = file.Close()
 		if parseErr != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if onMessageError != nil {
+				if err := onMessageError(path, parseErr); err != nil {
+					return fmt.Errorf("handle malformed message %s: %w", path, err)
+				}
+				return nil
+			}
 			return fmt.Errorf("parse %s: %w", path, parseErr)
 		}
 		folderPath := filepath.Dir(filepath.Dir(path))

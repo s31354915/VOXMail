@@ -3,9 +3,10 @@ package calls
 import (
 	"context"
 	"fmt"
+	"github.com/voxmail/voxmail/internal/maintenance"
+	"github.com/voxmail/voxmail/internal/process"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -95,10 +96,11 @@ func (r *VoiceRecorder) recordAndTranscribe(ctx context.Context, rawPath string,
 	if _, err := raw.Seek(offset, io.SeekStart); err != nil {
 		return "", err
 	}
-	segment, err := os.CreateTemp(dir, ".recording-*.pcm")
+	segment, releaseSegment, err := maintenance.CreateTemp(dir, ".recording-*.pcm")
 	if err != nil {
 		return "", err
 	}
+	defer releaseSegment()
 	segmentPath := segment.Name()
 	defer os.Remove(segmentPath)
 	if _, err := io.Copy(segment, io.LimitReader(raw, pcmWindowBytes(window))); err != nil {
@@ -108,10 +110,11 @@ func (r *VoiceRecorder) recordAndTranscribe(ctx context.Context, rawPath string,
 	if err := segment.Close(); err != nil {
 		return "", err
 	}
-	wav, err := os.CreateTemp(dir, ".recording-*.wav")
+	wav, releaseWav, err := maintenance.CreateTemp(dir, ".recording-*.wav")
 	if err != nil {
 		return "", err
 	}
+	defer releaseWav()
 	wavPath := wav.Name()
 	_ = wav.Close()
 	defer os.Remove(wavPath)
@@ -119,7 +122,7 @@ func (r *VoiceRecorder) recordAndTranscribe(ctx context.Context, rawPath string,
 	if binary == "" {
 		binary = "ffmpeg"
 	}
-	convert := exec.CommandContext(ctx, binary, "-nostdin", "-f", "s16le", "-ar", "8000", "-ac", "1", "-i", segmentPath, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", "-y", wavPath)
+	convert := process.New(ctx, "ffmpeg", binary, process.ConversionTimeout, "-nostdin", "-f", "s16le", "-ar", "8000", "-ac", "1", "-i", segmentPath, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", "-y", wavPath)
 	if output, err := convert.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("recording conversion: %w: %s", err, strings.TrimSpace(string(output)))
 	}
@@ -137,23 +140,26 @@ func (r *VoiceRecorder) recordAndTranscribe(ctx context.Context, rawPath string,
 // attachment. It deliberately does not run Whisper; callers who want speech
 // composition use RecordAndTranscribe instead.
 func (r *VoiceRecorder) RecordAudio(ctx context.Context, rawPath string, offset int64) ([]byte, error) {
+	return r.RecordAudioUntil(ctx, rawPath, offset, nil)
+}
+
+// RecordAudioUntil treats stop as successful completion while cancellation
+// remains owned by call teardown/navigation through conversion and cleanup.
+func (r *VoiceRecorder) RecordAudioUntil(ctx context.Context, rawPath string, offset int64, stop <-chan struct{}) ([]byte, error) {
 	if r == nil || rawPath == "" {
 		return nil, fmt.Errorf("voice recorder is not configured")
 	}
 	window := r.audioWindow()
 	timer := time.NewTimer(window)
+	defer timer.Stop()
 	select {
 	case <-timer.C:
+	case <-stop:
 	case <-ctx.Done():
-		// Cancellation is also the DTMF "finished" signal. Capture the
-		// bytes written so far; the caller-close cleanup path discards the
-		// result after the goroutine observes sess.Closed.
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
+		return nil, ctx.Err()
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
 	}
 	info, err := os.Stat(rawPath)
 	if err != nil {
@@ -170,10 +176,11 @@ func (r *VoiceRecorder) RecordAudio(ctx context.Context, rawPath string, offset 
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
 	}
-	segment, err := os.CreateTemp(dir, ".attachment-*.pcm")
+	segment, releaseSegment, err := maintenance.CreateTemp(dir, ".attachment-*.pcm")
 	if err != nil {
 		return nil, err
 	}
+	defer releaseSegment()
 	segmentPath := segment.Name()
 	defer os.Remove(segmentPath)
 	input, err := os.Open(rawPath)
@@ -194,10 +201,11 @@ func (r *VoiceRecorder) RecordAudio(ctx context.Context, rawPath string, offset 
 	if copyErr != nil {
 		return nil, copyErr
 	}
-	wav, err := os.CreateTemp(dir, ".attachment-*.wav")
+	wav, releaseWav, err := maintenance.CreateTemp(dir, ".attachment-*.wav")
 	if err != nil {
 		return nil, err
 	}
+	defer releaseWav()
 	wavPath := wav.Name()
 	_ = wav.Close()
 	defer os.Remove(wavPath)
@@ -205,13 +213,16 @@ func (r *VoiceRecorder) RecordAudio(ctx context.Context, rawPath string, offset 
 	if binary == "" {
 		binary = "ffmpeg"
 	}
-	convertCtx, convertCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer convertCancel()
-	convert := exec.CommandContext(convertCtx, binary, "-nostdin", "-f", "s16le", "-ar", "8000", "-ac", "1", "-i", segmentPath, "-ar", "8000", "-ac", "1", "-c:a", "pcm_s16le", "-y", wavPath)
+	convert := process.New(ctx, "ffmpeg", binary, process.ConversionTimeout, "-nostdin", "-f", "s16le", "-ar", "8000", "-ac", "1", "-i", segmentPath, "-ar", "8000", "-ac", "1", "-c:a", "pcm_s16le", "-y", wavPath)
 	if output, err := convert.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("audio attachment conversion: %w: %s", err, strings.TrimSpace(string(output)))
 	}
-	data, err := os.ReadFile(wavPath)
+	converted, err := os.Open(wavPath)
+	if err != nil {
+		return nil, err
+	}
+	defer converted.Close()
+	data, err := io.ReadAll(io.LimitReader(converted, (2<<20)+1))
 	if err != nil {
 		return nil, err
 	}

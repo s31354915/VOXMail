@@ -69,11 +69,82 @@ func TestQueuedMutationIsReportedAndClosedBySuccessfulSync(t *testing.T) {
 	if err != nil || len(items) != 1 || items[0].Status != "queued" {
 		t.Fatalf("queued mutation report=%+v err=%v", items, err)
 	}
-	if err := db.MarkQueuedMutationsSynchronized(ctx, "a"); err != nil {
+	watermark, err := db.QueuedMutationWatermark(ctx, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkQueuedMutationsSynchronized(ctx, "a", watermark, []string{"Inbox"}); err != nil {
 		t.Fatal(err)
 	}
 	items, err = db.ListMessageMutations(ctx, "owner", "a", 10)
 	if err != nil || len(items) != 1 || items[0].Status != "synchronized" {
 		t.Fatalf("synchronized mutation report=%+v err=%v", items, err)
+	}
+}
+
+func TestQueuedMutationAcknowledgmentRespectsRunCoverageAndBoundary(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "mail.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	if _, err := db.DB.Exec(`INSERT INTO users(id,username,password_hash,pin_hash,role,created_at) VALUES('owner','owner','p','p','user','now');
+ INSERT INTO accounts(id,user_id,canonical_name,email,sender_name,imap_host,imap_user,imap_password,smtp_host,smtp_user,smtp_password,created_at) VALUES('a','owner','Mail','a@e','A','h','u','p','h','u','p','now'),('b','owner','Other','b@e','B','h','u','p','h','u','p','now');
+ INSERT INTO mail_messages(id,account_id,folder,path,updated_at) VALUES(1,'a','NewInbox','/new','now'),(2,'a','OldInbox','/old','now'),(3,'b','NewInbox','/other','now'),(4,'a','NewInbox','/moved','now');`); err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range []struct {
+		id     int64
+		folder string
+	}{{1, "NewInbox"}, {2, "OldInbox"}, {3, "NewInbox"}, {4, "OldInbox"}} {
+		if err := db.RecordMessageMutation(ctx, item.id, "owner", "mark_read", item.folder, item.folder, "queued", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	watermark, err := db.QueuedMutationWatermark(ctx, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// This arrives after the runner's snapshot, even though its folder is covered.
+	if err := db.RecordMessageMutation(ctx, 1, "owner", "mark_read", "NewInbox", "NewInbox", "queued", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkQueuedMutationsSynchronized(ctx, "a", watermark, []string{}); err != nil {
+		t.Fatal(err)
+	}
+	var acknowledged int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM message_mutations WHERE status='synchronized'`).Scan(&acknowledged); err != nil || acknowledged != 0 {
+		t.Fatalf("empty plan acknowledged changes: %d %v", acknowledged, err)
+	}
+	if err := db.MarkQueuedMutationsSynchronized(ctx, "a", watermark, []string{"NewInbox"}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.DB.Query(`SELECT id,status FROM message_mutations ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		var id int64
+		var status string
+		if err := rows.Scan(&id, &status); err != nil {
+			t.Fatal(err)
+		}
+		want := "queued"
+		if id == 1 {
+			want = "synchronized"
+		}
+		if status != want {
+			t.Errorf("mutation %d: got %s want %s", id, status, want)
+		}
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if count != 5 {
+		t.Fatalf("journal entries=%d", count)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"github.com/voxmail/voxmail/internal/operation"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -288,7 +289,7 @@ func TestSendOutcomeReportsUncertainDATACompletion(t *testing.T) {
 	}()
 	result := SendWithOutcome(Config{Host: "127.0.0.1", Port: ln.Addr().(*net.TCPAddr).Port, From: "a@example.com", Security: "plaintext", AllowPlaintext25: true, AllowPrivate: true}, []string{"b@example.com"}, []byte("Subject: hi\r\n\r\nbody"))
 	<-done
-	if result.Status != SendUncertain || result.Err == nil {
+	if result.Status != SendUncertain || result.Err == nil || operation.Classify(result.Err) != operation.Uncertain {
 		t.Fatalf("outcome=%+v, want uncertain DATA result", result)
 	}
 }

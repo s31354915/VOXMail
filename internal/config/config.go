@@ -12,6 +12,8 @@ import (
 // Config contains deployment-level settings. User and account settings live in SQLite.
 type Config struct {
 	HTTPAddr             string
+	OfflineMode          bool
+	Verbose              bool
 	DataDir              string
 	DBPath               string
 	EncryptionKey        string
@@ -33,12 +35,22 @@ type Config struct {
 
 func Load() (Config, error) {
 	dataDir := env("VOXMAIL_DATA_DIR", "/data")
+	offlineMode, err := envBool("VOXMAIL_OFFLINE_MODE")
+	if err != nil {
+		return Config{}, err
+	}
+	verbose, err := envBool("VOXMAIL_VERBOSE")
+	if err != nil {
+		return Config{}, err
+	}
 	trustedProxyCIDRs, err := parseCIDRs(os.Getenv("VOXMAIL_TRUSTED_PROXY_CIDRS"))
 	if err != nil {
 		return Config{}, err
 	}
 	c := Config{
 		HTTPAddr:             env("VOXMAIL_HTTP_ADDR", "127.0.0.1:8080"),
+		OfflineMode:          offlineMode,
+		Verbose:              verbose,
 		DataDir:              dataDir,
 		DBPath:               env("VOXMAIL_DB_PATH", filepath.Join(dataDir, "sqlite", "voxmail.db")),
 		EncryptionKey:        os.Getenv("VOXMAIL_ENCRYPTION_KEY"),
@@ -73,6 +85,18 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("VOXMAIL_ENCRYPTION_KEY must be at least 32 bytes")
 	}
 	return c, nil
+}
+
+func envBool(key string) (bool, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return false, nil
+	}
+	value, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("%s must be a boolean: %w", key, err)
+	}
+	return value, nil
 }
 
 func parseCIDRs(raw string) ([]string, error) {

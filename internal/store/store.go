@@ -7,13 +7,15 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
 
 type Store struct {
-	DB *sql.DB
+	DB            *sql.DB
+	mailReadState sync.Mutex
 	// folderRoleInsertHook is a package-private failure seam used by the
 	// transaction rollback test. Production stores leave it nil.
 	folderRoleInsertHook func() error
@@ -188,14 +190,15 @@ type DraftRecord struct {
 }
 
 type SyncRun struct {
-	ID         int64  `json:"id"`
-	AccountID  string `json:"account_id"`
-	Kind       string `json:"kind"`
-	StartedAt  string `json:"started_at"`
-	FinishedAt string `json:"finished_at,omitempty"`
-	Success    bool   `json:"success"`
-	Changed    bool   `json:"changed"`
-	Error      string `json:"error,omitempty"`
+	ErrorCategory string `json:"error_category,omitempty"`
+	ID            int64  `json:"id"`
+	AccountID     string `json:"account_id"`
+	Kind          string `json:"kind"`
+	StartedAt     string `json:"started_at"`
+	FinishedAt    string `json:"finished_at,omitempty"`
+	Success       bool   `json:"success"`
+	Changed       bool   `json:"changed"`
+	Error         string `json:"error,omitempty"`
 }
 
 type MessageMutation struct {

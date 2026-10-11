@@ -1,0 +1,24 @@
+goos: linux
+goarch: amd64
+pkg: github.com/voxmail/voxmail/internal/store
+cpu: AMD EPYC 7763 64-Core Processor                
+BenchmarkSQLiteConnectionContention/1_readers/reads_only-2         	       5	  15812688 ns/op	         0 pool-wait-ms/burst	         0 pool-waits/burst	       493.1 read-mean-us/op	       702.4 read-p95-us/burst	 1746320 B/op	   27398 allocs/op
+BenchmarkSQLiteConnectionContention/1_readers/reads_only-2         	       5	  13689969 ns/op	         0 pool-wait-ms/burst	         0 pool-waits/burst	       426.9 read-mean-us/op	       497.3 read-p95-us/burst	 1746320 B/op	   27398 allocs/op
+BenchmarkSQLiteConnectionContention/1_readers/reads_only-2         	       5	  13519945 ns/op	         0 pool-wait-ms/burst	         0 pool-waits/burst	       421.5 read-mean-us/op	       483.1 read-p95-us/burst	 1746329 B/op	   27398 allocs/op
+BenchmarkSQLiteConnectionContention/1_readers/writer_0_attachments-2         	       5	  27116508 ns/op	        24.07 pool-wait-ms/burst	        64.00 pool-waits/burst	       748.4 read-mean-us/op	      1259 read-p95-us/burst	 1788230 B/op	   28296 allocs/op
+BenchmarkSQLiteConnectionContention/1_readers/writer_0_attachments-2         	       5	  25825362 ns/op	        22.62 pool-wait-ms/burst	        64.00 pool-waits/burst	       701.3 read-mean-us/op	      1107 read-p95-us/burst	 1788102 B/op	   28295 allocs/op
+BenchmarkSQLiteConnectionContention/1_readers/writer_0_attachments-2         	       5	  25782503 ns/op	        22.81 pool-wait-ms/burst	        63.80 pool-waits/burst	       708.2 read-mean-us/op	      1138 read-p95-us/burst	 1788062 B/op	   28294 allocs/op
+BenchmarkSQLiteConnectionContention/1_readers/writer_16_attachments-2        	       5	  35907996 ns/op	        29.14 pool-wait-ms/burst	        64.00 pool-waits/burst	       906.8 read-mean-us/op	      1322 read-p95-us/burst	 1937584 B/op	   31879 allocs/op
+BenchmarkSQLiteConnectionContention/1_readers/writer_16_attachments-2        	       5	  37225949 ns/op	        29.54 pool-wait-ms/burst	        64.00 pool-waits/burst	       919.4 read-mean-us/op	      1323 read-p95-us/burst	 1937587 B/op	   31879 allocs/op
+BenchmarkSQLiteConnectionContention/1_readers/writer_16_attachments-2        	       5	  36059795 ns/op	        29.33 pool-wait-ms/burst	        64.00 pool-waits/burst	       911.9 read-mean-us/op	      1288 read-p95-us/burst	 1937577 B/op	   31879 allocs/op
+BenchmarkSQLiteConnectionContention/4_readers/reads_only-2                   	       5	  65641822 ns/op	       185.1 pool-wait-ms/burst	       125.0 pool-waits/burst	      1957 read-mean-us/op	      4600 read-p95-us/burst	 7003390 B/op	  109955 allocs/op
+BenchmarkSQLiteConnectionContention/4_readers/reads_only-2                   	       5	  56053164 ns/op	       159.5 pool-wait-ms/burst	       125.8 pool-waits/burst	      1680 read-mean-us/op	      3877 read-p95-us/burst	 7003563 B/op	  109958 allocs/op
+BenchmarkSQLiteConnectionContention/4_readers/reads_only-2                   	       5	  58638740 ns/op	       168.8 pool-wait-ms/burst	       126.2 pool-waits/burst	      1774 read-mean-us/op	      4094 read-p95-us/burst	 7003672 B/op	  109960 allocs/op
+BenchmarkSQLiteConnectionContention/4_readers/writer_0_attachments-2         	       5	  68435528 ns/op	       245.9 pool-wait-ms/burst	       162.6 pool-waits/burst	      1919 read-mean-us/op	      4640 read-p95-us/burst	 7041502 B/op	  110776 allocs/op
+BenchmarkSQLiteConnectionContention/4_readers/writer_0_attachments-2         	       5	  74454946 ns/op	       263.6 pool-wait-ms/burst	       161.8 pool-waits/burst	      2057 read-mean-us/op	      4905 read-p95-us/burst	 7041217 B/op	  110772 allocs/op
+BenchmarkSQLiteConnectionContention/4_readers/writer_0_attachments-2         	       5	  69471170 ns/op	       249.2 pool-wait-ms/burst	       162.4 pool-waits/burst	      1945 read-mean-us/op	      4604 read-p95-us/burst	 7041091 B/op	  110772 allocs/op
+BenchmarkSQLiteConnectionContention/4_readers/writer_16_attachments-2        	       5	  80069641 ns/op	       281.5 pool-wait-ms/burst	       164.6 pool-waits/burst	      2197 read-mean-us/op	      5334 read-p95-us/burst	 7190916 B/op	  114363 allocs/op
+BenchmarkSQLiteConnectionContention/4_readers/writer_16_attachments-2        	       5	  82112061 ns/op	       292.1 pool-wait-ms/burst	       164.6 pool-waits/burst	      2279 read-mean-us/op	      5498 read-p95-us/burst	 7190916 B/op	  114363 allocs/op
+BenchmarkSQLiteConnectionContention/4_readers/writer_16_attachments-2        	       5	  92883095 ns/op	       281.3 pool-wait-ms/burst	       166.0 pool-waits/burst	      2194 read-mean-us/op	      5006 read-p95-us/burst	 7191168 B/op	  114368 allocs/op
+PASS
+ok  	github.com/voxmail/voxmail/internal/store	8.176s

@@ -4,27 +4,59 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	_ "embed"
+	"embed"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/voxmail/voxmail/internal/diagnostics"
+	"github.com/voxmail/voxmail/internal/folderpolicy"
+	"github.com/voxmail/voxmail/internal/imapcheck"
 	"io"
 	"log/slog"
 	"net/http"
+	"path"
 	"reflect"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/voxmail/voxmail/internal/auth"
+	"github.com/voxmail/voxmail/internal/mailer"
 	"github.com/voxmail/voxmail/internal/secret"
+	"github.com/voxmail/voxmail/internal/speech"
 	"github.com/voxmail/voxmail/internal/store"
 )
 
-//go:embed static/index.html
-var indexHTML []byte
+//go:embed static/index.html static/console.bundle.js console/console.css
+var consolePageFiles embed.FS
+
+var indexHTML = assembledConsole()
+
+func assembledConsole() []byte {
+	read := func(path string) string {
+		data, err := consolePageFiles.ReadFile(path)
+		if err != nil {
+			panic(err)
+		}
+		return string(data)
+	}
+	html := read("static/index.html")
+	for marker, path := range map[string]string{
+		"{{CONSOLE_SCRIPT}}": "static/console.bundle.js",
+		"{{CONSOLE_STYLES}}": "console/console.css",
+	} {
+		if strings.Count(html, marker) != 1 {
+			panic("console template must contain exactly one " + marker)
+		}
+		html = strings.Replace(html, marker, read(path), 1)
+	}
+	return []byte(html)
+}
+
+//go:embed static/assets/*
+var consoleAssets embed.FS
 
 var contentSecurityPolicy = fmt.Sprintf("default-src 'none'; script-src 'sha256-%s'; style-src 'sha256-%s'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; frame-src 'none'; media-src 'self' blob:; object-src 'none'", embeddedAssetHash("<script", "</script>"), embeddedAssetHash("<style", "</style>"))
 
@@ -65,10 +97,13 @@ type SIPApplyGate interface {
 // separate: a running process, a connected bridge, a registered SIP account,
 // and usable media are different facts.
 type RuntimeStatus struct {
-	Process      string `json:"process,omitempty"`
-	Bridge       string `json:"bridge,omitempty"`
-	Registration string `json:"registration,omitempty"`
-	Media        string `json:"media,omitempty"`
+	Process       string `json:"process,omitempty"`
+	Bridge        string `json:"bridge,omitempty"`
+	Registration  string `json:"registration,omitempty"`
+	Media         string `json:"media,omitempty"`
+	LastError     string `json:"-"`
+	ErrorCategory string `json:"-"`
+	ResponseCode  int    `json:"-"`
 }
 
 // AlertService places outgoing test alert calls on demand. It is optional:
@@ -77,10 +112,14 @@ type AlertService interface {
 	TestAlert(context.Context, string) error
 }
 
-// VoiceActivator installs/warm-ups a trusted voice and refreshes the live
+// VoiceActivator warms an installed voice and refreshes the live
 // static prompt set before the voice preference is persisted.
 type VoiceActivator interface {
 	ActivateVoice(context.Context, string, int, int) error
+}
+
+type VoiceInstaller interface {
+	Install(context.Context, string, speech.VoiceSpec) error
 }
 
 // VoicePreviewer synthesizes a short, bounded sample for an already selected
@@ -105,6 +144,15 @@ type AccountSyncer interface {
 	RefreshAccount(context.Context, string, string) error
 }
 
+type AccountSyncStarter interface {
+	StartRefreshAccount(context.Context, context.Context, string, string) (int64, error)
+	WaitManualSyncs()
+}
+
+type ManualSyncCanceler interface {
+	CancelManualSync(context.Context, string) (bool, error)
+}
+
 // AccountDeletionCoordinator stops a per-account worker before its metadata
 // and local files are removed. It is separate from AccountSyncer so small
 // test doubles and deployments without mail sync remain valid.
@@ -113,6 +161,8 @@ type AccountDeletionCoordinator interface {
 }
 
 type Server struct {
+	// JobContext owns background jobs independently of HTTP connections.
+	JobContext        context.Context
 	Store             *store.Store
 	Secrets           *secret.Box
 	Log               *slog.Logger
@@ -120,6 +170,8 @@ type Server struct {
 	SIP               SIPController
 	Alerts            AlertService
 	Voice             VoiceActivator
+	VoiceInstaller    VoiceInstaller
+	OfflineMode       bool
 	Preview           VoicePreviewer
 	Calls             CallSessionInvalidator
 	Sync              AccountSyncer
@@ -128,19 +180,43 @@ type Server struct {
 	TrustedProxyCIDRs []string
 	Ready             func(context.Context) error
 	RuntimeStatus     func(context.Context) RuntimeStatus
-	loginMu           sync.Mutex
-	logins            map[string]loginState
-	recoveryMu        sync.Mutex
-	recoveryRate      map[string]recoveryRateState
-	voiceMu           sync.Mutex
-	voiceJobs         map[string]*voiceInstallJob
-	voiceOnce         sync.Once
-	voiceCtx          context.Context
-	voiceCancel       context.CancelFunc
-	voiceSem          chan struct{}
-	voiceAdmissionMu  sync.Mutex
-	voiceClosing      bool
-	voiceWG           sync.WaitGroup
+	// SendRecovery optionally replaces the trusted delivery dependency. It is
+	// never controlled by a request; normal wiring uses verified SMTP.
+	SendRecovery func(context.Context, mailer.Config, []string, []byte) mailer.SendResult
+	// Private transport adapters for isolated provider fixtures. Endpoint policy
+	// checks still run first; requests and deployment settings cannot set these.
+	imapAccountCheck func(context.Context, imapcheck.Config) ([]string, error)
+	smtpAccountCheck func(context.Context, mailer.Config) error
+	accountEndpoint  func(context.Context, string, int) (string, error)
+	loginMu          sync.Mutex
+	logins           map[string]*loginState
+	loginActive      int
+	loginAccounts    map[string]int
+	loginWindow      time.Time
+	loginTotal       int
+	loginLastReap    time.Time
+	loginNow         func() time.Time
+	loginCheck       func(string, string) bool
+	setupOnce        sync.Once
+	setupHashSem     chan struct{}
+	setupMu          sync.Mutex
+	setupAttempts    map[string]setupAttemptState
+	setupHash        func(string) (string, error)
+	recoveryMu       sync.Mutex
+	recoveryRate     map[string]recoveryRateState
+	previewMu        sync.Mutex
+	previewJobs      map[string]*previewJob
+	voiceMu          sync.Mutex
+	voiceJobs        map[string]*voiceInstallJob
+	voiceJobCancel   map[string]context.CancelFunc
+	voiceOnce        sync.Once
+	voiceCtx         context.Context
+	voiceCancel      context.CancelFunc
+	voiceSem         chan struct{}
+	admissionMu      sync.Mutex
+	closing          bool
+	voiceWG          sync.WaitGroup
+	requestWG        sync.WaitGroup
 }
 
 type voiceInstallJob struct {
@@ -158,6 +234,7 @@ type loginState struct {
 	Failures int
 	Until    time.Time
 	Seen     time.Time
+	Pending  int
 }
 
 type recoveryRateState struct {
@@ -181,7 +258,9 @@ const (
 type SessionStore struct {
 	mu       sync.Mutex
 	byToken  map[string]Session
+	byUser   map[string]int
 	lastReap time.Time
+	now      func() time.Time
 }
 
 type Session struct {
@@ -190,14 +269,20 @@ type Session struct {
 	Expires time.Time
 }
 
-func NewSessionStore() *SessionStore { return &SessionStore{byToken: make(map[string]Session)} }
+func NewSessionStore() *SessionStore {
+	return &SessionStore{byToken: make(map[string]Session), byUser: make(map[string]int)}
+}
 
 func (s *Server) Handler() http.Handler {
 	if s.Sessions == nil {
 		s.Sessions = NewSessionStore()
 	}
 	s.voiceOnce.Do(func() {
-		s.voiceCtx, s.voiceCancel = context.WithCancel(context.Background())
+		base := s.JobContext
+		if base == nil {
+			base = context.Background()
+		}
+		s.voiceCtx, s.voiceCancel = context.WithCancel(base)
 		s.voiceSem = make(chan struct{}, 1)
 		if s.Store != nil {
 			if err := s.Store.MarkInterruptedVoiceInstallJobs(context.Background(), time.Now().UTC()); err != nil && s.Log != nil {
@@ -220,6 +305,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/security/2fa/enable", s.enable2FA)
 	mux.HandleFunc("POST /api/v1/security/2fa/disable", s.disable2FA)
 	mux.HandleFunc("GET /api/v1/me", s.me)
+	mux.HandleFunc("GET /api/v1/status", s.operationalStatus)
 	mux.HandleFunc("GET /api/v1/users", s.users)
 	mux.HandleFunc("POST /api/v1/users", s.createUser)
 	mux.HandleFunc("DELETE /api/v1/users/{id}", s.deleteUser)
@@ -229,8 +315,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/accounts/validate", s.validateAccount)
 	mux.HandleFunc("POST /api/v1/accounts/test", s.testAccount)
 	mux.HandleFunc("POST /api/v1/accounts/{id}/sync", s.syncAccount)
+	mux.HandleFunc("POST /api/v1/accounts/{id}/sync/cancel", s.cancelManualSync)
 	mux.HandleFunc("GET /api/v1/accounts/{id}/mutations", s.accountMutations)
+	mux.HandleFunc("GET /api/v1/accounts/{id}/folder-policy", s.accountFolderPolicy)
+	mux.HandleFunc("PUT /api/v1/accounts/{id}/folder-policy", s.saveAccountFolderPolicy)
 	mux.HandleFunc("DELETE /api/v1/accounts/{id}", s.deleteAccount)
+	mux.HandleFunc("GET /api/v1/cleanup-jobs", s.cleanupJobs)
+	mux.HandleFunc("POST /api/v1/cleanup-jobs/{id}/retry", s.retryCleanupJob)
 	mux.HandleFunc("GET /api/v1/contacts", s.contacts)
 	mux.HandleFunc("POST /api/v1/contacts", s.createContact)
 	mux.HandleFunc("PUT /api/v1/contacts/{id}", s.updateContact)
@@ -248,18 +339,27 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/v1/alert-numbers/{id}", s.deleteAlertNumber)
 	mux.HandleFunc("GET /api/v1/voices", s.voices)
 	mux.HandleFunc("POST /api/v1/voices/install", s.installVoice)
+	mux.HandleFunc("GET /api/v1/voices/jobs/active", s.activeVoiceInstallJob)
+	mux.HandleFunc("POST /api/v1/voices/jobs/{id}/cancel", s.cancelVoiceInstall)
 	mux.HandleFunc("GET /api/v1/voices/jobs/{id}", s.voiceInstallStatus)
 	mux.HandleFunc("POST /api/v1/voices/preview", s.previewVoice)
+	mux.HandleFunc("GET /api/v1/voices/previews/{id}", s.previewJobStatus)
+	mux.HandleFunc("GET /api/v1/voices/previews/{id}/audio", s.previewJobAudio)
+	mux.HandleFunc("POST /api/v1/voices/previews/{id}/cancel", s.cancelPreviewJob)
 	mux.HandleFunc("POST /api/v1/alerts/test", s.testAlert)
 	mux.HandleFunc("GET /api/v1/sip", s.sipSettings)
 	mux.HandleFunc("PUT /api/v1/sip", s.saveSIP)
+	mux.HandleFunc("GET /assets/{name}", s.asset)
 	mux.HandleFunc("GET /", s.index)
-	return withRequestID(withSecurityHeaders(mux))
+	return withRequestID(withSecurityHeaders(s.withAdmission(mux)))
 }
 
 func (s *Server) testAlert(w http.ResponseWriter, r *http.Request) {
 	u, ok := s.requireAlerts(w, r, true)
 	if !ok {
+		return
+	}
+	if !s.requireOnline(w, "test alert calling") {
 		return
 	}
 	if s.Alerts == nil {
@@ -277,6 +377,10 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
+	if s.shuttingDown() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "not_ready", "reason": "server is shutting down", "offline_mode": s.OfflineMode})
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
 	runtime := RuntimeStatus{}
@@ -284,7 +388,7 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 		runtime = s.RuntimeStatus(ctx)
 	}
 	writeReady := func(code int, status, reason string) {
-		payload := map[string]any{"status": status}
+		payload := map[string]any{"status": status, "offline_mode": s.OfflineMode}
 		if reason != "" {
 			payload["reason"] = reason
 		}
@@ -301,6 +405,10 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 			payload["media"] = runtime.Media
 		}
 		writeJSON(w, code, payload)
+	}
+	if s.shuttingDown() {
+		writeReady(http.StatusServiceUnavailable, "not_ready", "server is shutting down")
+		return
 	}
 	if err := s.Store.Healthy(ctx); err != nil {
 		writeReady(http.StatusServiceUnavailable, "not_ready", "database unavailable")
@@ -324,8 +432,24 @@ func (s *Server) apiInfo(w http.ResponseWriter, r *http.Request) {
 		}
 		setupAvailable = count == 0
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"name": "VOXMail", "api_version": "v1", "setup_available": setupAvailable})
+	writeJSON(w, http.StatusOK, map[string]any{"name": "VOXMail", "api_version": "v1", "setup_available": setupAvailable, "offline_mode": s.OfflineMode})
 }
+func (s *Server) asset(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	data, err := consoleAssets.ReadFile("static/assets/" + name)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if strings.HasSuffix(name, ".svg") {
+		w.Header().Set("Content-Type", "image/svg+xml")
+	} else {
+		w.Header().Set("Content-Type", http.DetectContentType(data))
+	}
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	_, _ = w.Write(data)
+}
+
 func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	setupState := "unknown"
@@ -418,14 +542,14 @@ func validateFolderMap(mapping map[string]string) error {
 	seenLocal := make(map[string]struct{}, len(mapping))
 	for remote, local := range mapping {
 		remote, local = strings.TrimSpace(remote), strings.TrimSpace(local)
-		if remote == "" || local == "" || strings.ContainsAny(remote+local, "\x00\r\n") || strings.Contains(remote, "..") || strings.Contains(local, "..") || strings.HasPrefix(remote, "/") || strings.HasPrefix(strings.ReplaceAll(local, "\\", "/"), "/") {
+		if remote == "" || local == "" || path.Clean(strings.ReplaceAll(local, "\\", "/")) == "." || strings.ContainsAny(remote+local, "\x00\r\n") || strings.Contains(remote, "..") || strings.Contains(local, "..") || strings.HasPrefix(remote, "/") || strings.HasPrefix(strings.ReplaceAll(local, "\\", "/"), "/") {
 			return errors.New("folder mappings must be relative, non-empty names")
 		}
-		remoteKey := strings.ToLower(remote)
+		remoteKey := folderpolicy.RemoteKey(remote)
 		if _, ok := seenRemote[remoteKey]; ok {
 			return errors.New("folder mappings must have unique remote names")
 		}
-		localKey := strings.ToLower(local)
+		localKey := strings.ToLower(path.Clean(strings.ReplaceAll(local, "\\", "/")))
 		if _, ok := seenLocal[localKey]; ok {
 			return errors.New("folder mappings must have unique local names")
 		}
@@ -504,14 +628,21 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 }
 
 type apiErrorResponse struct {
-	Error     string `json:"error"`
-	Code      string `json:"code"`
-	RequestID string `json:"request_id,omitempty"`
+	Failure   *OperationalFailure `json:"failure,omitempty"`
+	Error     string              `json:"error"`
+	Code      string              `json:"code"`
+	RequestID string              `json:"request_id,omitempty"`
+	Fields    map[string]string   `json:"fields,omitempty"`
 }
 
 func writeError(w http.ResponseWriter, status int, message string) {
 	response := apiErrorResponse{Error: message, Code: apiErrorCode(status), RequestID: w.Header().Get("X-Request-ID")}
 	writeJSON(w, status, response)
+}
+
+// Validation errors identify a field without echoing submitted credentials.
+func writeFieldError(w http.ResponseWriter, field, message string) {
+	writeJSON(w, http.StatusBadRequest, apiErrorResponse{Error: message, Code: "bad_request", RequestID: w.Header().Get("X-Request-ID"), Fields: map[string]string{field: message}})
 }
 
 func serverError(w http.ResponseWriter, err error) {
@@ -568,8 +699,20 @@ func redactHTTPError(err error) string {
 
 func withRequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Request-ID", newID())
-		next.ServeHTTP(w, r)
+		requestID := newID()
+		w.Header().Set("X-Request-ID", requestID)
+		if !diagnostics.Enabled() {
+			next.ServeHTTP(w, r)
+			return
+		}
+		recorder := &diagnosticResponse{ResponseWriter: w, status: http.StatusOK}
+		started := time.Now()
+		defer func() {
+			// ServeMux patterns contain placeholders; never log user-controlled
+			// paths, queries, request bodies, cookies or authorization headers.
+			slog.DebugContext(r.Context(), "HTTP request completed", "request_id", requestID, "method", r.Method, "route", r.Pattern, "status", recorder.status, "duration_ms", time.Since(started).Milliseconds())
+		}()
+		next.ServeHTTP(recorder, r)
 	})
 }
 
@@ -607,3 +750,25 @@ func parseID(value string) int64 {
 	}
 	return id
 }
+
+type diagnosticResponse struct {
+	http.ResponseWriter
+	status int
+	wrote  bool
+}
+
+func (w *diagnosticResponse) WriteHeader(code int) {
+	if !w.wrote && code >= 200 {
+		w.status = code
+		w.wrote = true
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+func (w *diagnosticResponse) Write(p []byte) (int, error) {
+	if !w.wrote {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(p)
+}
+func (w *diagnosticResponse) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+func (w *diagnosticResponse) Flush()                      { _ = http.NewResponseController(w.ResponseWriter).Flush() }

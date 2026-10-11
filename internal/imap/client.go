@@ -8,6 +8,8 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"github.com/voxmail/voxmail/internal/diagnostics"
+	"github.com/voxmail/voxmail/internal/operation"
 	"io"
 	"net"
 	"net/textproto"
@@ -84,7 +86,18 @@ type MessageIdentity struct {
 	Flags       []string
 }
 
-func Open(ctx context.Context, cfg Config) (*Client, error) {
+func Open(ctx context.Context, cfg Config) (_ *Client, retErr error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	finishTrace := diagnostics.Start(ctx, "imap", "connect")
+	defer func() {
+		if retErr != nil && ctx.Err() != nil {
+			retErr = errors.Join(retErr, ctx.Err())
+		}
+		retErr = operation.Wrap("imap", "connect", operation.Protocol, retErr)
+		finishTrace(retErr)
+	}()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -96,7 +109,7 @@ func Open(ctx context.Context, cfg Config) (*Client, error) {
 	}
 	if cfg.Host == "" || cfg.Port < 1 || cfg.Port > 65535 || cfg.Username == "" {
 		operationCancel()
-		return nil, fmt.Errorf("incomplete IMAP settings")
+		return nil, operation.Wrap("imap", "settings", operation.Configuration, fmt.Errorf("incomplete IMAP settings"))
 	}
 	security := strings.ToLower(strings.TrimSpace(cfg.Security))
 	if security == "" {
@@ -108,7 +121,7 @@ func Open(ctx context.Context, cfg Config) (*Client, error) {
 	}
 	if security != "implicit_tls" && security != "starttls" {
 		operationCancel()
-		return nil, fmt.Errorf("unsupported IMAP security mode")
+		return nil, operation.Wrap("imap", "settings", operation.Configuration, fmt.Errorf("unsupported IMAP security mode"))
 	}
 	dialCtx, dialCancel := context.WithTimeout(operationCtx, connectionTimeout)
 	conn, err := netguard.DialContext(dialCtx, cfg.Host, cfg.Port, cfg.Address, cfg.AllowPrivate)
@@ -144,7 +157,7 @@ func Open(ctx context.Context, cfg Config) (*Client, error) {
 			stop()
 			operationCancel()
 			_ = raw.Close()
-			return nil, fmt.Errorf("IMAP TLS handshake: %w", err)
+			return nil, operation.Wrap("imap", "tls_handshake", operation.TLS, err)
 		}
 		conn = tlsConn
 	}
@@ -163,14 +176,14 @@ func Open(ctx context.Context, cfg Config) (*Client, error) {
 			stop()
 			operationCancel()
 			_ = raw.Close()
-			return nil, fmt.Errorf("IMAP STARTTLS: %w", err)
+			return nil, operation.Wrap("imap", "starttls", operation.TLS, err)
 		}
 	}
 	if err := c.Login(cfg.Username, cfg.Password); err != nil {
 		stop()
 		operationCancel()
 		_ = raw.Close()
-		return nil, fmt.Errorf("IMAP authentication: %w", err)
+		return nil, operation.Wrap("imap", "authenticate", operation.Authentication, err)
 	}
 	return &Client{conn: c, raw: raw, ctx: operationCtx, stop: stop, cancel: operationCancel}, nil
 }
@@ -186,7 +199,7 @@ func (c *Client) Close() error {
 		// Logout is a protocol exchange. Give it a short independent budget,
 		// then close the transport so a silent peer cannot hold the caller.
 		c.conn.Timeout = cleanupTimeout
-		c.err = c.conn.Logout()
+		c.err = operation.Wrap("imap", "logout", operation.Protocol, c.conn.Logout())
 		if c.raw != nil {
 			_ = c.raw.Close()
 		}
@@ -342,7 +355,8 @@ func (c *Client) findMessages(folder, messageID string, readOnly bool) ([]Messag
 
 // ReconcileSeen checks a previously attempted Message-ID flag mutation using
 // a new read-only view. It never changes remote state.
-func (c *Client) ReconcileSeen(folder, messageID string, seen bool) (MutationState, error) {
+func (c *Client) ReconcileSeen(folder, messageID string, seen bool) (_ MutationState, retErr error) {
+	defer func() { retErr = c.boundaryError("ReconcileSeen", retErr) }()
 	identities, err := c.findMessages(folder, messageID, true)
 	if err != nil {
 		return MutationStateUnknown, err
@@ -362,7 +376,8 @@ func (c *Client) ReconcileSeen(folder, messageID string, seen bool) (MutationSta
 // ReconcileSeenByUID is the UIDVALIDITY-safe counterpart to ReconcileSeen.
 // A missing UID is intentionally unknown: another actor may have moved or
 // deleted the message after the uncertain command.
-func (c *Client) ReconcileSeenByUID(folder string, uid, uidValidity uint32, seen bool) (MutationState, error) {
+func (c *Client) ReconcileSeenByUID(folder string, uid, uidValidity uint32, seen bool) (_ MutationState, retErr error) {
+	defer func() { retErr = c.boundaryError("ReconcileSeenByUID", retErr) }()
 	identities, currentValidity, err := c.ListMessageIdentities(folder)
 	if err != nil {
 		return MutationStateUnknown, err
@@ -385,7 +400,8 @@ func (c *Client) ReconcileSeenByUID(folder string, uid, uidValidity uint32, seen
 // ReconcileMove confirms a move only when a unique Message-ID is absent from
 // the source and present exactly once in the destination, or vice versa. Any
 // other observation is deliberately left unknown.
-func (c *Client) ReconcileMove(source, destination, messageID string) (MutationState, error) {
+func (c *Client) ReconcileMove(source, destination, messageID string) (_ MutationState, retErr error) {
+	defer func() { retErr = c.boundaryError("ReconcileMove", retErr) }()
 	if strings.TrimSpace(source) == "" || strings.TrimSpace(destination) == "" || strings.TrimSpace(messageID) == "" {
 		return MutationStateUnknown, fmt.Errorf("source, destination, and Message-ID are required")
 	}
@@ -417,7 +433,8 @@ func (c *Client) ReconcileMove(source, destination, messageID string) (MutationS
 // when the original UID is still present under the same UIDVALIDITY. If it is
 // absent, a MOVE may have assigned a new UID in the destination, so the state
 // remains unknown without a stable Message-ID.
-func (c *Client) ReconcileMoveByUID(source string, uid, uidValidity uint32) (MutationState, error) {
+func (c *Client) ReconcileMoveByUID(source string, uid, uidValidity uint32) (_ MutationState, retErr error) {
+	defer func() { retErr = c.boundaryError("ReconcileMoveByUID", retErr) }()
 	identities, currentValidity, err := c.ListMessageIdentities(source)
 	if err != nil {
 		return MutationStateUnknown, err
@@ -442,7 +459,8 @@ func hasIMAPFlag(flags []string, want string) bool {
 	return false
 }
 
-func (c *Client) SetSeen(folder, messageID string, seen bool) error {
+func (c *Client) SetSeen(folder, messageID string, seen bool) (retErr error) {
+	defer func() { retErr = c.boundaryError("SetSeen", retErr) }()
 	set, err := c.find(folder, messageID)
 	if err != nil {
 		return err
@@ -457,7 +475,8 @@ func (c *Client) SetSeen(folder, messageID string, seen bool) error {
 	return nil
 }
 
-func (c *Client) SetSeenByUID(folder string, uid, uidValidity uint32, seen bool) error {
+func (c *Client) SetSeenByUID(folder string, uid, uidValidity uint32, seen bool) (retErr error) {
+	defer func() { retErr = c.boundaryError("SetSeenByUID", retErr) }()
 	set, err := c.uidSet(folder, uid, uidValidity)
 	if err != nil {
 		return err
@@ -472,7 +491,8 @@ func (c *Client) SetSeenByUID(folder string, uid, uidValidity uint32, seen bool)
 	return nil
 }
 
-func (c *Client) Move(folder, destination, messageID string) error {
+func (c *Client) Move(folder, destination, messageID string) (retErr error) {
+	defer func() { retErr = c.boundaryError("Move", retErr) }()
 	set, err := c.find(folder, messageID)
 	if err != nil {
 		return err
@@ -486,7 +506,8 @@ func (c *Client) Move(folder, destination, messageID string) error {
 	return nil
 }
 
-func (c *Client) MoveByUID(folder, destination string, uid, uidValidity uint32) error {
+func (c *Client) MoveByUID(folder, destination string, uid, uidValidity uint32) (retErr error) {
+	defer func() { retErr = c.boundaryError("MoveByUID", retErr) }()
 	set, err := c.uidSet(folder, uid, uidValidity)
 	if err != nil {
 		return err
@@ -524,9 +545,9 @@ func mutationError(operation string, err error) error {
 		return nil
 	}
 	if mutationTransportError(err) {
-		return fmt.Errorf("%w: %s: %v", ErrMutationUncertain, operation, err)
+		return mutationFailure(operation, err)
 	}
-	return fmt.Errorf("%s: %w", operation, err)
+	return mutationRejected(operation, err)
 }
 
 func mutationTransportError(err error) bool {
@@ -537,17 +558,19 @@ func mutationTransportError(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "connection closed")
 }
 
-func (c *Client) Append(folder string, raw []byte) error {
+func (c *Client) Append(folder string, raw []byte) (retErr error) {
+	defer func() { retErr = c.boundaryError("Append", retErr) }()
 	if c == nil || c.conn == nil || strings.TrimSpace(folder) == "" || len(raw) == 0 {
 		return fmt.Errorf("draft folder and message are required")
 	}
 	if err := c.conn.Append(folder, nil, time.Now(), bytes.NewReader(raw)); err != nil {
-		return fmt.Errorf("append IMAP draft: %w", err)
+		return mutationError("append IMAP draft", err)
 	}
 	return nil
 }
 
-func (c *Client) ListFolders() ([]string, error) {
+func (c *Client) ListFolders() (_ []string, retErr error) {
+	defer func() { retErr = c.boundaryError("ListFolders", retErr) }()
 	if c == nil || c.conn == nil {
 		return nil, fmt.Errorf("IMAP connection is unavailable")
 	}
@@ -577,7 +600,8 @@ func (c *Client) ListFolders() ([]string, error) {
 	return folders, nil
 }
 
-func (c *Client) ListMessageIdentities(folder string) ([]MessageIdentity, uint32, error) {
+func (c *Client) ListMessageIdentities(folder string) (_ []MessageIdentity, _ uint32, retErr error) {
+	defer func() { retErr = c.boundaryError("ListMessageIdentities", retErr) }()
 	if c == nil || c.conn == nil || strings.TrimSpace(folder) == "" {
 		return nil, 0, fmt.Errorf("IMAP folder is required")
 	}
@@ -610,4 +634,27 @@ func (c *Client) ListMessageIdentities(folder string) ([]MessageIdentity, uint32
 		return nil, 0, err
 	}
 	return identities, status.UidValidity, nil
+}
+
+func mutationFailure(stage string, err error) error {
+	return operation.Wrap("imap", stage, operation.Uncertain, errors.Join(ErrMutationUncertain, err))
+}
+func mutationRejected(stage string, err error) error {
+	return operation.Wrap("imap", stage, operation.Protocol, err)
+}
+
+func (c *Client) boundaryError(stage string, err error) error {
+	if err == nil {
+		return nil
+	}
+	category := operation.Protocol
+	if errors.Is(err, ErrUIDValidityChanged) || errors.Is(err, ErrMissingIdentity) || errors.Is(err, ErrAmbiguousMessage) {
+		category = operation.MailIndex
+	}
+	// Transport closure from cancellation must keep the controlling cause. An
+	// already uncertain mutation remains uncertain under the outer wrapper.
+	if contextErr := c.operationContext().Err(); contextErr != nil {
+		err = errors.Join(err, contextErr)
+	}
+	return operation.Wrap("imap", stage, category, err)
 }

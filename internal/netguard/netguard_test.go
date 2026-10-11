@@ -2,6 +2,7 @@ package netguard
 
 import (
 	"context"
+	"github.com/voxmail/voxmail/internal/operation"
 	"net"
 	"testing"
 )
@@ -101,5 +102,20 @@ func TestCheckAndPinRejectsReservedResolutionBeforeDial(t *testing.T) {
 	address, err := CheckAndPin(context.Background(), "127.0.0.1", 993, false)
 	if err == nil {
 		t.Fatalf("CheckAndPin returned address %q for loopback", address)
+	}
+}
+
+func TestRejectedEndpointsHaveStructuredCategory(t *testing.T) {
+	for _, tc := range []struct {
+		address string
+		want    operation.Category
+	}{
+		{"127.0.0.1:993", operation.EndpointPolicy},
+		{"not-an-address", operation.Configuration},
+	} {
+		err := ValidateAddress(tc.address, 993, false)
+		if operation.Classify(err) != tc.want {
+			t.Fatalf("%s: category=%s error=%v", tc.address, operation.Classify(err), err)
+		}
 	}
 }

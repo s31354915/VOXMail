@@ -13,7 +13,7 @@ option(VOXMAIL_BUILD_MODULE "Build the production Baresip module" ${_voxmail_bui
 
 set(SRCS voxmail.c command_queue.c call_dispatch.c json_output.c frame_parser.c
         client_owner.c command_wakeup.c nonblocking_pipe.c pcm_writer.c
-        pthread_start.c)
+        pthread_start.c event_shutdown.c)
 if(VOXMAIL_BUILD_MODULE)
   list(APPEND MODULES_DETECTED ${PROJECT_NAME})
   set(MODULES_DETECTED ${MODULES_DETECTED} PARENT_SCOPE)
@@ -65,4 +65,9 @@ if(VOXMAIL_BUILD_NATIVE_TESTS)
   voxmail_configure_native_test(voxmail_pthread_start_test)
   target_link_libraries(voxmail_pthread_start_test PRIVATE Threads::Threads)
   add_test(NAME voxmail_pthread_start_test COMMAND voxmail_pthread_start_test)
+  add_executable(voxmail_event_shutdown_test event_shutdown_test.c event_shutdown.c)
+  voxmail_configure_native_test(voxmail_event_shutdown_test)
+  target_link_libraries(voxmail_event_shutdown_test PRIVATE Threads::Threads)
+  add_test(NAME voxmail_event_shutdown_test COMMAND voxmail_event_shutdown_test)
+  set_tests_properties(voxmail_event_shutdown_test PROPERTIES TIMEOUT 30)
 endif()

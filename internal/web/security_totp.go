@@ -2,11 +2,13 @@ package web
 
 import (
 	"context"
+	"encoding/base64"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
+	"github.com/skip2/go-qrcode"
 	"github.com/voxmail/voxmail/internal/auth"
 )
 
@@ -28,7 +30,7 @@ func (s *Server) setup2FA(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !auth.Check(u.PasswordHash, req.CurrentPassword) {
-		writeError(w, http.StatusUnauthorized, "current password is incorrect")
+		writeFieldError(w, "current_password", "current password is incorrect")
 		return
 	}
 	secretValue, err := auth.GenerateTOTPSecret()
@@ -36,10 +38,16 @@ func (s *Server) setup2FA(w http.ResponseWriter, r *http.Request) {
 		serverError(w, err)
 		return
 	}
-	label := url.QueryEscape("VOXMail:" + u.Username)
+	label := url.PathEscape("VOXMail:" + u.Username)
 	issuer := url.QueryEscape("VOXMail")
 	uri := "otpauth://totp/" + label + "?secret=" + secretValue + "&issuer=" + issuer
-	writeJSON(w, http.StatusOK, map[string]string{"secret": secretValue, "provisioning_uri": uri})
+	// Render locally: an external QR service would disclose the TOTP secret.
+	png, err := qrcode.Encode(uri, qrcode.Medium, 256)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"secret": secretValue, "provisioning_uri": uri, "qr_data_uri": "data:image/png;base64," + base64.StdEncoding.EncodeToString(png)})
 }
 
 func (s *Server) enable2FA(w http.ResponseWriter, r *http.Request) {
@@ -51,8 +59,16 @@ func (s *Server) enable2FA(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	if s.Secrets == nil || !auth.Check(u.PasswordHash, req.CurrentPassword) || !auth.TOTP(req.Secret, req.Code, time.Now().UTC()) {
-		writeError(w, http.StatusUnauthorized, "password or authenticator code is incorrect")
+	if !auth.Check(u.PasswordHash, req.CurrentPassword) {
+		writeFieldError(w, "current_password", "current password is incorrect")
+		return
+	}
+	if !auth.TOTP(req.Secret, req.Code, time.Now().UTC()) {
+		writeFieldError(w, "code", "authenticator code is incorrect")
+		return
+	}
+	if s.Secrets == nil {
+		serverError(w, nil)
 		return
 	}
 	codes := make([]string, 0, 10)
@@ -93,8 +109,12 @@ func (s *Server) disable2FA(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	if u.TOTPSecret == "" || !auth.Check(u.PasswordHash, req.CurrentPassword) || !auth.TOTP(s.openTOTPSecret(u.TOTPSecret), req.Code, time.Now().UTC()) {
-		writeError(w, http.StatusUnauthorized, "password or authenticator code is incorrect")
+	if !auth.Check(u.PasswordHash, req.CurrentPassword) {
+		writeFieldError(w, "current_password", "current password is incorrect")
+		return
+	}
+	if u.TOTPSecret == "" || !auth.TOTP(s.openTOTPSecret(u.TOTPSecret), req.Code, time.Now().UTC()) {
+		writeFieldError(w, "code", "authenticator code is incorrect")
 		return
 	}
 	if err := s.Store.DisableTOTP(r.Context(), u.ID); err != nil {

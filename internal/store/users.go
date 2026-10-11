@@ -5,6 +5,15 @@ import (
 	"time"
 )
 
+// SetupCompleted reports the durable one-time bootstrap marker. The setup
+// handler uses it as a cheap preflight before expensive credential hashing;
+// CreateBootstrapUser remains the authoritative transactional guard.
+func (s *Store) SetupCompleted(ctx context.Context) (bool, error) {
+	var completed int
+	err := s.DB.QueryRowContext(ctx, `SELECT setup_completed FROM system_settings WHERE id=1`).Scan(&completed)
+	return completed != 0, err
+}
+
 func (s *Store) UserCount(ctx context.Context) (int, error) {
 	var count int
 	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&count)
