@@ -497,13 +497,15 @@ func phase1(base string) {
 		return
 	}
 	page, err := newSess(base).c.Do(req)
-	cancel()
 	if err != nil {
+		cancel()
 		fatalf("GET /: %v", err)
 	} else {
 		head := page.Header
-		html, _ := io.ReadAll(page.Body)
+		html, readErr := io.ReadAll(page.Body)
 		page.Body.Close()
+		cancel()
+		check(readErr == nil, "console response body is fully read: %v", readErr)
 		check(page.StatusCode == 200 && strings.Contains(string(html), "<title>VOXMail Console</title>") && strings.Contains(string(html), `id="app"`) && strings.Contains(string(html), "<script"), "console page is served")
 		check(head.Get("X-Content-Type-Options") == "nosniff" && head.Get("X-Frame-Options") == "DENY", "security headers are present")
 	}
