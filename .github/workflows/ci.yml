@@ -107,6 +107,10 @@ jobs:
     timeout-minutes: 15
     container: python:3.11-slim-bookworm@sha256:0a310eeecf4e1f5a0743f9a6520c90c88d089c903ca5fd283f501e3a805f5f89
     steps:
+      - name: Install Git for exact source verification
+        run: |
+          apt-get update
+          apt-get install --no-install-recommends -y git
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ env.VOXMAIL_CI_SOURCE_SHA }}
