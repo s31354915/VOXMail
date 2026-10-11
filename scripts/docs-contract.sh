@@ -66,7 +66,6 @@ for script in \
 	contains docs/OPERATIONS.md "$script"
 done
 
-contains README.md "docs/RELEASE-READINESS.md"
 contains README.md "Beta software"
 contains docs/SETTINGS.md "VOXMAIL_HTTP_ADDR"
 contains docs/SETTINGS.md "127.0.0.1:8080"

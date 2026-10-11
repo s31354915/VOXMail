@@ -47,8 +47,6 @@ mail content. Treat the Docker host and the `/data` volume as sensitive.
   mail actions, drafts, and voice composition.
 - [Architecture](docs/ARCHITECTURE.md) — synchronization safety, SIP/media
   ownership, model lifecycle, alerts, and data boundaries.
-- [Release readiness](docs/RELEASE-READINESS.md) — what has been verified,
-  what remains deployment-dependent, and the promotion checklist.
 - [Browser test guide](tests/browser/README.md) — the isolated Chromium
   scenario for the web console.
 
@@ -221,9 +219,8 @@ manifest. Prerelease and test tags do not move `latest`; production promotion
 must be an explicit decision. Fixed HIGH or CRITICAL vulnerability findings
 block publication unless an approved, time-bounded exception exists.
 
-Before promotion, keep the prior image digest and backup available, complete
-the [release checklist](docs/RELEASE-READINESS.md), and verify the image on
-the actual deployment host and provider network.
+Before promotion, keep the prior image digest and backup available, and verify
+the image on the actual deployment host and provider network.
 
 ## Data, backup, and upgrade rules
 
@@ -253,28 +250,6 @@ For rollback, set `VOXMAIL_IMAGE` to the previous immutable digest and recreate
 the service. Do not downgrade a database migration blindly; restore the
 matching data backup when a release states that its schema is not backward
 compatible.
-
-## Known limitations
-
-VOXMail is beta software and these are deliberate boundaries, not promises of
-provider compatibility:
-
-- SIP registration, NAT traversal, provider authentication syntax, TLS
-  certificates, codec negotiation, and RTP reachability vary by provider.
-- Local exact-image tests do not prove an external registrar, carrier, or
-  production reverse proxy.
-- Arm64 and the supported production browser-library combination must be
-  validated on the target deployment host before promotion.
-- Mailbox recovery can act as an alternate authentication factor because it
-  requires access to the configured mailbox; deployments needing stronger
-  assurance should disable or restrict it.
-- SQLite is intentionally conservative about writers. Large installations
-  need a production-shaped capacity test before increasing concurrency.
-- Interrupted model installation is reported as failed and must be retried;
-  partial model files are not silently activated.
-
-See [release readiness](docs/RELEASE-READINESS.md) for the exact evidence
-available in this checkout and the remaining deployment gates.
 
 ## License
 
