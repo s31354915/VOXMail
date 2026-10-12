@@ -98,11 +98,12 @@ and the static-prompt manifest version and digest include the normalized text,
 so a deployment cannot reuse recordings made with the old pronunciation.
 The bundled fallback WAVs are regenerated with that same pronunciation policy.
 
-At startup VOXMail compares prompt text, model name, and model digest. A
+At startup VOXMail compares prompt text, model name, model and configuration
+sidecar digests, and Piper synthesis options (including speech speed). A
 matching manifest returns without touching Piper, so ordinary idle startup
 does not warm speech resources. If the configured model exists but differs,
-both recordings are generated in a private staging directory and replaced only
-after both succeed; the manifest is written last. If the replacement model is
+all fixed recordings are generated in a private staging directory and replaced only
+after all succeed; the manifest is written last. If the replacement model is
 unavailable, the shipped recordings remain usable and a warning is logged.
 
 For a per-user custom voice, the fixed static main prompt is used only when its

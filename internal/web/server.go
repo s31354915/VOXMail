@@ -97,6 +97,9 @@ type SIPApplyGate interface {
 // separate: a running process, a connected bridge, a registered SIP account,
 // and usable media are different facts.
 type RuntimeStatus struct {
+	PromptState   string `json:"prompt_state,omitempty"`
+	PromptVoice   string `json:"prompt_voice,omitempty"`
+	PromptError   string `json:"prompt_error,omitempty"`
 	Process       string `json:"process,omitempty"`
 	Bridge        string `json:"bridge,omitempty"`
 	Registration  string `json:"registration,omitempty"`

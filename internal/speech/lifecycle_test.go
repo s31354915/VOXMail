@@ -15,18 +15,24 @@ func TestPrepareStaticPromptsRefreshesWhenModelChanges(t *testing.T) {
 	if err := os.WriteFile(model, []byte("model-one"), 0600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(model+".json", []byte(`{"audio":{"sample_rate":22050}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
 	piper := filepath.Join(root, "fake-piper.sh")
 	script := "#!/bin/sh\nout=\nnext=0\nfor arg in \"$@\"; do if [ \"$next\" = 1 ]; then out=$arg; next=0; elif [ \"$arg\" = \"--output_file\" ]; then next=1; fi; done\nprintf 'RIFF\\046\\000\\000\\000WAVEfmt \\020\\000\\000\\000\\001\\000\\001\\000\\100\\037\\000\\000\\200\\076\\000\\000\\002\\000\\020\\000data\\002\\000\\000\\000\\000\\000' > \"$out\"\n"
 	if err := os.WriteFile(piper, []byte(script), 0700); err != nil {
 		t.Fatal(err)
 	}
-	greeting := filepath.Join(root, "prompts", "welcome.wav")
-	main := filepath.Join(root, "prompts", "main-menu.wav")
+	greeting := filepath.Join(root, "custom", "greeting.wav")
+	main := filepath.Join(root, "custom", "menu.wav")
 	manifest := filepath.Join(root, "prompts", "static-prompts.json")
 	p := Piper{Binary: piper, Model: model}
 	first, err := PrepareStaticPrompts(context.Background(), p, greeting, main, manifest)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !ValidWAV(greeting) || !ValidWAV(main) {
+		t.Fatal("custom prompt destinations were not populated")
 	}
 	if first.ModelSHA256 == "" {
 		t.Fatal("missing model digest")
@@ -42,6 +48,15 @@ func TestPrepareStaticPromptsRefreshesWhenModelChanges(t *testing.T) {
 	if _, err := PrepareStaticPrompts(context.Background(), p, greeting, main, manifest); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Remove(greeting); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PrepareStaticPrompts(context.Background(), p, greeting, main, manifest); err != nil || !ValidWAV(greeting) {
+		t.Fatalf("cache hit did not restore custom greeting: %v", err)
+	}
+	if _, err := PrepareStaticPrompts(context.Background(), p, main, main, manifest); err == nil {
+		t.Fatal("colliding prompt destinations accepted")
+	}
 	if err := os.WriteFile(model, []byte("model-two"), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -51,6 +66,25 @@ func TestPrepareStaticPromptsRefreshesWhenModelChanges(t *testing.T) {
 	}
 	if first.ModelSHA256 == second.ModelSHA256 {
 		t.Fatal("static prompt manifest did not refresh after model change")
+	}
+	if err := os.WriteFile(model+".json", []byte(`{"audio":{"sample_rate":16000}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	third, err := PrepareStaticPrompts(context.Background(), p, greeting, main, manifest)
+	if err != nil || third.ConfigSHA256 == second.ConfigSHA256 {
+		t.Fatalf("configuration change did not regenerate prompts: %v", err)
+	}
+	p.Extra = SpeedExtra(2)
+	fourth, err := PrepareStaticPrompts(context.Background(), p, greeting, main, manifest)
+	if err != nil || fourth.OptionsSHA256 == third.OptionsSHA256 {
+		t.Fatalf("speed change did not regenerate prompts: %v", err)
+	}
+	if err := os.Remove(model); err != nil {
+		t.Fatal(err)
+	}
+	fallback, err := PrepareStaticPrompts(context.Background(), p, greeting, main, manifest)
+	if err == nil || fallback.ModelSHA256 != fourth.ModelSHA256 || !ValidWAV(greeting) {
+		t.Fatal("missing model must report failure while preserving backup recordings")
 	}
 }
 
@@ -197,6 +231,9 @@ func TestPrepareStaticPromptsRejectsManifestPathTraversal(t *testing.T) {
 	if err := os.WriteFile(model, []byte("model"), 0600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(model+".json", []byte(`{"audio":{"sample_rate":22050}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
 	piper := filepath.Join(root, "fake-piper.sh")
 	script := "#!/bin/sh\nout=\nnext=0\nfor arg in \"$@\"; do if [ \"$next\" = 1 ]; then out=$arg; next=0; elif [ \"$arg\" = \"--output_file\" ]; then next=1; fi; done\nprintf 'RIFF\\046\\000\\000\\000WAVEfmt \\020\\000\\000\\000\\001\\000\\001\\000\\100\\037\\000\\000\\200\\076\\000\\000\\002\\000\\020\\000data\\002\\000\\000\\000\\000\\000' > \"$out\"\n"
 	if err := os.WriteFile(piper, []byte(script), 0700); err != nil {
@@ -227,5 +264,23 @@ func TestPrepareStaticPromptsRejectsManifestPathTraversal(t *testing.T) {
 	}
 	if string(data) != "must remain" {
 		t.Fatalf("manifest traversal modified outside asset: %q", data)
+	}
+}
+
+func TestRuntimeFingerprintIncludesConfiguration(t *testing.T) {
+	model := filepath.Join(t.TempDir(), "voice.onnx")
+	if err := os.WriteFile(model, []byte("model"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(model+".json", []byte("one"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	first := NewRuntime(Piper{Model: model}, Whisper{}, "")
+	if err := os.WriteFile(model+".json", []byte("two"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	second := NewRuntime(Piper{Model: model}, Whisper{}, "")
+	if first.Fingerprint == "" || first.Fingerprint == second.Fingerprint {
+		t.Fatal("sidecar replacement reused runtime identity")
 	}
 }

@@ -92,7 +92,8 @@ func (v *voiceActivator) ActivateVoice(ctx context.Context, name string, menuSpe
 			return errors.New("voice prompt generation produced no usable assets")
 		}
 		if v.Player != nil {
-			v.Player.SetStaticPromptsForSpeed(assets, manifest.VoiceModel, speed)
+			fingerprint, _ := speech.ModelFingerprint(model)
+			v.Player.SetStaticPromptsForSpeed(assets, manifest.VoiceModel, speed, fingerprint)
 		}
 	}
 	return nil
@@ -265,6 +266,9 @@ func main() {
 		StaticVoice:  staticManifest.VoiceModel,
 		Dir:          promptDir,
 	}
+	if promptErr == nil {
+		promptPlayer.SetStaticPromptsForSpeed(staticPrompts, staticManifest.VoiceModel, 3, speechRuntime.Fingerprint)
+	}
 	promptPlayer.PruneDynamicPrompts()
 	bridgeService := &calls.Service{
 		Socket:   cfg.ControlSocket,
@@ -301,7 +305,16 @@ func main() {
 				}
 			}
 		}
-		return web.RuntimeStatus{Process: sipStatus.Process, Bridge: bridgeState, Registration: sipStatus.Registration, Media: mediaState, LastError: sipStatus.LastError, ErrorCategory: sipStatus.ErrorCategory, ResponseCode: sipStatus.ResponseCode}
+		promptState := "ready"
+		promptError := ""
+		if promptErr != nil {
+			promptState = "backup"
+			if !speech.ValidWAV(cfg.GreetingPath) {
+				promptState = "unavailable"
+			}
+			promptError = "Configured voice prompts could not be generated; check server logs."
+		}
+		return web.RuntimeStatus{PromptState: promptState, PromptVoice: staticManifest.VoiceModel, PromptError: promptError, Process: sipStatus.Process, Bridge: bridgeState, Registration: sipStatus.Registration, Media: mediaState, LastError: sipStatus.LastError, ErrorCategory: sipStatus.ErrorCategory, ResponseCode: sipStatus.ResponseCode}
 	}
 	voiceInstaller := speech.AdministratorVoiceInstaller{Validate: func(ctx context.Context, model string) error {
 		return (speech.Piper{Binary: cfg.PiperBinary, Model: model}).Warm(ctx, filepath.Join(cfg.DataDir, "run", "speech"))

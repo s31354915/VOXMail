@@ -152,3 +152,18 @@ func TestLoadVerboseMode(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadRejectsMalformedNumbers(t *testing.T) {
+	for _, key := range []string{"VOXMAIL_MAX_CALLS", "VOXMAIL_HISTORY_RETENTION_DAYS", "VOXMAIL_HISTORY_MAX_ROWS"} {
+		for _, value := range []string{"oops", "9999999999999999999999999999999999"} {
+			t.Run(key+value, func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("VOXMAIL_ENCRYPTION_KEY", "01234567890123456789012345678901")
+				t.Setenv(key, value)
+				if _, err := Load(); err == nil {
+					t.Fatal("invalid number accepted")
+				}
+			})
+		}
+	}
+}

@@ -94,6 +94,9 @@ func TestTwoFactorQRProvisioningAndVerification(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if img.Bounds().Dx() != 512 || img.Bounds().Dy() != 512 {
+		t.Fatalf("QR dimensions=%v, want 512x512", img.Bounds())
+	}
 	bitmap, err := gozxing.NewBinaryBitmapFromImage(img)
 	if err != nil {
 		t.Fatal(err)

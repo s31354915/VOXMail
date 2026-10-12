@@ -545,10 +545,13 @@ last active call lease ends.
 ### A model was replaced
 
 At startup VOXMail compares the static prompt manifest's model name and
-SHA-256 with the configured Piper model. If the model exists and differs, both
+SHA-256, configuration sidecar checksum, and synthesis options with the
+configured Piper model. When these differ, all fixed
 static recordings are regenerated in a private staging directory and the
 manifest is committed last. If the replacement is unavailable, the shipped
-recordings remain usable and a warning is logged.
+recordings remain usable and a warning is logged. The operational status API
+reports `prompt_state` (`ready`, `backup`, or `unavailable`), `prompt_voice`,
+and a safe `prompt_error` description.
 
 ## Verbose diagnostics
 

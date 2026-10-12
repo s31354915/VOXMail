@@ -42,7 +42,7 @@ func (s *Server) setup2FA(w http.ResponseWriter, r *http.Request) {
 	issuer := url.QueryEscape("VOXMail")
 	uri := "otpauth://totp/" + label + "?secret=" + secretValue + "&issuer=" + issuer
 	// Render locally: an external QR service would disclose the TOTP secret.
-	png, err := qrcode.Encode(uri, qrcode.Medium, 256)
+	png, err := qrcode.Encode(uri, qrcode.Medium, 512)
 	if err != nil {
 		serverError(w, err)
 		return

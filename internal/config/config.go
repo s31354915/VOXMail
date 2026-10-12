@@ -47,6 +47,13 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	for _, key := range []string{"VOXMAIL_MAX_CALLS", "VOXMAIL_HISTORY_RETENTION_DAYS", "VOXMAIL_HISTORY_MAX_ROWS"} {
+		if value := os.Getenv(key); value != "" {
+			if _, err := strconv.Atoi(value); err != nil {
+				return Config{}, fmt.Errorf("%s must be an integer: %w", key, err)
+			}
+		}
+	}
 	c := Config{
 		HTTPAddr:             env("VOXMAIL_HTTP_ADDR", "127.0.0.1:8080"),
 		OfflineMode:          offlineMode,

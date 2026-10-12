@@ -134,7 +134,11 @@ func (p *PromptPlayer) dynamicPromptPath(userID string, runtime *speech.Runtime,
 	if runtime == nil || strings.TrimSpace(userID) == "" || strings.TrimSpace(runtime.Piper.Model) == "" || len(text) > maxDynamicPromptText {
 		return "", false
 	}
-	checksum, err := speech.ModelSHA256(runtime.Piper.Model)
+	checksum := runtime.Fingerprint
+	var err error
+	if checksum == "" {
+		checksum, err = speech.ModelFingerprint(runtime.Piper.Model)
+	}
 	if err != nil || checksum == "" {
 		return "", false
 	}
@@ -349,7 +353,7 @@ func (p *PromptPlayer) SetStaticPrompts(assets map[string]string, voice string) 
 	p.SetStaticPromptsForSpeed(assets, voice, 3)
 }
 
-func (p *PromptPlayer) SetStaticPromptsForSpeed(assets map[string]string, voice string, speed int) {
+func (p *PromptPlayer) SetStaticPromptsForSpeed(assets map[string]string, voice string, speed int, fingerprint ...string) {
 	if p == nil {
 		return
 	}
@@ -361,7 +365,11 @@ func (p *PromptPlayer) SetStaticPromptsForSpeed(assets map[string]string, voice 
 	if p.StaticByKey == nil {
 		p.StaticByKey = make(map[string]map[string]string)
 	}
-	p.StaticByKey[voice+"|"+fmt.Sprint(speed)] = copyAssets
+	key := voice + "|" + fmt.Sprint(speed)
+	if len(fingerprint) > 0 {
+		key += "|" + fingerprint[0]
+	}
+	p.StaticByKey[key] = copyAssets
 	if p.Static == nil || (speed == 3 && (p.StaticVoice == "" || p.StaticVoice == voice)) {
 		p.Static = copyAssets
 		p.StaticVoice = voice
@@ -374,7 +382,7 @@ func staticRuntimeKey(runtime *speech.Runtime) string {
 		return ""
 	}
 	voice := strings.TrimSuffix(filepath.Base(runtime.Piper.Model), filepath.Ext(runtime.Piper.Model))
-	return voice + "|" + fmt.Sprint(runtime.Speed)
+	return voice + "|" + fmt.Sprint(runtime.Speed) + "|" + runtime.Fingerprint
 }
 
 func (p *PromptPlayer) PlayGreeting(ctx context.Context, fifo string) error {
@@ -396,6 +404,13 @@ func (p *PromptPlayer) PlayGreetingWithRuntime(ctx context.Context, runtime *spe
 			if _, err := os.Stat(greeting); err == nil {
 				return p.playWAV(ctx, fifo, greeting)
 			}
+		}
+		// A selected voice may not have an in-memory static index after restart.
+		// Generate its greeting before resorting to the deployment backup.
+		if err := p.PlayWithRuntime(ctx, runtime, fifo, speech.StaticWelcomeText); err == nil {
+			return nil
+		} else if ctx.Err() != nil || p.GreetingPath == "" {
+			return err
 		}
 	}
 	if p.GreetingPath == "" {

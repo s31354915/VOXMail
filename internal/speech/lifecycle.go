@@ -22,17 +22,19 @@ const (
 	BundledPromptVoice          = "en_US-hfc_male-medium"
 	StaticWelcomeText           = "Welcome to VOXMail. Please enter your PIN, then press pound."
 	StaticMainText              = "You are signed in. Press 1 for email, 2 for settings, or 3 for information and instructions."
-	staticPromptManifestVersion = 3
+	staticPromptManifestVersion = 5
 )
 
 type StaticPromptManifest struct {
-	Version      int               `json:"version"`
-	VoiceModel   string            `json:"voice_model"`
-	ModelSHA256  string            `json:"model_sha256"`
-	PromptSHA256 string            `json:"prompt_sha256"`
-	WelcomeText  string            `json:"welcome_text"`
-	MainText     string            `json:"main_text"`
-	Assets       map[string]string `json:"assets,omitempty"`
+	Version       int               `json:"version"`
+	VoiceModel    string            `json:"voice_model"`
+	ConfigSHA256  string            `json:"config_sha256"`
+	OptionsSHA256 string            `json:"options_sha256"`
+	ModelSHA256   string            `json:"model_sha256"`
+	PromptSHA256  string            `json:"prompt_sha256"`
+	WelcomeText   string            `json:"welcome_text"`
+	MainText      string            `json:"main_text"`
+	Assets        map[string]string `json:"assets,omitempty"`
 }
 
 // StaticPromptTexts returns every fixed prompt that can be spoken without
@@ -107,34 +109,85 @@ func ModelSHA256(path string) (string, error) {
 	return fmt.Sprintf("%x", hash.Sum(nil)), nil
 }
 
+// ModelFingerprint identifies both files used by Piper. Missing sidecars are
+// represented explicitly so adding one invalidates existing runtime identities.
+func ModelFingerprint(path string) (string, error) {
+	model, err := ModelSHA256(path)
+	if err != nil {
+		return "", err
+	}
+	config, err := ModelSHA256(path + ".json")
+	if err != nil && !os.IsNotExist(err) {
+		return "", err
+	}
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(model+"|"+config))), nil
+}
+
+// Copy a canonical prompt to an operator-selected location atomically.
+func syncPromptDestination(source, destination string) error {
+	if filepath.Clean(source) == filepath.Clean(destination) {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(destination), 0700); err != nil {
+		return err
+	}
+	data, err := os.ReadFile(source)
+	if err != nil {
+		return err
+	}
+	file, err := os.CreateTemp(filepath.Dir(destination), ".prompt-copy-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+	if _, err := file.Write(data); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(file.Name(), destination)
+}
+
 // PrepareStaticPrompts keeps all fixed recordings in sync with the Piper
 // model and IVR prompt text. A matching manifest returns without touching the
 // model. If the model, prompt text, or asset set changes, every fixed prompt
 // is generated in a private staging directory before activation.
 func PrepareStaticPrompts(ctx context.Context, p Piper, greetingPath, mainPath, manifestPath string) (StaticPromptManifest, error) {
+	activeDir := filepath.Dir(manifestPath)
+	canonicalGreeting := filepath.Join(activeDir, "welcome.wav")
+	canonicalMain := filepath.Join(activeDir, "main-menu.wav")
+	if filepath.Clean(greetingPath) == filepath.Clean(mainPath) || filepath.Clean(greetingPath) == filepath.Clean(manifestPath) || filepath.Clean(mainPath) == filepath.Clean(manifestPath) || filepath.Clean(greetingPath) == filepath.Clean(canonicalMain) || filepath.Clean(mainPath) == filepath.Clean(canonicalGreeting) {
+		return StaticPromptManifest{}, fmt.Errorf("prompt destinations must be distinct")
+	}
+	syncDestinations := func() error {
+		if err := syncPromptDestination(canonicalGreeting, greetingPath); err != nil {
+			return err
+		}
+		return syncPromptDestination(canonicalMain, mainPath)
+	}
 	texts := StaticPromptTexts()
 	digest := promptDigest(texts)
+	options, _ := json.Marshal(p.Extra)
+	optionsDigest := fmt.Sprintf("%x", sha256.Sum256(options))
+	configDigest, configErr := ModelSHA256(p.Model + ".json")
 	current, manifestErr := ReadStaticPromptManifest(manifestPath)
-	if manifestErr == nil && safeStaticAssets(current.Assets) && current.Version >= staticPromptManifestVersion && current.PromptSHA256 == digest && current.WelcomeText == StaticWelcomeText && current.MainText == StaticMainText {
+	if manifestErr == nil && safeStaticAssets(current.Assets) && current.Version == staticPromptManifestVersion && configErr == nil && current.ConfigSHA256 == configDigest && current.OptionsSHA256 == optionsDigest && current.PromptSHA256 == digest && current.WelcomeText == StaticWelcomeText && current.MainText == StaticMainText {
 		voice := filepath.Base(p.Model)
 		voice = strings.TrimSuffix(voice, filepath.Ext(voice))
 		if voice == current.VoiceModel {
 			complete := true
-			for _, relative := range current.Assets {
-				if !ValidWAV(filepath.Join(filepath.Dir(manifestPath), relative)) {
+			for key := range texts {
+				relative, exists := current.Assets[key]
+				if !exists || !ValidWAV(filepath.Join(filepath.Dir(manifestPath), relative)) {
 					complete = false
 					break
 				}
 			}
 			if complete && len(current.Assets) == len(texts) {
-				if current.ModelSHA256 == "" {
-					return current, nil
-				}
-				if _, err := os.Stat(p.Model); os.IsNotExist(err) {
-					return current, nil
-				}
 				if modelDigest, err := ModelSHA256(p.Model); err == nil && modelDigest == current.ModelSHA256 {
-					return current, nil
+					return current, syncDestinations()
 				}
 			}
 		}
@@ -142,12 +195,15 @@ func PrepareStaticPrompts(ctx context.Context, p Piper, greetingPath, mainPath, 
 	if _, err := os.Stat(p.Model); err != nil {
 		return current, fmt.Errorf("static prompt model unavailable: %w", err)
 	}
+	if configErr != nil {
+		return current, fmt.Errorf("static prompt model configuration unavailable: %w", configErr)
+	}
 	modelDigest, err := ModelSHA256(p.Model)
 	if err != nil {
 		return current, err
 	}
 	voice := strings.TrimSuffix(filepath.Base(p.Model), filepath.Ext(p.Model))
-	manifest := StaticPromptManifest{Version: staticPromptManifestVersion, VoiceModel: voice, ModelSHA256: modelDigest, PromptSHA256: digest, WelcomeText: StaticWelcomeText, MainText: StaticMainText, Assets: make(map[string]string, len(texts))}
+	manifest := StaticPromptManifest{Version: staticPromptManifestVersion, ConfigSHA256: configDigest, OptionsSHA256: optionsDigest, VoiceModel: voice, ModelSHA256: modelDigest, PromptSHA256: digest, WelcomeText: StaticWelcomeText, MainText: StaticMainText, Assets: make(map[string]string, len(texts))}
 	if err := os.MkdirAll(filepath.Dir(greetingPath), 0700); err != nil {
 		return current, err
 	}
@@ -170,9 +226,9 @@ func PrepareStaticPrompts(ctx context.Context, p Piper, greetingPath, mainPath, 
 	for _, key := range keys {
 		filename := "static-" + fmt.Sprintf("%x", sha256.Sum256([]byte(key+"\x00"+texts[key])))[:16] + ".wav"
 		if key == "welcome" {
-			filename = filepath.Base(greetingPath)
+			filename = "welcome.wav"
 		} else if key == "main" {
-			filename = filepath.Base(mainPath)
+			filename = "main-menu.wav"
 		}
 		path := filepath.Join(stage, filename)
 		if err := p.Synthesize(ctx, texts[key], path); err != nil {
@@ -188,7 +244,6 @@ func PrepareStaticPrompts(ctx context.Context, p Piper, greetingPath, mainPath, 
 	if err := os.WriteFile(manifestStage, append(data, '\n'), 0600); err != nil {
 		return current, err
 	}
-	activeDir := filepath.Dir(manifestPath)
 	backup, err := os.MkdirTemp(activeDir, ".static-prompts-backup-")
 	if err != nil {
 		return current, err
@@ -248,7 +303,7 @@ func PrepareStaticPrompts(ctx context.Context, p Piper, greetingPath, mainPath, 
 	}
 	committed = true
 	_ = os.RemoveAll(backup)
-	return manifest, nil
+	return manifest, syncDestinations()
 }
 
 type capabilityReady struct {
@@ -274,10 +329,11 @@ func (r *capabilityReady) finish(err error) {
 // active calls. Piper/TTS and Whisper/STT warm independently: a broken STT
 // installation must not prevent fixed or dynamic TTS menus from working.
 type Runtime struct {
-	Piper   Piper
-	Whisper Whisper
-	Dir     string
-	Speed   int
+	Piper       Piper
+	Whisper     Whisper
+	Dir         string
+	Speed       int
+	Fingerprint string
 
 	mu       sync.Mutex
 	refs     int
@@ -298,7 +354,8 @@ type Lease struct {
 }
 
 func NewRuntime(piper Piper, whisper Whisper, dir string) *Runtime {
-	return &Runtime{Piper: piper, Whisper: whisper, Dir: dir, Speed: 3}
+	fingerprint, _ := ModelFingerprint(piper.Model)
+	return &Runtime{Piper: piper, Whisper: whisper, Dir: dir, Speed: 3, Fingerprint: fingerprint}
 }
 
 type RuntimePool struct {
@@ -333,7 +390,7 @@ func (p *RuntimePool) Activate(voice string, speed int) (*Runtime, *Lease) {
 			model = resolved
 		}
 	}
-	modelDigest, _ := ModelSHA256(model)
+	modelDigest, _ := ModelFingerprint(model)
 	if modelDigest == "" {
 		modelDigest = "unavailable"
 	}

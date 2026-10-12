@@ -5,6 +5,9 @@ umask 077
 mkdir -p /data/config /data/sqlite /data/run /data/mail /data/recordings /data/voices /data/whisper /data/logs /data/prompts /data/run/voxmail
 chmod 700 /data /data/config /data/sqlite /data/run /data/mail /data/recordings /data/voices /data/whisper /data/logs /data/prompts /data/run/voxmail
 
+# Seed backup recordings only. The application generates the active prompt set
+# with the configured Piper model before serving calls; these remain available
+# if model provisioning or synthesis fails.
 if [ ! -s /data/prompts/welcome.wav ]; then
   cp /usr/local/share/voxmail/welcome.wav /data/prompts/welcome.wav
   chmod 600 /data/prompts/welcome.wav
