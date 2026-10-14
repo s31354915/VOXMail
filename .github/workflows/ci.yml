@@ -26,7 +26,7 @@ jobs:
           persist-credentials: false
       - name: Verify exact checked-out source
         run: test "$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)" = "$VOXMAIL_CI_SOURCE_SHA"
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.26.x"
           cache: true
@@ -56,7 +56,7 @@ jobs:
           persist-credentials: false
       - name: Verify exact checked-out source
         run: test "$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)" = "$VOXMAIL_CI_SOURCE_SHA"
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.26.x"
       - name: Run E2E suite (builds image, container, restart persistence, cleanup)
@@ -90,7 +90,7 @@ jobs:
           persist-credentials: false
       - name: Verify exact checked-out source
         run: test "$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)" = "$VOXMAIL_CI_SOURCE_SHA"
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.26.x'
           cache: true
@@ -131,7 +131,7 @@ jobs:
           persist-credentials: false
       - name: Verify exact checked-out source
         run: test "$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)" = "$VOXMAIL_CI_SOURCE_SHA"
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.26.x"
           cache: true
