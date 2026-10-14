@@ -93,6 +93,14 @@ including unmapped folders downloaded by sync. Equivalent local paths count as
 the same destination. Choose a distinct alias and use a logical group to combine
 duplicates; sharing a physical directory would mix their UID state.
 
+If discovery finds a folder whose automatic destination conflicts with a saved
+mapping, **Folder choices** opens with a conflict notice. The phone preview stays
+unavailable until the conflict is resolved. Each mapping dropdown offers a fresh
+`Separate/<remote folder>` destination. For example, if Gmail Sent Mail already
+uses `Sent`, map the newly discovered `Sent` folder to `Separate/Sent`, then save.
+Existing destinations remain reserved to protect previously synchronized state;
+logical grouping can combine their presentation after physical mappings are distinct.
+
 ### Draft synchronization policy
 
 Drafts are stored locally as the canonical editable copy. The first local save

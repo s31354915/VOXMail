@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -131,5 +132,50 @@ func TestFolderMappingValidationRetainsCaseDistinctRemoteNames(t *testing.T) {
 		if err := validateFolderMap(mapping); err == nil {
 			t.Fatalf("canonical local alias collision accepted: %v", mapping)
 		}
+	}
+}
+
+func TestFolderChoicesCanRepairDiscoveredDestinationConflicts(t *testing.T) {
+	srv, h := voiceWebFixture(t)
+	_, err := srv.Store.DB.Exec(`INSERT INTO accounts(id,user_id,canonical_name,email,sender_name,imap_host,imap_user,imap_password,smtp_host,smtp_user,smtp_password,folder_map,created_at) VALUES('a','user','Mail','a@e','A','h','u','p','h','u','p','{"[Gmail]/Sent Mail":"Sent","[Gmail]/Trash":"Trash"}','now');
+ INSERT INTO account_folder_discovery(account_id,remote_path) VALUES('a','Sent'),('a','Trash'),('a','[Gmail]/Sent Mail'),('a','[Gmail]/Trash');`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/api/v1/accounts/a/folder-policy"
+	response := voiceRequest(h, "user", http.MethodGet, path, nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("conflicting editor failed: %d %s", response.Code, response.Body.String())
+	}
+	var snapshot struct {
+		Warnings []string          `json:"warnings"`
+		Folders  map[string]string `json:"folders"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Warnings) == 0 || len(snapshot.Folders) != 4 {
+		t.Fatalf("missing repair inventory: %s", response.Body.String())
+	}
+	payload := map[string]any{"config_version": 1, "policy": folderpolicy.Policy{}, "folder_map": map[string]string{"[Gmail]/Sent Mail": "Sent", "[Gmail]/Trash": "Trash"}, "folder_roles": map[string]string{}}
+	if response := voiceRequest(h, "user", http.MethodPut, path, payload); response.Code != http.StatusBadRequest {
+		t.Fatalf("accepted conflict: %d %s", response.Code, response.Body.String())
+	}
+	payload["folder_map"] = map[string]string{"[Gmail]/Sent Mail": "Sent", "[Gmail]/Trash": "Trash", "Sent": "Separate/Sent", "Trash": "Separate/Trash"}
+	if response := voiceRequest(h, "user", http.MethodPut, path, payload); response.Code != http.StatusOK {
+		t.Fatalf("repair failed: %d %s", response.Code, response.Body.String())
+	}
+	if err := srv.Store.BindSyncFolders(context.Background(), "user", "a", 2); err != nil {
+		t.Fatalf("repaired sync still blocked: %v", err)
+	}
+	response = voiceRequest(h, "user", http.MethodGet, path, nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("repaired editor: %d %s", response.Code, response.Body.String())
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Warnings) != 0 {
+		t.Fatalf("repair warnings remain: %v", snapshot.Warnings)
 	}
 }

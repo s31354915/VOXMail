@@ -3,6 +3,7 @@ import AxeBuilder from '@axe-core/playwright';
 
 async function fixture(page, initial = {}) {
   let version = 7;
+  let warnings = initial.warnings || [];
   let policy = initial.policy || { groups: [], excluded: [] };
   let mapping = { INBOX: 'Inbox', '[Gmail]/Inbox': 'GmailInbox', Drafts: 'Drafts', Sent: 'Sent', Trash: 'Trash' };
   mapping = initial.mapping || mapping;
@@ -13,11 +14,11 @@ async function fixture(page, initial = {}) {
   await page.route('**/api/v1/**', async route => {
     const path = new URL(route.request().url()).pathname, method = route.request().method();
     if (path === '/api/v1/accounts/mail/folder-policy') {
-      if (method === 'GET') return route.fulfill({ json: { config_version: version, policy, folders, folder_map: mapping, folder_roles: roles, mailboxes: [], folder_bindings: initial.bindings || {} } });
+      if (method === 'GET') return route.fulfill({ json: { config_version: version, warnings, policy, folders, folder_map: mapping, folder_roles: roles, mailboxes: [], folder_bindings: initial.bindings || {} } });
       const body = route.request().postDataJSON();
       submissions.push(body);
       if (body.config_version !== version) return route.fulfill({ status: 409, json: { error: 'account settings changed; reload before saving folder choices' } });
-      policy = body.policy; mapping = body.folder_map; roles = body.folder_roles; version++;
+      policy = body.policy; mapping = body.folder_map; roles = body.folder_roles; version++; warnings = [];
       return route.fulfill({ json: { status: 'saved', config_version: version } });
     }
     if (path === '/api/v1/accounts') return route.fulfill({ json: [row()] });
@@ -217,4 +218,24 @@ test('mapping and ignoring folders use dropdowns and survive reopening', async (
   await editor.getByRole('button', { name: 'Save folder choices' }).click();
   await expect(editor.locator('#folder-editor-status')).toHaveText('Folder choices saved.');
   expect(submissions[1].policy.excluded).toEqual([]);
+});
+
+
+test('conflicting folder choices open and can be repaired with fresh dropdown destinations', async ({ page }) => {
+  const { submissions } = await fixture(page, {
+    mapping: { '[Gmail]/Sent Mail': 'Sent', '[Gmail]/Trash': 'Trash' },
+    folders: { '[Gmail]/Sent Mail': 'Sent', '[Gmail]/Trash': 'Trash', Sent: 'Sent', Trash: 'Trash' },
+    roles: {},
+    warnings: ['Some folders share a local destination. Choose a distinct destination for each folder before saving.'],
+  });
+  const editor = page.locator('#folder-editor');
+  await expect(editor.getByRole('heading', { name: 'Folder mapping conflicts' })).toBeVisible();
+  await expect(editor.locator('#folder-preview')).toContainText('Resolve the folder mapping conflicts');
+  await editor.locator('[data-folder-mapping="Sent"]').selectOption('Separate/Sent');
+  await editor.locator('[data-folder-mapping="Trash"]').selectOption('Separate/Trash');
+  await editor.getByRole('button', { name: 'Save folder choices' }).click();
+  await expect(editor.locator('#folder-editor-status')).toHaveText('Folder choices saved.');
+  expect(submissions[0].folder_map).toEqual({ '[Gmail]/Sent Mail': 'Sent', '[Gmail]/Trash': 'Trash', Sent: 'Separate/Sent', Trash: 'Separate/Trash' });
+  await expect(editor.getByRole('heading', { name: 'Folder mapping conflicts' })).toHaveCount(0);
+  await expect(editor.locator('#folder-preview')).toContainText('Separate');
 });

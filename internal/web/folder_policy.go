@@ -28,8 +28,12 @@ func (s *Server) accountFolderPolicy(w http.ResponseWriter, r *http.Request) {
 		serverError(w, err)
 		return
 	}
+	warnings := []string{}
 	mailboxes, err := s.Store.ListLogicalMailboxes(r.Context(), u.ID, id)
-	if err != nil {
+	if errors.Is(err, store.ErrInvalidAccountConfig) {
+		warnings = append(warnings, "Some folders share a local destination. Choose a distinct destination for each folder before saving. The phone preview is unavailable until these conflicts are resolved.")
+		mailboxes = nil
+	} else if err != nil {
 		serverError(w, err)
 		return
 	}
@@ -62,12 +66,17 @@ func (s *Server) accountFolderPolicy(w http.ResponseWriter, r *http.Request) {
 		roleMap[role.Role] = role.RemotePath
 	}
 	bindings, err := s.Store.FolderBindingsForPreview(r.Context(), u.ID, id)
-	if err != nil {
+	if errors.Is(err, store.ErrInvalidAccountConfig) {
+		if len(warnings) == 0 {
+			warnings = append(warnings, "Retained folder identities conflict. Choose distinct local destinations; the phone preview is unavailable until the conflict is resolved.")
+		}
+		bindings = nil
+	} else if err != nil {
 		serverError(w, err)
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, http.StatusOK, map[string]any{"config_version": version, "policy": policy, "folders": inventory, "mailboxes": mailboxes, "folder_map": mapping, "folder_roles": roleMap, "folder_bindings": bindings})
+	writeJSON(w, http.StatusOK, map[string]any{"config_version": version, "policy": policy, "folders": inventory, "mailboxes": mailboxes, "folder_map": mapping, "folder_roles": roleMap, "folder_bindings": bindings, "warnings": warnings})
 }
 
 func (s *Server) saveAccountFolderPolicy(w http.ResponseWriter, r *http.Request) {

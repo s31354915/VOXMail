@@ -984,6 +984,7 @@
       name: account.canonical_name,
       epoch,
       version: data.config_version,
+      warnings: data.warnings || [],
       folders: data.folders || {},
       mailboxes: data.mailboxes || [],
       bindings: data.folder_bindings || {},
@@ -1062,6 +1063,11 @@
       ...Object.entries(editor.mapping),
       ...Object.entries(editor.bindings).map(([local, owner]) => [owner, local])
     ];
+    const used = new Set(occupied.map(([, local]) => localKey(local)));
+    let suggested = `Separate/${remote}`;
+    for (let suffix = 2; used.has(localKey(suggested)); suffix++)
+      suggested = `Separate/${remote}-${suffix}`;
+    choices.add(suggested);
     return [...choices].filter(Boolean).sort((a, b) => a.localeCompare(b)).map((name) => {
       const taken = occupied.some(
         ([owner, local]) => remoteKey(owner) !== remoteKey(remote) && localKey(local) === localKey(name)
@@ -1070,6 +1076,8 @@
     }).join("");
   }
   function preview() {
+    if (editor.warnings.length)
+      return "<p>Resolve the folder mapping conflicts and save to refresh the phone preview.</p>";
     const model = folderPreviewModel(editor);
     const icons = [
       "added-083-envelope.svg",
@@ -1096,6 +1104,7 @@
     const group = selectedGroup();
     $("#folder-editor").innerHTML = `
     <header class="editor-heading"><div><h2 id="folder-editor-title" tabindex="-1">Folder mapping for ${esc(e.name)}</h2><p>Choose folders, assign roles and decide which duplicates belong together. Choices take effect when saved.</p></div></header>
+    ${e.warnings.length ? `<div class="notice" role="status"><div><h3>Folder mapping conflicts</h3>${e.warnings.map((warning) => `<p>${esc(warning)}</p>`).join("")}<p>Choose an unused destination from each folder\u2019s dropdown, such as Separate/Sent. Existing destinations remain reserved to protect synced mail.</p></div></div>` : ""}
     <div class="editor-panels">
       <section class="panel"><div class="intro"><h3>Discovered folders</h3><p>Select folders for an action. Every ungrouped folder stays separate unless you choose otherwise.</p></div>
         <div class="folders">${names().map((remote, index) => {
@@ -1315,6 +1324,27 @@
       e.version = result.config_version;
       Object.assign(e.savedMapping, e.mapping);
       message("Folder choices saved.", false, true);
+      if (e.warnings.length) {
+        try {
+          const snapshot = await api(
+            `/api/v1/accounts/${encodeURIComponent(e.id)}/folder-policy`
+          );
+          if (e !== editor || e.epoch !== state.sessionEpoch) return;
+          e.warnings = snapshot.warnings || [];
+          e.folders = snapshot.folders || {};
+          e.bindings = snapshot.folder_bindings || {};
+          e.mailboxes = snapshot.mailboxes || [];
+          renderEditor();
+          message("Folder choices saved.", false, true);
+        } catch (error) {
+          if (e !== editor || e.epoch !== state.sessionEpoch) return;
+          message(
+            "Folder choices saved, but the preview could not refresh. Reopen Folder choices.",
+            true,
+            true
+          );
+        }
+      }
       try {
         await e.afterSave();
       } catch (error) {
