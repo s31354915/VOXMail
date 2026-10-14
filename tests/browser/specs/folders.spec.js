@@ -197,3 +197,24 @@ test('folder selection and primary choices work with the keyboard', async ({ pag
   await expect(editor.locator('#folder-editor-status')).toHaveText('Folder choices saved.');
   expect(submissions[0].policy.groups[0]).toMatchObject({ name: 'Keyboard inbox', primary: 'INBOX' });
 });
+
+test('mapping and ignoring folders use dropdowns and survive reopening', async ({ page }) => {
+  const { submissions } = await fixture(page);
+  const editor = page.locator('#folder-editor');
+  await expect(editor.locator('[data-folder-mapping="Projects"] option[value="Inbox"]')).toHaveJSProperty('disabled', true);
+  await editor.locator('[data-folder-mapping="Projects"]').selectOption('Archive');
+  await editor.locator('[data-folder-visibility="[Gmail]/All Mail"]').selectOption('ignore');
+  await expect(editor.locator('#folder-preview')).not.toContainText('[Gmail]/All Mail');
+  await editor.getByRole('button', { name: 'Save folder choices' }).click();
+  await expect(editor.locator('#folder-editor-status')).toHaveText('Folder choices saved.');
+  expect(submissions[0].folder_map.Projects).toBe('Archive');
+  expect(submissions[0].policy.excluded).toEqual(['[Gmail]/All Mail']);
+  await editor.getByRole('button', { name: 'Cancel', exact: true }).click();
+  await page.locator('[data-folders-account="mail"]').click();
+  await expect(editor.locator('[data-folder-mapping="Projects"]')).toHaveValue('Archive');
+  await expect(editor.locator('[data-folder-visibility="[Gmail]/All Mail"]')).toHaveValue('ignore');
+  await editor.locator('[data-folder-visibility="[Gmail]/All Mail"]').selectOption('show');
+  await editor.getByRole('button', { name: 'Save folder choices' }).click();
+  await expect(editor.locator('#folder-editor-status')).toHaveText('Folder choices saved.');
+  expect(submissions[1].policy.excluded).toEqual([]);
+});

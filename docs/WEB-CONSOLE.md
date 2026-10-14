@@ -57,15 +57,20 @@ editor to map folders before a long initial sync finishes. Discovered names are
 retained separately from synchronized directories; testing never rewrites existing
 Maildir paths or UID metadata. Use the folder
 checkboxes to select an action; selecting a checkbox alone changes no mapping.
-Expand **Local** beside a folder to edit its physical alias, and use the role
-selector to assign a role. Existing mappings and role assignments are retained.
+Use **Map to local folder** to select a local alias from the dropdown, and use
+the role selector to assign a role. Destinations used by other folders are disabled;
+combine those folders as a logical group instead. **Custom local name** also allows
+a new alias when needed. Existing mappings and role assignments are retained.
 
 To combine duplicates, select their folders and choose **Combine selected**,
 enter a display name, and explicitly choose the primary member. The primary is
 the destination for writes to that group; browsing includes each member's
 distinct messages. Provider names never cause automatic grouping or exclusion.
 **Keep separate**, **Exclude from browsing**, and **Show selected** control the
-selected folders. Exclusion retains the stored and remote emails. Existing
+selected folders. Each folder also has a **Phone menu** dropdown: choose
+**Hide from phone menu** to ignore it or **Show folder** to restore it. Excluded
+folders are not listed in the phone folder menu; stored and remote emails are
+retained and synchronization continues. Existing
 groups can be edited through **Edit group** or dissolved with **Keep all members
 separate**.
 

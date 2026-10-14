@@ -988,6 +988,7 @@
       mailboxes: data.mailboxes || [],
       bindings: data.folder_bindings || {},
       mapping: Object.assign(/* @__PURE__ */ Object.create(null), data.folder_map),
+      savedMapping: { ...data.folder_map },
       roles: { ...data.folder_roles },
       policy: structuredClone(data.policy || {}),
       selected: /* @__PURE__ */ new Set(),
@@ -1046,6 +1047,28 @@
   function labelFor(remote) {
     return groupFor(remote)?.name || remote;
   }
+  function mappingOptions(remote) {
+    const current = editor.mapping[mappingName(remote)] ?? editor.folders[remote];
+    const choices = /* @__PURE__ */ new Set([
+      current,
+      ...Object.values(roleNames),
+      ...Object.values(editor.folders),
+      ...Object.values(editor.mapping)
+    ]);
+    const localKey = (name) => name.replaceAll("\\", "/").split("/").filter((part) => part && part !== ".").join("/").toLowerCase();
+    const occupied = [
+      ...Object.entries(editor.folders),
+      ...Object.entries(editor.savedMapping),
+      ...Object.entries(editor.mapping),
+      ...Object.entries(editor.bindings).map(([local, owner]) => [owner, local])
+    ];
+    return [...choices].filter(Boolean).sort((a, b) => a.localeCompare(b)).map((name) => {
+      const taken = occupied.some(
+        ([owner, local]) => remoteKey(owner) !== remoteKey(remote) && localKey(local) === localKey(name)
+      );
+      return `<option value="${esc(name)}"${name === current ? " selected" : ""}${taken && name !== current ? " disabled" : ""}>${esc(name)}${taken && name !== current ? " (in use \u2014 combine folders instead)" : ""}</option>`;
+    }).join("");
+  }
   function preview() {
     const model = folderPreviewModel(editor);
     const icons = [
@@ -1085,10 +1108,12 @@
             <div class="select-wrap"><select data-folder-role="${esc(remote)}" aria-label="Role for ${esc(remote)}">${option("", "No role", !role)}${Object.entries(
         roleNames
       ).map(([key, name]) => option(key, name, role === key)).join("")}</select></div>
-            <details class="local-alias"><summary>Local: ${esc(e.mapping[mappingName(remote)] ?? e.folders[remote])}</summary><label>Local folder<input data-folder-alias="${esc(remote)}" aria-label="Local folder for ${esc(remote)}" value="${esc(e.mapping[mappingName(remote)] ?? e.folders[remote])}"></label></details>
+            <label class="local-alias">Map to local folder<select data-folder-mapping="${esc(remote)}" aria-label="Map ${esc(remote)} to local folder">${mappingOptions(remote)}</select></label>
+            <label class="local-alias">Phone menu<select data-folder-visibility="${esc(remote)}" aria-label="Browsing for ${esc(remote)}">${option("show", "Show folder", !excluded(remote))}${option("ignore", "Hide from phone menu", excluded(remote))}</select></label>
+            <details class="local-alias"><summary>Custom local name: ${esc(e.mapping[mappingName(remote)] ?? e.folders[remote])}</summary><label>Local folder<input data-folder-alias="${esc(remote)}" aria-label="Local folder for ${esc(remote)}" value="${esc(e.mapping[mappingName(remote)] ?? e.folders[remote])}"></label></details>
           </div>`;
     }).join("") || "<p>No folder inventory yet. Use Test saved settings on this account to discover its provider folders, then reopen Folder choices.</p>"}</div>
-        <div class="actions"><h3>Folder actions</h3><p id="folder-selection-count">${e.selected.size} selected</p><div class="action-buttons"><button type="button" data-folder-action="combine">Combine selected</button><button type="button" data-folder-action="separate">Keep separate</button><button type="button" data-folder-action="exclude">Exclude from browsing</button><button type="button" data-folder-action="include">Show selected</button></div><p class="description">Excluding a folder hides it from browsing. Its emails are retained.</p></div>
+        <div class="actions"><h3>Folder actions</h3><p id="folder-selection-count">${e.selected.size} selected</p><div class="action-buttons"><button type="button" data-folder-action="combine">Combine selected</button><button type="button" data-folder-action="separate">Keep separate</button><button type="button" data-folder-action="exclude">Exclude from browsing</button><button type="button" data-folder-action="include">Show selected</button></div><p class="description">Excluded folders are hidden from the phone folder menu. Their emails are retained.</p></div>
       </section>
       <section class="panel group"><div class="intro"><h3>Mailbox groups</h3><p>Choose a display name and primary folder. Messages from each selected member remain distinct.</p></div>
         <label class="group-choice">Edit group<select id="folder-group-choice">${option("", "Choose a group", !group)}${e.policy.groups.map((item) => option(item.id, item.name || "Unnamed group", item.id === e.active)).join("")}</select></label>
@@ -1099,7 +1124,7 @@
       ([role, name]) => `<div class="role-row"><strong>${esc(name)}</strong><span>${esc(e.roles[role] ? labelFor(e.roles[role]) : "Unassigned")}</span></div>`
     ).join("")}</div></div>
       </section>
-      <section class="panel result"><div class="intro"><h3>Resulting mailboxes</h3><p>Preview after the next successful sync. Inbox, Drafts, Sent and Trash keep keys 1\u20134. Other folders use 5\u20138; press 9 for more. Expand nested folders to see their keys.</p></div><div id="folder-preview" class="mailboxes">${preview()}</div><div class="notice"><div><h4>Excluded folders: ${e.policy.excluded.length}</h4><p>${esc(e.policy.excluded.join(", ") || "None. Every folder is retained in browsing.")}</p></div></div></section>
+      <section class="panel result"><div class="intro"><h3>Resulting mailboxes</h3><p>Preview after the next successful sync. Inbox, Drafts, Sent and Trash keep keys 1\u20134. Other folders use 5\u20138; press 9 for more. Expand nested folders to see their keys.</p></div><div id="folder-preview" class="mailboxes">${preview()}</div><div class="notice"><div><h4>Excluded folders: ${e.policy.excluded.length}</h4><p>${esc(e.policy.excluded.join(", ") || "None. Every folder is available in the phone menu.")}</p></div></div></section>
     </div>
     <footer class="editor-footer"><p id="folder-editor-status" class="editor-status" role="status" aria-live="polite" aria-atomic="true" tabindex="-1">Unsaved choices. Review the preview before saving.</p><div class="footer-buttons"><button class="button" type="button" data-folder-action="cancel">Cancel</button><button class="button save" type="button" data-folder-action="save">Save folder choices</button></div></footer>`;
     $("#folder-editor").onchange = onChange;
@@ -1130,8 +1155,33 @@
       $("#folder-selection-count").textContent = `${editor.selected.size} selected`;
       return;
     }
+    if (input.hasAttribute("data-folder-visibility")) {
+      const remote = input.dataset.folderVisibility;
+      editor.policy.excluded = editor.policy.excluded.filter(
+        (member) => remoteKey(member) !== remoteKey(remote)
+      );
+      if (input.value === "ignore") {
+        detach(/* @__PURE__ */ new Set([remote]));
+        editor.policy.excluded.push(remote);
+      }
+      renderEditor();
+      document.querySelector(`[data-folder-visibility="${CSS.escape(remote)}"]`)?.focus();
+      return;
+    }
+    if (input.hasAttribute("data-folder-mapping")) {
+      const remote = input.dataset.folderMapping;
+      editor.mapping[mappingName(remote)] = input.value;
+      renderEditor();
+      document.querySelector(`[data-folder-mapping="${CSS.escape(remote)}"]`)?.focus();
+      message("Local mapping changed. Save when ready.");
+      return;
+    }
     if (input.hasAttribute("data-folder-alias")) {
       editor.mapping[mappingName(input.dataset.folderAlias)] = input.value;
+      const select = document.querySelector(
+        `[data-folder-mapping="${CSS.escape(input.dataset.folderAlias)}"]`
+      );
+      select.innerHTML = mappingOptions(input.dataset.folderAlias);
       $("#folder-preview").innerHTML = preview();
       message("Local mapping changed. Save when ready.");
       return;
@@ -1263,6 +1313,7 @@
       );
       if (e !== editor || e.epoch !== state.sessionEpoch) return;
       e.version = result.config_version;
+      Object.assign(e.savedMapping, e.mapping);
       message("Folder choices saved.", false, true);
       try {
         await e.afterSave();
