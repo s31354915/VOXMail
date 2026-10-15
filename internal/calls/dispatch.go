@@ -134,8 +134,12 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 	if key == "*" {
 		s.mu.Lock()
 		state := string(stateLocked(sess))
-		if state == "attachment_playback" && sess.AttachmentCancel != nil {
-			sess.AttachmentCancel()
+		if state == "attachment_playback" {
+			if sess.AttachmentCancel != nil {
+				sess.AttachmentCancel()
+				sess.AttachmentCancel = nil
+			}
+			transitionLocked(sess, "read")
 		}
 		if state == "audio_recording" && sess.RecordStop != nil {
 			close(sess.RecordStop)

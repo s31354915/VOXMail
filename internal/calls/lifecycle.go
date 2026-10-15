@@ -210,6 +210,11 @@ func (s *Service) closeCall(message bridge.Message) {
 func (s *Service) onEstablished(message bridge.Message) {
 	s.mu.Lock()
 	sess := s.sessions[message.CallID]
+	if sess == nil || sess.Closed || sess.Established {
+		s.mu.Unlock()
+		return
+	}
+	sess.Established = true
 	sessState := ""
 	if sess != nil {
 		sessState = string(stateLocked(sess))

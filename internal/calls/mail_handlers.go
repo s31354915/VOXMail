@@ -183,21 +183,35 @@ func (s *Service) playAttachment(sess *session, index int) {
 		s.prompt(sess, "I could not prepare that attachment.")
 		return
 	}
-	ctx, cancel := context.WithTimeout(s.baseContext(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(s.eventContext(sess), 10*time.Minute)
 	s.mu.Lock()
+	if sess.Closed || stateLocked(sess) != "attachment_playback" {
+		s.mu.Unlock()
+		cancel()
+		return
+	}
+	sess.attachmentSequence++
+	sequence := sess.attachmentSequence
 	sess.AttachmentCancel = cancel
+	s.beginMediaLocked(sess)
 	s.mu.Unlock()
+	sess.promptMu.Lock()
 	err = s.Media.PlayMedia(ctx, sess.TxPath, path)
+	sess.promptMu.Unlock()
+	playbackContextErr := ctx.Err()
 	cancel()
 	s.mu.Lock()
-	wasPlaying := string(stateLocked(sess)) == "attachment_playback"
-	sess.AttachmentCancel = nil
+	wasPlaying := !sess.Closed && sess.attachmentSequence == sequence && string(stateLocked(sess)) == "attachment_playback"
+	if sess.attachmentSequence == sequence {
+		sess.AttachmentCancel = nil
+	}
+	s.endMediaLocked(sess)
 	if wasPlaying {
 		transitionLocked(sess, "read")
 	}
 	s.mu.Unlock()
 	if wasPlaying {
-		if err != nil && ctx.Err() == nil {
+		if err != nil && playbackContextErr != context.Canceled {
 			s.prompt(sess, "Attachment playback failed.")
 		} else {
 			s.prompt(sess, "Attachment playback finished. Press 8 to listen again, or pound to return.")

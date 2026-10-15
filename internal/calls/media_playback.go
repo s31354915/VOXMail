@@ -286,14 +286,9 @@ func openPCMWriter(ctx context.Context, path string) (*os.File, error) {
 	for {
 		file, openErr := os.OpenFile(path, os.O_WRONLY|syscall.O_NONBLOCK, 0600)
 		if openErr == nil {
-			if isFIFO {
-				// Once a reader is present, restore blocking writes so a slow
-				// baresip callback does not turn ordinary audio into EAGAIN.
-				if nonblockErr := syscall.SetNonblock(int(file.Fd()), false); nonblockErr != nil {
-					_ = file.Close()
-					return nil, nonblockErr
-				}
-			}
+			// Keep the descriptor pollable. Switching it to blocking mode
+			// makes a full FIFO write immune to context cancellation.
+
 			return file, nil
 		}
 		var errno syscall.Errno
@@ -448,13 +443,42 @@ func (p *PromptPlayer) playInput(ctx context.Context, fifo, input string) error 
 		return err
 	}
 	defer pipe.Close()
+	// Closing a pollable FIFO wakes both pending writes and process output
+	// copying. Killing ffmpeg alone cannot wake a blocked Go output writer.
+	stopClose := context.AfterFunc(mediaCtx, func() { _ = pipe.Close() })
+	defer stopClose()
+	info, err := pipe.Stat()
+	if err != nil {
+		return err
+	}
+	var output io.Writer = pipe
+	if info.Mode()&os.ModeNamedPipe != 0 {
+		output = &pacedPCMWriter{ctx: mediaCtx, w: pipe}
+	}
+	writer := &pcmLimitWriter{w: output, max: 8_000 * 2 * 600}
 	cmd := process.New(mediaCtx, "ffmpeg", binary, 0, "-nostdin", "-i", input, "-vn", "-ar", "8000", "-ac", "1", "-f", "s16le", "pipe:1")
-	cmd.Stdout = &pcmLimitWriter{w: pipe, max: 8_000 * 2 * 600}
+	cmd.Stdout = writer
 	if err := cmd.Run(); err != nil {
 		if mediaCtx.Err() != nil {
 			return mediaCtx.Err()
 		}
 		return fmt.Errorf("prompt conversion: %w", err)
+	}
+	if writer.n == 0 {
+		return fmt.Errorf("decoded audio is empty")
+	}
+	if info.Mode()&os.ModeNamedPipe != 0 {
+		// A read-only observer lets the writer close (and flush the native
+		// reader's final partial frame) while we inspect unread FIFO bytes.
+		observer, err := os.OpenFile(fifo, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+		if err != nil {
+			return err
+		}
+		defer observer.Close()
+		if err := pipe.Close(); err != nil {
+			return err
+		}
+		return drainPCM(mediaCtx, observer)
 	}
 	return nil
 }

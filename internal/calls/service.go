@@ -15,6 +15,7 @@ import (
 	"github.com/voxmail/voxmail/internal/keypad"
 	"github.com/voxmail/voxmail/internal/mailer"
 	"github.com/voxmail/voxmail/internal/mailparse"
+	"github.com/voxmail/voxmail/internal/process"
 	"github.com/voxmail/voxmail/internal/secret"
 	"github.com/voxmail/voxmail/internal/speech"
 	"github.com/voxmail/voxmail/internal/store"
@@ -414,6 +415,9 @@ type session struct {
 	Flow                 *ivr.Session
 	navigationGeneration uint64
 	Closed               bool
+	Established          bool
+	mediaPlays           int
+	attachmentSequence   uint64
 	eventCtx             context.Context
 	eventCancel          context.CancelFunc
 	inactivityCancel     context.CancelFunc
@@ -455,7 +459,7 @@ const (
 const bridgeWriteTimeout = 5 * time.Second
 
 func (s *Service) armInactivityTimeoutLocked(sess *session) {
-	if sess == nil || sess.Closed {
+	if sess == nil || sess.Closed || sess.mediaPlays > 0 {
 		return
 	}
 	if sess.inactivityCancel != nil {
@@ -507,12 +511,14 @@ func (s *Service) greet(sess *session) {
 	if sess == nil || s.Media == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(s.eventContext(sess), 45*time.Second)
-	defer cancel()
 	if s.Media.GreetingPath != "" {
-		if err := s.Media.PlayGreetingWithRuntime(ctx, sess.Runtime, sess.TxPath); err == nil {
+		err := s.playPrompt(sess, func(ctx context.Context) error {
+			return s.Media.PlayGreetingWithRuntime(ctx, sess.Runtime, sess.TxPath)
+		})
+		if err == nil || errors.Is(err, context.Canceled) {
 			return
-		} else if s.Log != nil {
+		}
+		if s.Log != nil {
 			s.Log.Warn("static greeting unavailable; falling back to synthesis", "error", err)
 		}
 	}
@@ -529,7 +535,15 @@ func (s *Service) prompt(sess *session, text string) error {
 	if s.Media == nil || sess.TxPath == "" {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(s.eventContext(sess), 45*time.Second)
+	return s.playPrompt(sess, func(ctx context.Context) error {
+		return s.Media.PlayWithRuntimeForUser(ctx, s.promptRuntime(sess), sess.UserID, sess.TxPath, text)
+	})
+}
+
+// All greetings, menus and email speech share cancellation and FIFO ownership.
+// Synthesis has its own bound; playback must not inherit the 45s dial timeout.
+func (s *Service) playPrompt(sess *session, play func(context.Context) error) error {
+	ctx, cancel := context.WithTimeout(s.eventContext(sess), process.PiperTimeout+process.PlaybackTimeout)
 	s.mu.Lock()
 	if sess.playCancel != nil {
 		sess.playCancel()
@@ -537,20 +551,38 @@ func (s *Service) prompt(sess *session, text string) error {
 	sess.playSequence++
 	sequence := sess.playSequence
 	sess.playCancel = cancel
+	s.beginMediaLocked(sess)
 	s.mu.Unlock()
 	sess.promptMu.Lock()
-	err := s.Media.PlayWithRuntimeForUser(ctx, s.promptRuntime(sess), sess.UserID, sess.TxPath, text)
+	err := play(ctx)
 	sess.promptMu.Unlock()
+	playbackContextErr := ctx.Err()
 	cancel()
 	s.mu.Lock()
 	if sess.playSequence == sequence {
 		sess.playCancel = nil
 	}
+	s.endMediaLocked(sess)
 	s.mu.Unlock()
-	if err != nil && ctx.Err() == nil && s.Log != nil {
+	if err != nil && playbackContextErr != context.Canceled && s.Log != nil {
 		s.Log.Warn("ivr prompt failed", "error", err)
 	}
 	return err
+}
+
+func (s *Service) beginMediaLocked(sess *session) {
+	sess.mediaPlays++
+	if sess.inactivityCancel != nil {
+		sess.inactivityCancel()
+		sess.inactivityCancel = nil
+	}
+	sess.inactivityGeneration++
+}
+func (s *Service) endMediaLocked(sess *session) {
+	sess.mediaPlays--
+	if sess.mediaPlays == 0 && !sess.Closed && stateLocked(sess) != "announce" && stateLocked(sess) != "outgoing" {
+		s.armInactivityTimeoutLocked(sess)
+	}
 }
 
 // interruptPrompt lets the bridge reader stop the current menu audio before

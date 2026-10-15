@@ -199,8 +199,8 @@ func (s *Service) playOutgoingAlert(sess *session) {
 	s.mu.Lock()
 	transitionLocked(sess, "announce")
 	s.mu.Unlock()
-	success := true
-	if s.Media != nil && sess.AlertText != "" {
+	success := false
+	if s.Media != nil && sess.AlertText != "" && sess.TxPath != "" {
 		success = s.prompt(sess, sess.AlertText) == nil
 	}
 	if success {

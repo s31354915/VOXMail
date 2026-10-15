@@ -901,6 +901,7 @@ def open_tx_fifo(path: Path) -> int:
 
 
 def pump_pcm(fd: int, stop: threading.Event) -> None:
+    deadline = now()
     phase = 0
     frame = bytearray()
     while not stop.is_set():
@@ -923,7 +924,8 @@ def pump_pcm(fd: int, stop: threading.Event) -> None:
                 view.release()
         except OSError:
             return
-        time.sleep(RTP_PTIME)
+        deadline += RTP_PTIME
+        stop.wait(max(0, deadline - now()))
 
 
 def assert_rx_audio(path: Path) -> None:
@@ -954,15 +956,30 @@ def run_call_audio_and_dtmf(peer: SIPPeer, bridge: Bridge, event: dict, label: s
         peer_call = peer.calls[call_id]
         wait_until(lambda: peer_call.rtp_non_silence > 0, TIMEOUT, f"{label} outbound RTP audio")
         assert_rx_audio(rx_path)
-        peer.send_dtmf(peer_call, "5")
-        dtmf = bridge.wait_for("dtmf", call_id=call_id, timeout=TIMEOUT)
-        if dtmf.get("digit") != "5" or dtmf.get("phase") != "start":
-            raise SmokeFailure(f"unexpected {label} DTMF event: {dtmf}")
-        dtmf_events = [message for message in bridge.drain(0.15) if message.get("type") == "dtmf" and message.get("call_id") == call_id]
-        release_events = [message for message in dtmf_events if message.get("phase") == "end"]
-        duplicate_digits = [message for message in dtmf_events if message.get("phase") != "end"]
-        if duplicate_digits or len(release_events) != 1 or release_events[0].get("digit"):
-            raise SmokeFailure(f"unexpected {label} DTMF release/duplicate events: {dtmf_events}")
+        # Exercise sustained audio, not just the first audible packet. Relative
+        # callback sleeps can sound fine initially then starve the RTP buffer.
+        for _ in range(6):
+            received, audible = peer_call.rtp_received, peer_call.rtp_non_silence
+            started = now()
+            time.sleep(2)
+            expected = (now() - started) / RTP_PTIME
+            if peer_call.rtp_received - received < expected * 0.9:
+                raise SmokeFailure(f"{label} sustained RTP cadence fell behind")
+            if peer_call.rtp_non_silence - audible < expected * 0.9:
+                raise SmokeFailure(f"{label} sustained audio contains dropouts")
+        # Repeated keys and every message-menu control must survive real RTP
+        # telephone-event start/end signaling while audio is flowing.
+        for digit in "112234567890*#":
+            peer.send_dtmf(peer_call, digit)
+            dtmf = bridge.wait_for("dtmf", call_id=call_id, timeout=TIMEOUT)
+            if dtmf.get("digit") != digit or dtmf.get("phase") != "start":
+                raise SmokeFailure(f"unexpected {label} DTMF event: {dtmf}")
+            dtmf_events = [message for message in bridge.drain(0.15) if message.get("type") == "dtmf" and message.get("call_id") == call_id]
+            release_events = [message for message in dtmf_events if message.get("phase") == "end"]
+            duplicate_digits = [message for message in dtmf_events if message.get("phase") != "end"]
+            if duplicate_digits or len(release_events) != 1 or release_events[0].get("digit"):
+                raise SmokeFailure(f"unexpected {label} DTMF release/duplicate events: {dtmf_events}")
+
     finally:
         stop.set()
         try:

@@ -45,7 +45,7 @@ RUN --mount=type=cache,id=bare-baresip-source-${BARESIP_REF}-${TARGETARCH},targe
     -DMODULES='account;g711;auconv;auresamp;aubridge;aufile;in_band_dtmf;ice;stun;srtp;dtls_srtp;stdio' \
     -DAPP_MODULES_DIR=/src/appmodules -DAPP_MODULES=voxmail \
     -DVOXMAIL_BUILD_NATIVE_TESTS=ON; \
-    cmake --build /build/baresip --target voxmail_command_queue_test voxmail_json_output_test voxmail_frame_parser_test voxmail_client_owner_test voxmail_command_wakeup_test voxmail_nonblocking_pipe_test voxmail_pcm_writer_test voxmail_pthread_start_test voxmail_event_shutdown_test --config Release -j"$(nproc)"; \
+    cmake --build /build/baresip --target voxmail_media_timing_test voxmail_command_queue_test voxmail_json_output_test voxmail_frame_parser_test voxmail_client_owner_test voxmail_command_wakeup_test voxmail_nonblocking_pipe_test voxmail_pcm_writer_test voxmail_pthread_start_test voxmail_event_shutdown_test --config Release -j"$(nproc)"; \
     ctest --test-dir /build/baresip/app_modules/voxmail --output-on-failure; \
     cmake --build /build/baresip --config Release -j"$(nproc)"; \
     mkdir -p /out/modules /out/provenance; \

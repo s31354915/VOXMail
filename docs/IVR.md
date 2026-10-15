@@ -25,6 +25,17 @@ always has three choices; account count does not alter its prerecorded audio.
 Account, folder, contact, attachment, and draft prompts enumerate current data
 dynamically.
 
+Key presses interrupt speech without waiting for a long menu to finish. Repeated
+transport callbacks for one held key are ignored without interrupting the next
+prompt. A missing release cannot disable that key for the rest of the call.
+The inactivity timer pauses during speech and attachment playback, then starts
+a fresh input window after playback ends.
+
+Audio uses a fixed frame timeline and a small PCM prebuffer, shared by menus,
+email reading, greetings, and attachments. An outgoing alert waits for the
+audio pipe to drain before reporting playback complete and hanging up; missing
+or failed audio is recorded as a failed alert.
+
 ## Mail actions
 
 In a message list:

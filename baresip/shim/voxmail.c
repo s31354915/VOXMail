@@ -32,6 +32,8 @@
 #include "json_output.h"
 #include "nonblocking_pipe.h"
 #include "pcm_writer.h"
+#include "pcm_clock.h"
+#include "dtmf_guard.h"
 #include "pthread_start.h"
 
 enum { SOCKET_PATH_MAX = 108, EVENT_BUFFER = 2048, AUDIO_PATH_MAX = 256,
@@ -52,7 +54,7 @@ struct session {
 	bool closed;
 	bool ringing;
 	bool established;
-	char active_dtmf;
+	struct voxmail_dtmf_guard dtmf;
 };
 
 struct dial_item {
@@ -154,6 +156,8 @@ static int pcm_source_thread(void *arg)
 	void *samples = mem_zalloc(bytes, NULL);
 	void *pending = mem_zalloc(bytes, NULL);
 	size_t pending_len = 0;
+	struct voxmail_pcm_clock clock;
+	voxmail_pcm_clock_init(&clock, tmr_jiffies(), st->ptime);
 	if (!samples || !pending) {
 		mem_deref(samples);
 		mem_deref(pending);
@@ -161,6 +165,11 @@ static int pcm_source_thread(void *arg)
 	}
 	while (re_atomic_rlx(&st->run)) {
 		struct auframe af;
+		uint32_t wait = voxmail_pcm_clock_wait(&clock, tmr_jiffies());
+		if (wait) {
+			sys_msleep(wait);
+			continue;
+		}
 		ssize_t got = 0;
 		memset(samples, 0, bytes);
 		if (st->fd >= 0 && pending_len < bytes)
@@ -170,19 +179,22 @@ static int pcm_source_thread(void *arg)
 			break;
 		if (got > 0)
 			pending_len += (size_t)got;
-		if (pending_len == bytes) {
-			memcpy(samples, pending, bytes);
+		if (pending_len == bytes || (got == 0 && pending_len > 0)) {
+			memcpy(samples, pending, pending_len - pending_len % 2);
 			pending_len = 0;
 		}
 		/* A FIFO opened read-only/nonblocking reports EOF while no writer is
 		 * attached.  Keep the source alive and emit silence until Go opens the
 		 * corresponding TX pipe.  If a writer supplied only part of one PCM
 		 * frame, keep those bytes private until the rest arrives; never expose a
-		 * half sample or a mixed frame to baresip. */
+		 * half sample or a mixed frame to baresip. At writer EOF, pad the
+		 * final complete samples with silence instead of keeping them for the
+		 * next prompt. */
 		auframe_init(&af, st->prm.fmt, samples, st->sampc,
 		             st->prm.srate, st->prm.ch);
+		af.timestamp = clock.next_ms * 1000;
 		st->rh(&af, st->arg);
-		sys_msleep(st->ptime ? st->ptime : 20);
+		voxmail_pcm_clock_advance(&clock);
 	}
 	mem_deref(samples);
 	mem_deref(pending);
@@ -252,6 +264,8 @@ static int pcm_player_thread(void *arg)
 	size_t bytes = st->sampc * aufmt_sample_size(st->prm.fmt);
 	char path[AUDIO_PATH_MAX];
 	void *samples = mem_zalloc(bytes, NULL);
+	struct voxmail_pcm_clock clock;
+	voxmail_pcm_clock_init(&clock, tmr_jiffies(), st->prm.ptime);
 	if (!samples)
 		return ENOMEM;
 	if (pcm_path(path, sizeof(path), st->device, "rx.pcm")) {
@@ -262,9 +276,15 @@ static int pcm_player_thread(void *arg)
 	}
 	while (re_atomic_rlx(&st->run)) {
 		struct auframe af;
+		uint32_t wait = voxmail_pcm_clock_wait(&clock, tmr_jiffies());
+		if (wait) {
+			sys_msleep(wait);
+			continue;
+		}
 		memset(samples, 0, bytes);
 		auframe_init(&af, st->prm.fmt, samples, st->sampc,
 		             st->prm.srate, st->prm.ch);
+		af.timestamp = clock.next_ms * 1000;
 		st->wh(&af, st->arg);
 		if (st->fd < 0) {
 			st->fd = open(path, O_WRONLY | O_NONBLOCK | O_APPEND, 0600);
@@ -282,7 +302,7 @@ static int pcm_player_thread(void *arg)
 				st->fd = -1;
 			}
 		}
-		sys_msleep(st->prm.ptime ? st->prm.ptime : 20);
+		voxmail_pcm_clock_advance(&clock);
 	}
 	mem_deref(samples);
 	return 0;
@@ -637,8 +657,7 @@ static void call_dtmf_handler(struct call *call, char key, void *arg)
 	if (key == KEYCODE_NONE || key == KEYCODE_REL) {
 		bool was_active;
 		pthread_mutex_lock(&session_lock);
-		was_active = session->active_dtmf != 0;
-		session->active_dtmf = 0;
+		was_active = voxmail_dtmf_release(&session->dtmf);
 		pthread_mutex_unlock(&session_lock);
 		if (was_active)
 			emit_event("dtmf", session, ",\"phase\":\"end\"");
@@ -647,11 +666,10 @@ static void call_dtmf_handler(struct call *call, char key, void *arg)
 	if (!((key >= '0' && key <= '9') || key == '*' || key == '#'))
 		return;
 	pthread_mutex_lock(&session_lock);
-	if (session->active_dtmf == key) {
+	if (!voxmail_dtmf_press(&session->dtmf, key, tmr_jiffies())) {
 		pthread_mutex_unlock(&session_lock);
 		return;
 	}
-	session->active_dtmf = key;
 	pthread_mutex_unlock(&session_lock);
 	{
 		char escaped_digit[sizeof(digit) * 6 + 1];

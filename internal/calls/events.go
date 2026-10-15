@@ -14,6 +14,14 @@ import (
 
 const callEventQueueSize = 32
 
+// A lost release event must not disable this key for the rest of the call.
+const dtmfReleaseGrace = 2 * time.Second
+
+type activeTone struct {
+	digit string
+	seen  time.Time
+}
+
 type callEventJob struct {
 	message            bridge.Message
 	navigationVersion  uint64
@@ -38,7 +46,7 @@ type callEventDispatcher struct {
 
 	mu         sync.Mutex
 	workers    map[string]*callEventWorker
-	activeDTMF map[string]string
+	activeDTMF map[string]activeTone
 	errs       chan error
 	// handleFn is nil in production. Tests use it to deterministically hold
 	// one event and prove queue ordering, isolation, and cancellation without
@@ -52,7 +60,7 @@ func newCallEventDispatcher(ctx context.Context, service *Service, conn net.Conn
 		conn:       conn,
 		ctx:        ctx,
 		workers:    make(map[string]*callEventWorker),
-		activeDTMF: make(map[string]string),
+		activeDTMF: make(map[string]activeTone),
 		errs:       make(chan error, 1),
 	}
 }
@@ -91,21 +99,21 @@ func (d *callEventDispatcher) dispatch(message bridge.Message) error {
 		d.stopWorker(message.CallID)
 		return nil
 	}
-	if message.Type == "dtmf" {
-		// Prompt playback runs on the ordered call worker. Interrupt it as soon
-		// as the bridge receives a completed key so the worker can process that
-		// key instead of making callers wait for the whole menu to finish.
-		d.service.interruptPrompt(message.CallID)
-	}
 
 	d.mu.Lock()
 	if message.Type == "dtmf" {
-		if d.activeDTMF[message.CallID] == message.Digit {
+		previous := d.activeDTMF[message.CallID]
+		now := time.Now()
+		if message.Phase != "" && previous.digit == message.Digit && now.Sub(previous.seen) < dtmfReleaseGrace {
+			d.activeDTMF[message.CallID] = activeTone{message.Digit, now}
 			d.trace(message, "duplicate ignored")
 			d.mu.Unlock()
 			return nil
 		}
-		d.activeDTMF[message.CallID] = message.Digit
+		d.activeDTMF[message.CallID] = activeTone{message.Digit, now}
+		// Only accepted presses may interrupt audio. A duplicate callback must
+		// not cancel the next menu while being discarded as input.
+		d.service.interruptPrompt(message.CallID)
 	}
 	worker := d.workers[message.CallID]
 	if worker == nil {
