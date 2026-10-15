@@ -38,6 +38,7 @@ test('preview matches local aliases, fixed legacy roles, nested keys and every m
   const mapping = { INBOX: 'InboxCustom', Drafts: 'DraftCache', Sent: 'Archive/SentCache' };
   const folders = { ...mapping, 'Projects/2026': 'Projects/2026', 'Projects/2027': 'Projects/2027', A: 'A', B: 'B', C: 'C', D: 'D', E: 'E', F: 'F' };
   await fixture(page, { mapping, folders, roles: {} });
+  await page.getByRole('tab', { name: 'Phone preview', exact: true }).click();
   const preview = page.locator('#folder-preview');
   const rootRows = preview.locator(':scope > .mailbox');
   await expect(rootRows).toHaveCount(8);
@@ -52,10 +53,12 @@ test('preview matches local aliases, fixed legacy roles, nested keys and every m
   await expect(nested.locator('[data-preview-key="1"]')).toHaveAttribute('data-preview-folder', 'Projects/2026');
   await expect(nested.locator('[data-preview-key="2"]')).toHaveAttribute('data-preview-folder', 'Projects/2027');
   const editor = page.locator('#folder-editor');
+  await editor.getByRole('tab', { name: 'Folders', exact: true }).click();
   const alias = editor.locator('details.local-alias').filter({ has: page.locator('[data-folder-alias="Drafts"]') });
   await alias.locator('summary').click();
   await editor.locator('[data-folder-alias="Drafts"]').fill('ChangedDrafts');
   await editor.locator('[data-folder-alias="Drafts"]').press('Tab');
+  await editor.getByRole('tab', { name: 'Phone preview', exact: true }).click();
   await expect(preview.locator(':scope > [data-preview-key="2"]')).toHaveAttribute('data-preview-folder', 'ChangedDrafts');
   await expect(editor.getByText('Preview after the next successful sync.', { exact: false })).toBeVisible();
   const audit = await new AxeBuilder({ page }).include('#folder-editor').analyze();
@@ -64,6 +67,7 @@ test('preview matches local aliases, fixed legacy roles, nested keys and every m
 
 test('preview receives retained source bindings without listing old caches twice', async ({ page }) => {
   await fixture(page, { mapping: { Alias: 'NewAlias' }, folders: { Alias: 'NewAlias' }, roles: {}, bindings: { Drafts: 'Alias', NewAlias: 'Alias' } });
+  await page.getByRole('tab', { name: 'Phone preview', exact: true }).click();
   const preview = page.locator('#folder-preview');
   await expect(preview.locator(':scope > .mailbox')).toHaveCount(4);
   await expect(preview.locator(':scope > [data-preview-key="2"]')).toHaveAttribute('data-preview-folder', 'NewAlias');
@@ -74,6 +78,7 @@ test('provider names matching object properties remain selectable and map correc
   const folders = JSON.parse('{"__proto__":"__proto__","constructor":"constructor"}');
   const { submissions } = await fixture(page, { mapping: {}, folders, roles: {} });
   const editor = page.locator('#folder-editor');
+  await editor.getByRole('tab', { name: 'Folders', exact: true }).click();
   const alias = editor.locator('details.local-alias').filter({ has: page.locator('[data-folder-alias="__proto__"]') });
   await alias.locator('summary').click();
   await expect(editor.locator('[data-folder-alias="__proto__"]')).toHaveValue('__proto__');
@@ -95,12 +100,14 @@ test('reserved INBOX casing preserves saved groups, primary, roles and mapping k
   const inboxRow = editor.locator('.folder-row').filter({ has: page.locator('[data-folder-select="Inbox"]') });
   await expect(inboxRow).toContainText('Group: My inbox');
   await expect(editor.locator('[data-folder-role="Inbox"]')).toHaveValue('inbox');
+  await editor.locator('[data-folder-select="Inbox"]').check();
+  await editor.getByRole('tab', { name: 'Groups', exact: true }).click();
   await editor.locator('#folder-group-choice').selectOption('pair');
   await expect(editor.locator('[data-folder-primary="inbox"]')).toBeChecked();
-  await editor.locator('[data-folder-select="Inbox"]').check();
   await editor.getByRole('button', { name: 'Add selected members' }).click();
   await expect(editor.locator('input[name=folder-primary]')).toHaveCount(2);
   await expect(editor.locator('[data-folder-primary="inbox"]')).toBeChecked();
+  await editor.getByRole('tab', { name: 'Folders', exact: true }).click();
   const alias = editor.locator('details.local-alias').filter({ has: page.locator('[data-folder-alias="Inbox"]') });
   await alias.locator('summary').click();
   await expect(editor.locator('[data-folder-alias="Inbox"]')).toHaveValue('FutureInbox');
@@ -119,8 +126,9 @@ for (const width of [1536, 390]) {
     const { submissions } = await fixture(page);
     const editor = page.locator('#folder-editor');
     await expect(editor.locator('input[type=checkbox]:checked')).toHaveCount(0);
-    await expect(editor.locator('.folder-row')).toHaveCount(7);
     await expect(editor.locator('#folder-editor-title')).toBeFocused();
+    await editor.locator('#folder-page-size').selectOption('10');
+    await expect(editor.locator('.folder-row')).toHaveCount(7);
     for (const remote of ['INBOX', '[Gmail]/Inbox']) await editor.locator(`[data-folder-select="${remote}"]`).check();
     await editor.getByRole('button', { name: 'Combine selected', exact: true }).click();
     await expect(editor.locator('input[name=folder-primary]:checked')).toHaveCount(0);
@@ -129,6 +137,7 @@ for (const width of [1536, 390]) {
     expect(submissions).toHaveLength(0);
     await editor.locator('#folder-group-name').fill('My inbox');
     await editor.locator('[data-folder-primary="[Gmail]/Inbox"]').check();
+    await editor.getByRole('tab', { name: 'Folders', exact: true }).click();
     await editor.locator('[data-folder-select="[Gmail]/All Mail"]').check();
     await editor.getByRole('button', { name: 'Exclude from browsing' }).click();
     await editor.getByRole('button', { name: 'Save folder choices' }).click();
@@ -141,10 +150,12 @@ for (const width of [1536, 390]) {
     await editor.getByRole('button', { name: 'Cancel', exact: true }).click();
     await expect(page.locator('[data-folders-account="mail"]')).toBeFocused();
     await page.locator('[data-folders-account="mail"]').click();
+    await editor.getByRole('tab', { name: 'Groups', exact: true }).click();
     await editor.locator('#folder-group-choice').selectOption(submissions[0].policy.groups[0].id);
     await expect(editor.locator('#folder-group-name')).toHaveValue('My inbox');
     await expect(editor.locator('[data-folder-primary="[Gmail]/Inbox"]')).toBeChecked();
     await editor.getByRole('button', { name: 'Keep all members separate' }).click();
+    await editor.getByRole('tab', { name: 'Folders', exact: true }).click();
     await editor.locator('[data-folder-select="[Gmail]/All Mail"]').check();
     await editor.getByRole('button', { name: 'Show selected' }).click();
     await editor.getByRole('button', { name: 'Save folder choices' }).click();
@@ -205,6 +216,7 @@ test('mapping and ignoring folders use dropdowns and survive reopening', async (
   await expect(editor.locator('[data-folder-mapping="Projects"] option[value="Inbox"]')).toHaveJSProperty('disabled', true);
   await editor.locator('[data-folder-mapping="Projects"]').selectOption('Archive');
   await editor.locator('[data-folder-visibility="[Gmail]/All Mail"]').selectOption('ignore');
+  await editor.getByRole('tab', { name: 'Phone preview', exact: true }).click();
   await expect(editor.locator('#folder-preview')).not.toContainText('[Gmail]/All Mail');
   await editor.getByRole('button', { name: 'Save folder choices' }).click();
   await expect(editor.locator('#folder-editor-status')).toHaveText('Folder choices saved.');
@@ -230,12 +242,61 @@ test('conflicting folder choices open and can be repaired with fresh dropdown de
   });
   const editor = page.locator('#folder-editor');
   await expect(editor.getByRole('heading', { name: 'Folder mapping conflicts' })).toBeVisible();
+  await editor.getByRole('tab', { name: 'Phone preview', exact: true }).click();
   await expect(editor.locator('#folder-preview')).toContainText('Resolve the folder mapping conflicts');
+  await editor.getByRole('tab', { name: 'Folders', exact: true }).click();
   await editor.locator('[data-folder-mapping="Sent"]').selectOption('Separate/Sent');
   await editor.locator('[data-folder-mapping="Trash"]').selectOption('Separate/Trash');
   await editor.getByRole('button', { name: 'Save folder choices' }).click();
   await expect(editor.locator('#folder-editor-status')).toHaveText('Folder choices saved.');
   expect(submissions[0].folder_map).toEqual({ '[Gmail]/Sent Mail': 'Sent', '[Gmail]/Trash': 'Trash', Sent: 'Separate/Sent', Trash: 'Separate/Trash' });
   await expect(editor.getByRole('heading', { name: 'Folder mapping conflicts' })).toHaveCount(0);
+  await editor.getByRole('tab', { name: 'Phone preview', exact: true }).click();
   await expect(editor.locator('#folder-preview')).toContainText('Separate');
 });
+
+for (const width of [1536, 1100, 768, 390]) {
+  test(`large folder inventory stays compact and preserves edits across pages at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 1000 });
+    const folders = Object.fromEntries(Array.from({ length: 125 }, (_, i) => {
+      const name = `Projects/Folder-${String(i).padStart(3, '0')}`;
+      return [name, name];
+    }));
+    const { submissions } = await fixture(page, { mapping: {}, roles: {}, folders });
+    const editor = page.locator('#folder-editor');
+    await expect(editor.locator('.folder-row')).toHaveCount(width <= 600 ? 5 : 10);
+    await editor.locator('[data-folder-select="Projects/Folder-000"]').check();
+    await editor.locator('[data-folder-mapping="Projects/Folder-000"]').selectOption('Archive');
+    await editor.getByRole('button', { name: 'Next page', exact: true }).click();
+    await expect(editor.locator(`[data-folder-select="Projects/Folder-${width <= 600 ? '005' : '010'}"]`)).toBeVisible();
+    await editor.getByRole('searchbox', { name: 'Search folders' }).fill('Folder-124');
+    await expect(editor.locator('.folder-row')).toHaveCount(1);
+    await editor.locator('[data-folder-select="Projects/Folder-124"]').check();
+    await expect(editor.locator('#folder-selection-count')).toHaveText('2 selected');
+    await editor.getByRole('button', { name: 'Combine selected', exact: true }).click();
+    await expect(editor.getByRole('tab', { name: 'Groups', exact: true })).toHaveAttribute('aria-selected', 'true');
+    await editor.locator('#folder-group-name').fill('Across pages');
+    await editor.locator('[data-folder-primary="Projects/Folder-124"]').check();
+    await editor.getByRole('tab', { name: 'Phone preview', exact: true }).click();
+    await expect(editor.locator('#folder-preview')).toContainText('Across pages');
+    await editor.getByRole('tab', { name: 'Folders', exact: true }).click();
+    await editor.getByRole('searchbox', { name: 'Search folders' }).fill('nothing-matches');
+    await expect(editor.locator('.folder-row')).toHaveCount(0);
+    await expect(editor.getByText('No folders match your search.', { exact: true })).toBeVisible();
+    await editor.getByRole('searchbox', { name: 'Search folders' }).fill('');
+    await expect(editor.locator('.folder-row')).toHaveCount(width <= 600 ? 5 : 10);
+    await expect(editor.locator('[data-folder-mapping="Projects/Folder-000"]')).toHaveValue('Archive');
+    for (const tab of ['Folders', 'Groups', 'Phone preview']) {
+      await editor.getByRole('tab', { name: tab, exact: true }).click();
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+      const audit = await new AxeBuilder({ page }).include('#folder-editor').analyze();
+      expect(audit.violations).toEqual([]);
+      await editor.screenshot({ path: `/tmp/voxmail-redesign-${width}-${tab.replaceAll(' ', '-')}.png` });
+
+    }
+    await editor.getByRole('button', { name: 'Save folder choices' }).click();
+    await expect(editor.locator('#folder-editor-status')).toHaveText('Folder choices saved.');
+    expect(submissions[0].folder_map['Projects/Folder-000']).toBe('Archive');
+    expect(submissions[0].policy.groups[0].folders).toEqual(['Projects/Folder-000', 'Projects/Folder-124']);
+  });
+}

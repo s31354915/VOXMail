@@ -55,9 +55,16 @@ shows retained mappings and folders discovered by synchronization or a successfu
 **Test saved settings**. For a new account, test its saved settings and reopen the
 editor to map folders before a long initial sync finishes. Discovered names are
 retained separately from synchronized directories; testing never rewrites existing
-Maildir paths or UID metadata. Use the folder
+Maildir paths or UID metadata.
+
+The editor separates **Folders**, **Groups**, and **Phone preview** into tabs.
+Search by folder name and use the page controls for large inventories; selections
+and unsaved edits persist across pages, searches, and tabs. **Select this page**
+selects the visible rows, while **Clear selection** clears all selections. The
+editor defaults to five rows on phones and ten on larger screens, with a
+**Rows per page** control. Fields stack on narrow screens. Use the folder
 checkboxes to select an action; selecting a checkbox alone changes no mapping.
-Use **Map to local folder** to select a local alias from the dropdown, and use
+Use **Destination** to select a local alias from the dropdown, and use
 the role selector to assign a role. Destinations used by other folders are disabled;
 combine those folders as a logical group instead. **Custom local name** also allows
 a new alias when needed. Existing mappings and role assignments are retained.
@@ -67,7 +74,7 @@ enter a display name, and explicitly choose the primary member. The primary is
 the destination for writes to that group; browsing includes each member's
 distinct messages. Provider names never cause automatic grouping or exclusion.
 **Keep separate**, **Exclude from browsing**, and **Show selected** control the
-selected folders. Each folder also has a **Phone menu** dropdown: choose
+selected folders. Each folder also has a **Phone visibility** dropdown: choose
 **Hide from phone menu** to ignore it or **Show folder** to restore it. Excluded
 folders are not listed in the phone folder menu; stored and remote emails are
 retained and synchronization continues. Existing
@@ -79,12 +86,14 @@ save preserves your edits and reports the error beside the editor. If another
 configuration update makes the save stale, cancel and reopen Folder choices to
 load the current version. Cancel discards unsaved editor changes.
 
-The preview shows the phone menu after the next successful synchronization,
+The **Phone preview** tab shows the phone menu after the next successful synchronization,
 using local aliases and the retained legacy role fallbacks. Expand **Nested
 folders** and **Press 9 for more folders** to inspect every submenu and page.
 Inbox/Drafts/Sent/Trash retain keys 1–4 at the root; additional root folders start
 at 5–8, and subsequent pages and nested menus use 1–8. An explicitly excluded role
-stays unavailable until the owner assigns it again.
+stays unavailable until the owner assigns it again. When a phone folder has
+nested folders, select it and press **1** to listen to messages stored directly
+in that parent, or **2** to open its nested folders.
 
 Aliases must be relative, non-empty, and unique locally. Keep alert-folder
 names aligned with the remote names or local aliases produced by sync.

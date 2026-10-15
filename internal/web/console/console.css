@@ -1451,7 +1451,7 @@ body[data-signed-in="true"][data-console-task="administration"] {
     margin-left: 0;
   }
 }
-@media (max-width: 600px) {
+@media (max-width: 1200px) {
   #accounts table,
   #accounts tbody {
     display: block;
@@ -1570,757 +1570,299 @@ body[data-signed-in="true"][data-console-task="administration"] {
   }
 }
 
-/* Folder editor baseline: 12ui C conversion, source 6889d5fcd39b114f. */
-.folder-editor * {
+/* 12ui candidate C: compact table, pill tabs, cream/navy/terracotta palette.
+   The application uses full-width tab panels and fluid mobile cards rather
+   than the export's fixed canvas and simultaneous detail sidebar. */
+.folder-editor {
+  container-type: inline-size;
+  margin-top: 24px;
+  color: var(--navy);
+  font-size: 14px;
+  min-width: 0;
+}
+.folder-editor *,
+.folder-editor *::before,
+.folder-editor *::after {
   box-sizing: border-box;
 }
-.folder-editor {
+.folder-editor [hidden] {
+  display: none !important;
+}
+.folder-editor h2,
+.folder-editor h3,
+.folder-editor h4 {
+  font-family: Georgia, "Times New Roman", serif;
   margin: 0;
-  color: #08264b;
-  font-family: inherit;
-  font-size: 14px;
-  background-color: #f4f1eb;
-  background-image:
-    repeating-linear-gradient(
-      113deg,
-      rgba(140, 115, 82, 0.012) 0,
-      rgba(140, 115, 82, 0.012) 1px,
-      transparent 1px,
-      transparent 4px
-    ),
-    radial-gradient(ellipse at 45% 35%, #f8f6f2a0, transparent 75%);
+  line-height: 1.3;
+}
+.folder-editor h2 {
+  font-size: clamp(22px, 3vw, 28px);
+  overflow-wrap: anywhere;
+}
+.folder-editor h3 {
+  font-size: 19px;
+}
+.folder-editor h4 {
+  font-size: 16px;
+}
+.folder-editor p {
+  line-height: 1.5;
+}
+.folder-editor .editor-heading p,
+.folder-editor .intro p,
+.folder-editor .description {
+  color: var(--muted);
+  margin: 8px 0 0;
+}
+.folder-editor .editor-heading {
+  margin-bottom: 20px;
 }
 .folder-editor button,
 .folder-editor input,
 .folder-editor select {
   font: inherit;
   color: inherit;
-}
-.folder-editor button,
-.folder-editor a,
-.folder-editor input,
-.folder-editor select {
-  outline-offset: 4px;
+  max-width: 100%;
 }
 .folder-editor button {
   cursor: pointer;
-}
-.folder-editor svg {
-  width: 22px;
-  height: 22px;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.7;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-  flex-shrink: 0;
-  color: #31517a;
-}
-.folder-editor .symbols {
-  position: absolute;
-  width: 0;
-  height: 0;
-  overflow: hidden;
-}
-.folder-editor .page {
-  padding: 29px 40px 32px;
-  max-width: 1700px;
-  margin: auto;
-}
-.folder-editor .editor-heading {
-  display: flex;
-  gap: 21px;
-  align-items: flex-start;
-  margin-bottom: 28px;
-}
-.folder-editor .back {
-  display: flex;
-  padding: 11px 4px;
-  text-decoration: none;
-}
-.folder-editor .back svg {
-  width: 21px;
-  height: 21px;
-  color: #547398;
-}
-.folder-editor h1,
-.folder-editor h2,
-.folder-editor h3 {
-  font-family: Georgia, "Times New Roman", serif;
-  margin: 0;
-  font-weight: 700;
-}
-.folder-editor h1 {
-  font-size: 34px;
-  line-height: 1.25;
-  letter-spacing: -0.45px;
-}
-.folder-editor .editor-heading p {
-  margin: 5px 0 0;
-  color: #536e94;
-  line-height: 22px;
-}
-.folder-editor .editor-panels {
-  display: grid;
-  grid-template-columns: 1fr 1.045fr 1fr;
-  gap: 14px;
-}
-.folder-editor .panel {
-  background: rgba(255, 255, 255, 0.82);
-  border-radius: 9px;
-  min-width: 0;
-  min-height: 776px;
-  overflow: hidden;
-}
-.folder-editor h2 {
-  font-size: 23px;
-  line-height: 29px;
-  letter-spacing: -0.35px;
-}
-.folder-editor h3 {
-  font-size: 19px;
-  line-height: 26px;
-}
-.folder-editor .intro {
-  padding: 20px 25px 0;
-}
-.folder-editor .intro p,
-.folder-editor .description {
-  color: #536e94;
-  line-height: 22px;
-  margin: 8px 0 0;
-}
-.folder-editor .folders {
-  padding: 25px 25px 16px;
-}
-.folder-editor .table-head {
-  display: grid;
-  grid-template-columns: 1fr 157px;
-  font-size: 13px;
-  color: #536e94;
-  padding-bottom: 6px;
-  line-height: 20px;
-}
-.folder-editor .table-head span:last-child {
-  padding-left: 7px;
-}
-.folder-editor .folder-row {
-  display: grid;
-  grid-template-columns: 25px 26px minmax(0, 1fr) 157px;
-  align-items: center;
-  gap: 20px;
-  min-height: 62px;
-  border-top: 1px solid #edf0f4;
-}
-.folder-editor .folder-row svg {
-  width: 21px;
-  height: 21px;
-}
-.folder-editor .check {
-  appearance: none;
-  margin: 0;
-  width: 20px;
-  height: 20px;
-  border-radius: 5px;
-  border: 1px solid #e76851;
-  background: linear-gradient(140deg, #e46a54, #fa8063);
-  position: relative;
-  cursor: pointer;
-}
-.folder-editor .check:checked:after {
-  content: "";
-  position: absolute;
-  left: 6px;
-  top: 2px;
-  width: 5px;
-  height: 10px;
-  border: solid white;
-  border-width: 0 2px 2px 0;
-  transform: rotate(43deg);
-}
-.folder-editor .check:not(:checked) {
-  background: white;
-  border-color: #b7c4d6;
-}
-.folder-editor .select-wrap {
-  position: relative;
-  min-width: 0;
-}
-.folder-editor .select-wrap:after {
-  content: "";
-  position: absolute;
-  right: 18px;
-  top: 16px;
-  width: 6px;
-  height: 6px;
-  border-right: 1px solid #31517a;
-  border-bottom: 1px solid #31517a;
-  transform: rotate(45deg);
-  pointer-events: none;
-}
-.folder-editor select {
-  appearance: none;
-  width: 100%;
-  border: 1px solid #f0f1f5;
-  border-radius: 9px;
-  background: linear-gradient(120deg, #f4f5f9, #f7f8fa);
-  padding: 10px 32px 10px 13px;
-  height: 41px;
-}
-.folder-editor .actions {
-  border-top: 1px solid #e9edf2;
-  padding: 24px 25px 25px;
-}
-.folder-editor .actions h3 {
-  margin-bottom: 16px;
-}
-.folder-editor .action {
-  display: grid;
-  grid-template-columns: 21px 1fr;
-  gap: 12px;
-  margin-top: 12px;
-  align-items: start;
-}
-.folder-editor .radio {
-  appearance: none;
-  width: 20px;
-  height: 20px;
-  border: 1.5px solid #a9bbd0;
-  border-radius: 50%;
-  margin: 0;
-  background: #fff;
-  cursor: pointer;
-}
-.folder-editor .radio:checked {
-  border: 6px solid #e76d57;
-}
-.folder-editor .action label {
-  display: block;
-  line-height: 21px;
-}
-.folder-editor .action p {
-  font-size: 12px;
-  color: #536e94;
-  line-height: 20px;
-  margin: 1px 0 0;
-}
-.folder-editor .group .intro {
-  padding-left: 25px;
-  padding-right: 25px;
-}
-.folder-editor .group-box {
-  margin: 15px 0 0 24px;
-  padding: 19px 25px 23px 11px;
-  border: 1px solid #e9edf3;
-  border-radius: 12px;
-}
-.folder-editor .field-label {
-  font-size: 13px;
-  font-weight: 700;
-  display: block;
-  margin-bottom: 8px;
-}
-.folder-editor .name-input {
-  height: 42px;
-  padding: 10px 13px;
-  border: 1px solid #dce3ed;
-  border-radius: 9px;
-  width: 100%;
-  background: #ffffff55;
-}
-.folder-editor .members-heading {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin: 21px 0 8px;
-}
-.folder-editor .members-heading .field-label {
-  margin: 0;
-}
-.folder-editor .add {
-  border: 0;
-  background: none;
-  color: #ed664e;
-  padding: 2px 0;
-  font-size: 13px;
-  font-weight: 500;
-}
-.folder-editor .member-list {
-  background: #f7f8fa99;
-  border: 1px solid #e8ecf2;
-  border-radius: 11px;
-  overflow: hidden;
-}
-.folder-editor .member {
-  display: flex;
-  align-items: center;
-  gap: 28px;
-  min-height: 54px;
-  padding: 9px 13px;
-}
-.folder-editor .member + .member {
-  border-top: 1px solid #eff1f5;
-}
-.folder-editor .member svg {
-  width: 21px;
-  height: 21px;
-}
-.folder-editor .member label {
-  margin-left: -8px;
-}
-.folder-editor .primary {
-  font-size: 12px;
-  color: #ed684f;
-  background: #fbeae5;
-  border-radius: 20px;
-  padding: 5px 17px;
-  margin-left: -4px;
-}
-.folder-editor .drag {
-  border: 0;
-  padding: 0;
-  background: none;
-  margin-left: auto;
-  line-height: 1;
-}
-.folder-editor .drag svg {
-  width: 16px;
-  height: 20px;
-  stroke: none;
-  fill: #7290b0;
-}
-.folder-editor .roles {
-  border-top: 1px solid #e9edf2;
-  padding: 19px 25px 26px;
-}
-.folder-editor .roles .description {
-  margin-top: 7px;
-}
-.folder-editor .role-list {
-  margin-top: 13px;
-}
-.folder-editor .role-row {
-  display: grid;
-  grid-template-columns: 26px 1fr 168px;
-  gap: 20px;
-  align-items: center;
-  min-height: 54px;
-  padding-left: 15px;
-}
-.folder-editor .role-row svg {
-  width: 21px;
-  height: 21px;
-}
-.folder-editor .result .intro {
-  padding: 22px 27px 0;
-}
-.folder-editor .mailboxes {
-  margin: 15px 13px 0 27px;
-  border: 1px solid #e8ecf2;
-  border-radius: 12px;
-  padding: 3px 12px;
-}
-.folder-editor .mailbox {
-  display: grid;
-  grid-template-columns: 36px 22px 1fr 18px;
-  gap: 27px;
-  align-items: center;
-  min-height: 66px;
-  color: #08264b;
-  text-decoration: none;
-}
-.folder-editor .mailbox + .mailbox {
-  border-top: 1px solid #edf0f4;
-}
-.folder-editor .number {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 35px;
-  height: 35px;
-  border-radius: 50%;
-  color: white;
-  background:
-    radial-gradient(ellipse at 72% 28%, #ffffff35, transparent 45%),
-    linear-gradient(135deg, #f1785c, #ee5c45);
-}
-.folder-editor .number.purple {
-  background:
-    radial-gradient(ellipse at 72% 28%, #ffffff45, transparent 45%), #9891f0;
-}
-.folder-editor .number.blue {
-  background:
-    radial-gradient(ellipse at 72% 28%, #ffffff45, transparent 45%), #4da7e9;
-}
-.folder-editor .number.green {
-  background:
-    radial-gradient(ellipse at 72% 28%, #ffffff45, transparent 45%), #51a775;
-}
-.folder-editor .number.pink {
-  background:
-    radial-gradient(ellipse at 72% 28%, #ffffff45, transparent 45%), #eb4d7d;
-}
-.folder-editor .mailbox > span:last-of-type {
-  font-weight: 500;
-}
-.folder-editor .mailbox .chevron {
-  width: 16px;
-  height: 18px;
-}
-.folder-editor .notice {
-  display: flex;
-  gap: 23px;
-  margin: 24px 13px 0 27px;
-  padding: 19px 18px 17px;
-  background: linear-gradient(120deg, #f4f6fc, #f5f6fb);
-  border-radius: 10px;
-}
-.folder-editor .notice > svg {
-  width: 33px;
-  height: 33px;
-  color: #2773d5;
-  stroke-width: 1.8;
-}
-.folder-editor .notice h4 {
-  font-size: 14px;
-  font-weight: 500;
-  margin: 1px 0 4px;
-  line-height: 20px;
-}
-.folder-editor .notice p {
-  font-size: 13px;
-  color: #536e94;
-  line-height: 21px;
-  margin: 0;
-}
-.folder-editor .editor-footer {
-  margin-top: 18px;
-  border: 1px solid #e7eaef;
-  background: #ffffffad;
-  border-radius: 9px;
-  padding: 16px 9px 16px 17px;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-.folder-editor .validated {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-.folder-editor .valid-icon {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: #e4f2ec;
-  width: 40px;
-  height: 40px;
-  border-radius: 50%;
-  color: #228c77;
-}
-.folder-editor .valid-icon svg {
-  color: inherit;
-  width: 23px;
-}
-.folder-editor .validated strong {
-  font-size: 12px;
-  color: #128565;
-  font-weight: 500;
-}
-.folder-editor .validated p {
-  font-size: 11px;
-  color: #536e94;
-  line-height: 17px;
-  margin: 3px 0 0;
-}
-.folder-editor .footer-buttons {
-  display: flex;
-  gap: 21px;
-  margin-left: auto;
-}
-.folder-editor .button {
-  height: 42px;
-  border: 1px solid #dce3ed;
-  border-radius: 13px;
-  padding: 0 27px;
-  background: #f8f8f7;
-}
-.folder-editor .save {
-  border-color: #ea6952;
-  background:
-    radial-gradient(ellipse at 75% 0%, #fb8c6999, transparent 70%),
-    linear-gradient(120deg, #f16b50, #e76b54);
-  color: #fff;
-  font-size: 13px;
-  font-weight: 600;
-  padding: 0 22px;
-}
-.folder-editor .mobile-label {
-  display: none;
-}
-@media (min-width: 1024px) and (max-width: 1300px) {
-  .folder-editor .page {
-    padding-left: 24px;
-    padding-right: 24px;
-  }
-  .folder-editor .folder-row {
-    gap: 10px;
-    grid-template-columns: 21px 21px minmax(0, 1fr) 115px;
-  }
-  .folder-editor .table-head {
-    grid-template-columns: 1fr 115px;
-  }
-  .folder-editor .intro,
-  .folder-editor .roles,
-  .folder-editor .folders,
-  .folder-editor .actions {
-    padding-left: 18px;
-    padding-right: 18px;
-  }
-  .folder-editor .member {
-    gap: 16px;
-  }
-  .folder-editor .role-row {
-    grid-template-columns: 22px 1fr 115px;
-    gap: 12px;
-    padding-left: 0;
-  }
-  .folder-editor .mailbox {
-    gap: 17px;
-  }
-  .folder-editor .notice {
-    gap: 12px;
-  }
-}
-@media (min-width: 600px) and (max-width: 1023px) {
-  .folder-editor .page {
-    padding: 25px;
-  }
-  .folder-editor .editor-panels {
-    grid-template-columns: 1fr;
-    gap: 18px;
-  }
-  .folder-editor .panel {
-    min-height: 0;
-  }
-  .folder-editor h1 {
-    font-size: 30px;
-  }
-  .folder-editor .group-box {
-    margin: 18px 25px 0;
-    padding: 20px;
-  }
-  .folder-editor .roles {
-    margin-top: 20px;
-  }
-  .folder-editor .result {
-    padding-bottom: 25px;
-  }
-  .folder-editor .mailboxes,
-  .folder-editor .notice {
-    margin-right: 27px;
-  }
-  .folder-editor .folder-row {
-    grid-template-columns: 25px 26px 1fr 190px;
-  }
-  .folder-editor .table-head {
-    grid-template-columns: 1fr 190px;
-  }
-  .folder-editor .role-row {
-    grid-template-columns: 26px 1fr 190px;
-  }
-  .folder-editor .member {
-    gap: 28px;
-  }
-  .folder-editor .editor-footer {
-    flex-wrap: wrap;
-  }
-}
-@media (max-width: 599px) {
-  .folder-editor {
-    font-size: 13px;
-  }
-  .folder-editor .page {
-    padding: 20px 14px;
-  }
-  .folder-editor .editor-heading {
-    gap: 10px;
-    margin-bottom: 20px;
-  }
-  .folder-editor h1 {
-    font-size: 27px;
-  }
-  .folder-editor .editor-heading p {
-    font-size: 13px;
-    line-height: 21px;
-  }
-  .folder-editor .back {
-    padding-left: 0;
-  }
-  .folder-editor .editor-panels {
-    display: flex;
-    flex-direction: column;
-    gap: 16px;
-  }
-  .folder-editor .panel {
-    min-height: 0;
-  }
-  .folder-editor h2 {
-    font-size: 22px;
-  }
-  .folder-editor h3 {
-    font-size: 19px;
-  }
-  .folder-editor .intro,
-  .folder-editor .result .intro {
-    padding: 20px 18px 0;
-  }
-  .folder-editor .folders {
-    padding: 19px 18px 10px;
-  }
-  .folder-editor .table-head {
-    display: none;
-  }
-  .folder-editor .folder-row {
-    grid-template-columns: 21px 22px 1fr;
-    gap: 13px;
-    padding: 13px 0;
-  }
-  .folder-editor .folder-row .select-wrap {
-    grid-column: 3;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
-  .folder-editor .mobile-label {
-    display: block;
-    color: #536e94;
-    font-size: 12px;
-  }
-  .folder-editor select {
-    flex: 1;
-    min-width: 0;
-  }
-  .folder-editor .actions {
-    padding: 20px 18px;
-  }
-  .folder-editor .action p {
-    font-size: 12px;
-  }
-  .folder-editor .group-box {
-    margin: 17px 18px 0;
-    padding: 16px 12px;
-  }
-  .folder-editor .member {
-    gap: 15px;
-    padding: 12px 9px;
-    flex-wrap: wrap;
-  }
-  .folder-editor .member label {
-    margin-left: 0;
-  }
-  .folder-editor .primary {
-    padding: 4px 9px;
-    margin-left: 0;
-  }
-  .folder-editor .roles {
-    margin-top: 20px;
-    padding: 19px 18px;
-  }
-  .folder-editor .role-row {
-    grid-template-columns: 22px 1fr 125px;
-    gap: 10px;
-    padding-left: 0;
-  }
-  .folder-editor .mailboxes {
-    margin: 16px 18px 0;
-  }
-  .folder-editor .mailbox {
-    gap: 18px;
-  }
-  .folder-editor .notice {
-    margin: 20px 18px;
-    gap: 14px;
-    padding: 17px 13px;
-  }
-  .folder-editor .notice p {
-    font-size: 12px;
-  }
-  .folder-editor .editor-footer {
-    flex-direction: column;
-    align-items: stretch;
-    padding: 16px;
-    margin-top: 16px;
-  }
-  .folder-editor .validated p {
-    font-size: 12px;
-  }
-  .folder-editor .footer-buttons {
-    margin: 8px 0 0;
-    gap: 12px;
-    justify-content: flex-end;
-  }
-  .folder-editor .button {
-    padding: 0 20px;
-  }
-}
-
-.folder-editor {
-  margin-top: 24px;
-  color: var(--navy);
-}
-.folder-editor .editor-heading {
-  margin-bottom: 20px;
-}
-.folder-editor .editor-heading h2 {
-  font-size: 28px;
-}
-.folder-editor .editor-panels {
-  padding: 0;
-  margin: 0;
-  max-width: none;
-}
-.folder-editor .panel {
-  min-height: 0;
+  min-height: 40px;
+  padding: 9px 14px;
   border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #faf9f6;
 }
-.folder-editor .folder-row {
-  grid-template-columns: 20px minmax(0, 1fr) 110px;
-  gap: 12px;
-  padding: 12px 0;
+.folder-editor
+  button:not(.save):not([aria-selected="true"]):hover:not(:disabled) {
+  background: #f1eee7;
 }
-.folder-editor .folder-row label {
-  margin: 0;
-  overflow-wrap: anywhere;
+.folder-editor button:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
-.folder-editor .folder-row .local-alias {
-  grid-column: 2 / -1;
-  margin: 0;
-  font-size: 12px;
-  color: var(--muted);
-}
-.folder-editor .local-alias input {
-  margin-top: 4px;
+.folder-editor input:not([type="checkbox"]):not([type="radio"]),
+.folder-editor select {
+  display: block;
   width: 100%;
-}
-.folder-editor .check,
-.folder-editor .radio {
-  padding: 0;
-  min-height: 0;
-  flex-shrink: 0;
-}
-.folder-editor .select-wrap::after {
-  display: none;
+  min-width: 0;
+  min-height: 40px;
+  margin: 0;
+  border: 1px solid #dce4eb;
+  border-radius: 9px;
+  padding: 9px 10px;
+  background: #f7f9fa;
 }
 .folder-editor select {
   appearance: auto;
-  padding: 8px;
+  text-overflow: ellipsis;
+}
+.folder-editor input:focus-visible,
+.folder-editor button:focus-visible,
+.folder-editor select:focus-visible,
+.folder-editor summary:focus-visible,
+.folder-editor [role="tabpanel"]:focus-visible {
+  outline: 3px solid var(--navy);
+  outline-offset: 3px;
+}
+.folder-editor label {
+  font-weight: 400;
+  margin: 0;
+  min-width: 0;
+  font-size: 13px;
+}
+.folder-editor .editor-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 18px;
+}
+.folder-editor .editor-tabs button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border-radius: 24px;
+  padding-inline: 18px;
+}
+.folder-editor .editor-tabs button[aria-selected="true"],
+.folder-editor button.save {
+  color: #fff;
+  background: var(--accent-dark);
+  border-color: var(--accent-dark);
+}
+.folder-editor .editor-tabs button[aria-selected="true"] img {
+  filter: brightness(0) invert(1);
+}
+.folder-editor .editor-tabs img {
+  width: 18px;
+  height: 18px;
+}
+.folder-editor .editor-panels {
+  display: block;
+  min-width: 0;
+}
+.folder-editor .panel {
+  min-width: 0;
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 2px 8px #172f4610;
+}
+.folder-editor .intro {
+  padding: 22px 24px 0;
+}
+.folder-editor .folder-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 20px 24px;
+}
+.folder-editor .folder-search {
+  flex: 1 1 240px;
+  max-width: 520px;
+}
+.folder-editor .folder-search input {
+  background: #fff;
+}
+.folder-editor .sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.folder-editor .folder-table-head,
+.folder-editor .folder-row {
+  display: grid;
+  grid-template-columns:
+    22px minmax(0, 1.5fr) minmax(0, 0.8fr) minmax(0, 1.25fr)
+    minmax(0, 1.05fr);
+  gap: 16px;
+  align-items: start;
+}
+.folder-editor .folder-table-head {
+  padding: 12px 24px;
+  border-block: 1px solid #e9eef2;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
 }
 .folder-editor .folders {
-  padding-top: 12px;
+  padding: 0 24px;
 }
-.folder-editor .actions {
+.folder-editor .folder-row {
+  padding: 14px 0;
+  border-bottom: 1px solid #e9eef2;
+}
+.folder-editor .folder-row:last-child {
+  border-bottom: 0;
+}
+.folder-editor .folder-row.is-selected {
+  background: #f0f5fa;
+  box-shadow:
+    -10px 0 #f0f5fa,
+    10px 0 #f0f5fa;
+}
+.folder-editor .check,
+.folder-editor .radio {
+  appearance: auto;
+  accent-color: var(--accent-dark);
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  min-height: 0;
+  margin: 11px 0 0;
+  flex-shrink: 0;
+}
+.folder-editor .folder-name {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding-top: 9px;
+  font-size: 14px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.folder-editor .folder-name span {
+  min-width: 0;
+}
+.folder-editor .folder-icon {
+  width: 20px;
+  height: 20px;
+  object-fit: contain;
+  flex-shrink: 0;
+}
+.folder-editor .folder-name small {
   display: block;
+  margin-top: 5px;
+  font-size: 12px;
+  font-weight: 400;
+}
+.folder-editor .folder-destination,
+.folder-editor .folder-visibility,
+.folder-editor .select-wrap {
+  min-width: 0;
+}
+.folder-editor .field-caption {
+  display: none;
+}
+.folder-editor .local-alias {
+  border: 0;
+  padding: 0;
+  min-width: 0;
+  font-size: 12px;
+  margin-top: 8px;
+}
+.folder-editor .local-alias summary {
+  font-weight: 400;
+  cursor: pointer;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.folder-editor .local-alias label {
+  display: block;
+  margin-top: 8px;
+}
+.folder-editor .local-alias input {
+  margin-top: 5px !important;
+}
+.folder-editor .folder-empty {
+  padding: 20px 0;
+  color: var(--muted);
+}
+.folder-editor .folder-pagination {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 16px;
+  justify-content: space-between;
+  padding: 16px 24px;
+  border-top: 1px solid #e9eef2;
+  font-size: 13px;
+}
+.folder-editor .folder-pagination label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.folder-editor .folder-pagination select {
+  width: 72px;
+}
+.folder-editor .page-buttons {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.folder-editor .page-buttons button {
+  font-size: 22px;
+  line-height: 20px;
+  min-width: 40px;
 }
 .folder-editor .action-buttons {
   display: flex;
@@ -2328,103 +1870,277 @@ body[data-signed-in="true"][data-console-task="administration"] {
   gap: 8px;
 }
 .folder-editor .action-buttons button {
-  font-size: 12px;
-  padding: 8px;
+  font-size: 13px;
 }
-.folder-editor .group-box {
-  margin: 18px;
-  padding: 16px;
+.folder-editor .actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 16px;
+  border-top: 1px solid var(--line);
+  padding: 20px 24px;
 }
-.folder-editor .member {
-  gap: 12px;
-  overflow-wrap: anywhere;
+.folder-editor .selection-summary h3 {
+  font-size: 16px;
 }
-.folder-editor .member label {
+.folder-editor .selection-summary p {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+.folder-editor .actions > .description {
+  flex-basis: 100%;
   margin: 0;
+  font-size: 12px;
+}
+.folder-editor .group-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr);
+  gap: 32px;
+  padding: 24px;
 }
 .folder-editor .group-choice {
-  margin: 16px 25px 0;
-}
-.folder-editor .roles {
-  margin-top: 20px;
-}
-.folder-editor .role-row {
-  grid-template-columns: 1fr;
-  padding: 8px 0;
-  gap: 4px;
-}
-.folder-editor .mailboxes {
-  margin: 16px 18px;
-}
-.folder-editor .mailbox {
-  grid-template-columns: 35px 1fr;
-  gap: 12px;
-  padding: 10px 0;
-}
-.folder-editor .mailbox small {
   display: block;
-  font-weight: 400;
-  color: var(--muted);
+  font-weight: 600;
 }
-.folder-editor .notice {
-  margin: 18px;
-}
-.folder-editor .editor-footer {
-  flex-wrap: wrap;
-  padding: 16px;
-}
-.folder-editor .editor-status {
-  flex: 1;
-  min-width: 180px;
-  margin: 0;
-}
-.folder-editor .editor-status.error {
-  color: var(--danger);
-}
-.folder-editor input:focus-visible,
-.folder-editor button:focus-visible,
-.folder-editor select:focus-visible {
-  outline: 3px solid var(--navy);
-  outline-offset: 3px;
-}
-.folder-editor button.save {
-  background: var(--accent-dark);
-  border-color: var(--accent-dark);
-}
-@media (max-width: 1200px) {
-  .folder-editor .editor-panels {
-    grid-template-columns: 1fr;
-  }
-}
-@media (max-width: 599px) {
-  .folder-editor .footer-buttons {
-    flex-wrap: wrap;
-  }
-  .folder-editor .folder-row .select-wrap {
-    grid-column: auto;
-  }
-}
-.folder-editor .number {
-  background: var(--accent-dark);
-}
-.folder-editor .primary {
-  color: var(--accent-dark);
-}
-.folder-editor .local-alias summary {
-  cursor: pointer;
-  color: var(--muted);
-  font-weight: 400;
-}
-.folder-editor .local-alias label {
-  display: block;
+.folder-editor .group-choice select {
   margin-top: 8px;
 }
-/* Reviewed 12ui alignment kit: preserve its real role icons and accessible colors. */
+.folder-editor .group-box {
+  margin-top: 20px;
+  padding: 20px;
+  background: #fafbfc;
+  border: 1px solid #e3e9ef;
+  border-radius: 12px;
+}
+.folder-editor .field-label {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+.folder-editor .members-heading {
+  margin-top: 24px;
+}
+.folder-editor .member-list {
+  max-height: 340px;
+  overflow-y: auto;
+  padding: 3px;
+  margin-bottom: 16px;
+}
+.folder-editor .member {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 0;
+  border-bottom: 1px solid #e3e9ef;
+}
+.folder-editor .member .radio {
+  margin: 0;
+}
+.folder-editor .member label {
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+.folder-editor .primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border-radius: 16px;
+  background: #fbece5;
+  color: var(--accent-dark);
+  padding: 4px 8px;
+  font-size: 12px;
+}
+.folder-editor .role-list {
+  margin-top: 16px;
+}
+.folder-editor .role-row {
+  display: grid;
+  grid-template-columns: minmax(70px, 0.7fr) minmax(0, 1fr);
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid #e9eef2;
+  overflow-wrap: anywhere;
+}
+.folder-editor .roles p {
+  font-size: 13px;
+}
+.folder-editor .mailboxes {
+  padding: 12px 24px 24px;
+}
 .folder-editor .mailbox {
-  grid-template-columns: 35px 22px minmax(0, 1fr);
+  display: grid;
+  grid-template-columns: 32px 22px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  padding: 14px 0;
+  border-bottom: 1px solid #e9eef2;
+  overflow-wrap: anywhere;
 }
 .folder-editor .mailbox-icon {
   width: 22px;
   height: 22px;
   object-fit: contain;
+}
+.folder-editor .mailbox small {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 4px;
+}
+.folder-editor .number {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  background: var(--accent-dark);
+  color: #fff;
+  border-radius: 50%;
+}
+.folder-editor .mailboxes .local-alias {
+  margin: 12px 0 12px 20px;
+}
+.folder-editor .notice {
+  margin: 18px 0;
+  padding: 18px 20px;
+  background: #f0f5fa;
+  border: 1px solid #dce5ed;
+  border-radius: 10px;
+  overflow-wrap: anywhere;
+}
+.folder-editor .notice p {
+  margin: 8px 0 0;
+  color: var(--muted);
+}
+.folder-editor .result .notice {
+  margin: 0 24px 24px;
+}
+.folder-editor .editor-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-top: 14px;
+  padding: 18px 22px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #fffdf9;
+}
+.folder-editor .editor-status {
+  flex: 1 1 240px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+.folder-editor .editor-status.error {
+  color: var(--danger);
+}
+.folder-editor .footer-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+/* The editor is inside a narrower app shell, so respond to its width rather
+   than only the browser viewport. */
+@container (max-width: 760px) {
+  .folder-editor .folder-table-head {
+    display: none;
+  }
+  .folder-editor .folder-row {
+    grid-template-columns: 22px minmax(0, 1fr) minmax(0, 1fr);
+    gap: 12px;
+    padding: 18px 0;
+  }
+  .folder-editor .folder-name {
+    grid-column: 2 / -1;
+    padding-top: 6px;
+  }
+  .folder-editor .select-wrap {
+    grid-column: 2;
+  }
+  .folder-editor .folder-destination {
+    grid-column: 2;
+    grid-row: 3;
+  }
+  .folder-editor .folder-visibility {
+    grid-column: 3;
+    grid-row: 2;
+  }
+  .folder-editor .folder-destination {
+    grid-column: 2 / -1;
+  }
+  .folder-editor .field-caption {
+    display: block;
+    font-size: 12px;
+    margin-bottom: 6px;
+    color: var(--muted);
+  }
+  .folder-editor .group-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+@container (max-width: 460px) {
+  .folder-editor .intro,
+  .folder-editor .folder-toolbar {
+    padding: 16px 14px 0;
+  }
+  .folder-editor .folder-toolbar {
+    padding-bottom: 14px;
+  }
+  .folder-editor .folders {
+    padding: 0 14px;
+  }
+  .folder-editor .editor-tabs {
+    gap: 6px;
+  }
+  .folder-editor .editor-tabs button {
+    padding: 9px 12px;
+    font-size: 13px;
+  }
+  .folder-editor .editor-tabs img {
+    display: none;
+  }
+  .folder-editor .folder-row {
+    grid-template-columns: 20px minmax(0, 1fr);
+    gap: 10px;
+  }
+  .folder-editor .select-wrap,
+  .folder-editor .folder-destination,
+  .folder-editor .folder-visibility {
+    grid-column: 2;
+    grid-row: auto;
+  }
+  .folder-editor .folder-pagination {
+    padding: 14px;
+    gap: 12px;
+  }
+  .folder-editor .page-buttons {
+    width: 100%;
+    justify-content: space-between;
+  }
+  .folder-editor .actions,
+  .folder-editor .group-layout,
+  .folder-editor .mailboxes {
+    padding: 16px 14px;
+  }
+  .folder-editor .group-box {
+    padding: 14px;
+  }
+  .folder-editor .member {
+    flex-wrap: wrap;
+  }
+  .folder-editor .result .notice {
+    margin: 0 14px 16px;
+  }
+  .folder-editor .editor-footer {
+    padding: 14px;
+  }
+  .folder-editor .footer-buttons {
+    width: 100%;
+  }
+  .folder-editor .footer-buttons button.save {
+    flex: 1;
+  }
 }
