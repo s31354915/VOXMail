@@ -426,6 +426,7 @@ func (s *Service) syncAccountStarted(ctx context.Context, account store.Account,
 		close(done)
 		s.mu.Unlock()
 	}()
+	previous, previousErr := s.Store.LatestSyncRun(ctx, account.ID, false)
 	runID, err := s.Store.BeginSyncRun(ctx, account.ID, kind)
 	if err != nil {
 		return err
@@ -445,6 +446,26 @@ func (s *Service) syncAccountStarted(ctx context.Context, account store.Account,
 	root := filepath.Join(s.Root, "mail", account.ID)
 	if err := os.MkdirAll(root, 0700); err != nil {
 		return err
+	}
+	// Recover complete files on every failed exit, including cancellation after
+	// the download succeeded but before/during indexing. Keep account ownership
+	// until recovery finishes so a new sync cannot race this scan.
+	defer func() {
+		if retErr == nil || s.Index == nil {
+			return
+		}
+		recoveryCtx, recoveryCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Minute)
+		defer recoveryCancel()
+		if indexErr := s.Index.IndexAvailable(recoveryCtx, account.ID, root); indexErr != nil {
+			retErr = errors.Join(retErr, operation.Wrap("mailindex", "partial_sync", operation.MailIndex, indexErr))
+		}
+	}()
+	// A hard process/container stop cannot execute deferred recovery. Import its
+	// completed Maildir files before attempting another network connection.
+	if s.Index != nil && previousErr == nil && !previous.Success {
+		if err := s.Index.IndexAvailable(ctx, account.ID, root); err != nil {
+			return operation.Wrap("mailindex", "recover_sync", operation.MailIndex, err)
+		}
 	}
 	if s.EndpointResolver == nil {
 		return fmt.Errorf("IMAP endpoint resolver is required")
@@ -511,17 +532,12 @@ func (s *Service) syncAccountStarted(ctx context.Context, account store.Account,
 	}
 	result, err := s.Runner.SyncChannels(ctx, configPath, channels...)
 	if err != nil {
-		// mbsync can download complete messages before failing. Import those
-		// files without retention, stale-row purging, remote reconciliation,
-		// or acknowledging mutations. Keep the original failure durable.
-		// Use the account context so shutdown/deletion still stops this work.
-		if s.Index != nil {
-			if indexErr := s.Index.IndexAvailable(ctx, account.ID, root); indexErr != nil {
-				return errors.Join(err, operation.Wrap("mailindex", "partial_sync", operation.MailIndex, indexErr))
-			}
-		}
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	changed = result.Changed
 	// Retry retained folders before indexing/reconciliation can refresh flags.
 	// Import downloaded mail even when a retry fails, then report that failure.

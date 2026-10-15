@@ -16,9 +16,10 @@ import (
 )
 
 func TestFailedSyncIndexesDownloadedMailWithoutReconciliation(t *testing.T) {
-	for _, mode := range []string{"timeout", "failure", "index-failure"} {
+	for _, mode := range []string{"timeout", "failure", "index-failure", "download-canceled", "index-canceled", "restart-offline"} {
 		t.Run(mode, func(t *testing.T) {
-			ctx := context.Background()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 			db, err := store.Open(filepath.Join(t.TempDir(), "mail.db"))
 			if err != nil {
 				t.Fatal(err)
@@ -34,6 +35,10 @@ func TestFailedSyncIndexesDownloadedMailWithoutReconciliation(t *testing.T) {
 			cutoff := "2026-01-01T00:00:00Z"
 			retention := 1
 			account := store.Account{ID: "a", UserID: "u", CanonicalName: "Mail", Email: "u@example.com", SenderName: "User", IMAPHost: "imap.example", IMAPUser: "u", IMAPPassword: "p", SMTPHost: "smtp.example", SMTPUser: "u", SMTPPassword: "p", FolderMap: `{}`, InitialCutoff: &cutoff, RetentionDays: &retention}
+			if mode == "index-canceled" {
+				account.InitialCutoff = nil
+				account.RetentionDays = nil
+			}
 			if err := db.SaveAccount(ctx, box, account); err != nil {
 				t.Fatal(err)
 			}
@@ -64,8 +69,10 @@ root=$(awk '$1 == "Path" {gsub(/"/, "", $2); print $2; exit}' "$2")
 rm "$root/Inbox/new/previous"
 printf '%s\n' 'From: sender@example.com' 'To: u@example.com' 'Subject: downloaded before failure' 'Message-ID: <partial@example.com>' 'Date: Thu, 01 Jan 2020 00:00:00 +0000' '' 'Downloaded body remains readable.' > "$root/Inbox/new/downloaded"
 `
-			if mode == "timeout" {
+			if mode == "timeout" || mode == "download-canceled" {
 				script += "exec sleep 30\n"
+			} else if mode == "index-canceled" {
+				script += "exit 0\n"
 			} else {
 				script += "echo 'fixture connection lost' >&2\nexit 7\n"
 			}
@@ -82,7 +89,67 @@ printf '%s\n' 'From: sender@example.com' 'To: u@example.com' 'Subject: downloade
 			if mode == "index-failure" {
 				service.Index = &mailindex.Indexer{Store: unavailableIndexStore{IndexStore: db, err: indexFailure}}
 			}
+			if mode == "index-canceled" {
+				service.Index = &mailindex.Indexer{Store: &cancelOnceIndexStore{IndexStore: db, cancel: cancel}}
+			}
+			if mode == "download-canceled" {
+				go func(watchCtx context.Context) {
+					timer := time.NewTimer(3 * time.Second)
+					defer timer.Stop()
+					ticker := time.NewTicker(10 * time.Millisecond)
+					defer ticker.Stop()
+					for {
+						select {
+						case <-watchCtx.Done():
+							return
+						case <-timer.C:
+							cancel()
+							return
+						case <-ticker.C:
+							if _, err := os.Stat(filepath.Join(folder, "downloaded")); err == nil {
+								cancel()
+								return
+							}
+						}
+					}
+				}(ctx)
+			}
+
+			if mode == "restart-offline" {
+				if _, err := db.BeginSyncRun(ctx, account.ID, "manual"); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := db.InterruptSyncRuns(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(previousPath); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(folder, "downloaded"), []byte("From: sender@example.com\nSubject: downloaded before failure\n\nDownloaded body remains readable."), 0600); err != nil {
+					t.Fatal(err)
+				}
+				service.EndpointResolver = func(ctx context.Context, _ string, _ int) (string, error) {
+					messages, err := db.ListMail(ctx, "u", false)
+					if err != nil || len(messages) != 2 {
+						t.Errorf("local recovery must finish before network access: messages=%d err=%v", len(messages), err)
+					}
+					return "", errors.New("fixture connection lost")
+				}
+			}
+			// A file still in Maildir tmp is an incomplete download, not an email.
+			tmpDir := filepath.Join(mailRoot, "Inbox", "tmp")
+			if err := os.MkdirAll(tmpDir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(tmpDir, "unfinished"), []byte("Subject: incomplete\n\npartial body"), 0600); err != nil {
+				t.Fatal(err)
+			}
 			err = service.SyncAll(ctx)
+			// Inspect durable recovery using a live context after caller cancellation.
+			ctx = context.Background()
+			if (mode == "download-canceled" || mode == "index-canceled") && !errors.Is(err, context.Canceled) {
+				t.Fatalf("error=%v, want cancellation", err)
+			}
 			if mode == "index-failure" {
 				if !errors.Is(err, indexFailure) || !strings.Contains(err.Error(), "fixture connection lost") {
 					t.Fatalf("error=%v, want both runner and index failures", err)
@@ -96,7 +163,7 @@ printf '%s\n' 'From: sender@example.com' 'To: u@example.com' 'Subject: downloade
 			if mode == "timeout" && !errors.Is(err, context.DeadlineExceeded) {
 				t.Fatalf("error=%v, want deadline", err)
 			}
-			if mode == "failure" && (err == nil || !strings.Contains(err.Error(), "fixture connection lost")) {
+			if (mode == "failure" || mode == "restart-offline") && (err == nil || !strings.Contains(err.Error(), "fixture connection lost")) {
 				t.Fatalf("error=%v, want original failure", err)
 			}
 			messages, err := db.ListMail(ctx, "u", false)
@@ -162,4 +229,20 @@ func TestPartialIndexHonorsCancellation(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error=%v, want cancellation before store access", err)
 	}
+}
+
+// Cancel the first indexing attempt after mbsync has returned successfully.
+// The recovery scan must use a fresh context and retry that same file.
+type cancelOnceIndexStore struct {
+	mailindex.IndexStore
+	cancel context.CancelFunc
+}
+
+func (s *cancelOnceIndexStore) FindMailIndex(ctx context.Context, account, path string) (store.MailIndexRecord, error) {
+	if s.cancel != nil {
+		s.cancel()
+		s.cancel = nil
+		return store.MailIndexRecord{}, ctx.Err()
+	}
+	return s.IndexStore.FindMailIndex(ctx, account, path)
 }

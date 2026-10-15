@@ -71,6 +71,8 @@ func (r Runner) run(ctx context.Context, account string, args ...string) (Result
 	if category == operation.ProcessExit {
 		lower := strings.ToLower(string(output))
 		switch {
+		case strings.Contains(lower, "imap tunnel inactivity timeout"):
+			category = operation.Timeout
 		case strings.Contains(lower, "authentication failed"), strings.Contains(lower, "authenticationfailed"), strings.Contains(lower, "login failed"):
 			category = operation.Authentication
 		case strings.Contains(lower, "certificate verification failed"), strings.Contains(lower, "ssl error"), strings.Contains(lower, "tls handshake"):

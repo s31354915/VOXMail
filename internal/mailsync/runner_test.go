@@ -2,6 +2,7 @@ package mailsync
 
 import (
 	"context"
+	"github.com/voxmail/voxmail/internal/operation"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -152,5 +153,16 @@ func TestSyncDefaultBinaryWithoutImplicitTimeout(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed > 20*time.Second {
 		t.Fatalf("default timeout applied lazily and took too long (%v)", elapsed)
+	}
+}
+
+func TestTunnelIdleTimeoutIsRecordedAsTimeout(t *testing.T) {
+	shim := filepath.Join(t.TempDir(), "mbsync")
+	if err := os.WriteFile(shim, []byte("#!/bin/sh\necho 'proxy: IMAP tunnel inactivity timeout' >&2\nexit 1\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	_, err := (Runner{Binary: shim}).Sync(context.Background(), "config", "home")
+	if operation.Classify(err) != operation.Timeout {
+		t.Fatalf("error = %v, want timeout category", err)
 	}
 }

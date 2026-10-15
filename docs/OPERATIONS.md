@@ -462,15 +462,27 @@ its schema is not backward-compatible.
 
 ## mbsync safety model
 
-If mbsync fails or reaches an explicitly configured runner timeout after
-receiving messages, VOXMail indexes complete files already in the Maildir and
-keeps the sync marked failed with its original error. This partial import does
-not apply retention or the initial cutoff, purge missing-file index records,
-reconcile remote identities, or acknowledge queued mutations. A later successful
-sync performs normal reconciliation. Application shutdown, account deletion,
-and explicit sync cancellation also stop indexing; downloaded files remain on
-disk for a subsequent run. If indexing itself fails, both errors appear in the
-durable sync outcome.
+The fixed-address `voxmail-connect` tunnel closes the socket and both local
+pipes when either copy direction ends, so a disconnected provider cannot leave
+it waiting indefinitely on mbsync's stdin. A five-minute inactivity watchdog
+tracks successfully transferred bytes in either direction. Active transfers can
+continue for any duration; this is not an overall initial-import deadline.
+Tunnel inactivity is recorded as a timeout in the sync outcome.
+
+After a failed or canceled sync, VOXMail indexes complete files already in
+Maildir `cur` and `new`, including when cancellation happens after downloading
+or during indexing. Incomplete files in `tmp` are ignored. Recovery uses a fresh
+context with a five-minute budget, retains account ownership until it finishes,
+and keeps the run marked failed with its original error. This partial import
+does not apply retention or the initial cutoff, purge missing-file index records,
+reconcile remote identities, or acknowledge queued mutations. If recovery also
+fails, both errors appear in the durable sync outcome.
+
+A hard process/container stop cannot run cleanup. On restart, the abandoned run
+is marked interrupted; the next account sync indexes available local mail before
+trying the provider again. The same recovery applies after any unsuccessful run,
+so files left by a recovery timeout remain eligible on retry, even if the provider
+is offline. A later successful sync performs normal reconciliation.
 
 VOXMail renders one configuration and channel per account. Routine sync uses
 UID state, `Sync All`, `Create Slave`, `Remove None`, and `Expunge None`.
