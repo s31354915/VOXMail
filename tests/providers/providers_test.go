@@ -205,7 +205,7 @@ func TestRealMbsyncDiscoversFoldersPreservesAttachmentsAndChecksEpoch(t *testing
 			t.Fatal(err)
 		}
 		for _, identity := range remoteMessages {
-			if err := db.UpdateMailIdentity(ctx, "fixture", local, identity.MessageID, identity.UID, validity, identity.Flags); err != nil {
+			if err := db.UpdateMailIdentity(ctx, "fixture", local, identity.MessageID, identity.UID, validity, identity.Flags, false); err != nil {
 				t.Fatal(err)
 			}
 		}
