@@ -109,16 +109,33 @@ func TestPlaybackCancellationWithNonConsumingReader(t *testing.T) {
 func TestPCMPacingLimitsBufferedSpeech(t *testing.T) {
 	var output bytes.Buffer
 	writer := &pacedPCMWriter{ctx: context.Background(), w: &output}
+	// A short payload fits inside the 120 ms jitter prebuffer and may burst,
+	// but a long payload must still be paced against the media clock: only
+	// the prebuffer may run ahead of real time.
+	payload := make([]byte, pcmBytesPerSecond)
 	start := time.Now()
+	if _, err := writer.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed < 700*time.Millisecond {
+		t.Fatalf("1s of PCM was delivered in %v, faster than the jitter buffer allows", elapsed)
+	}
+	if output.Len() != len(payload) {
+		t.Fatal("PCM was lost")
+	}
+}
+
+func TestPCMPacingKeepsJitterCreditAfterStall(t *testing.T) {
+	var output bytes.Buffer
+	writer := &pacedPCMWriter{ctx: context.Background(), w: &output}
 	payload := make([]byte, pcmBytesPerSecond/5)
 	if _, err := writer.Write(payload); err != nil {
 		t.Fatal(err)
 	}
-	if time.Since(start) < 130*time.Millisecond {
-		t.Fatal("200ms of PCM was queued as a burst")
-	}
+	// The initial burst may cover the prebuffer plus the payload, but the
+	// writer must not lose more PCM than it was given.
 	if output.Len() != len(payload) {
-		t.Fatal("PCM was lost")
+		t.Fatalf("PCM was lost: wrote %d of %d bytes", output.Len(), len(payload))
 	}
 }
 

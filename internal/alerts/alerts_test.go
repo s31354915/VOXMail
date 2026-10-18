@@ -2,6 +2,7 @@ package alerts
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
 	"sync"
@@ -237,5 +238,40 @@ func TestTestAlertRequiresPhone(t *testing.T) {
 	bridge.mu.Unlock()
 	if before != 0 {
 		t.Fatalf("expected no dials, got %d", before)
+	}
+}
+
+func TestAlertAttemptCapStopsReDialing(t *testing.T) {
+	db := seedAlertStore(t)
+	bridge := &fakeBridge{err: errors.New("dial failed")}
+	s := &Service{Store: db, Bridge: bridge, Log: slog.Default(), MinDelay: time.Nanosecond}
+	ctx := context.Background()
+	const cap = 3
+	for round := 0; round < cap; round++ {
+		if err := s.round(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bridge.mu.Lock()
+	dials := len(bridge.dials)
+	bridge.mu.Unlock()
+	if dials != cap {
+		t.Fatalf("expected %d dials before the cap, got %d", cap, dials)
+	}
+	if err := s.round(ctx); err != nil {
+		t.Fatal(err)
+	}
+	bridge.mu.Lock()
+	dials = len(bridge.dials)
+	bridge.mu.Unlock()
+	if dials != cap {
+		t.Fatalf("attempt cap did not stop further dials, got %d dials", dials)
+	}
+	var attempts int
+	if err := db.DB.QueryRowContext(ctx, `SELECT alert_attempts FROM mail_messages WHERE path='/m/a1/1'`).Scan(&attempts); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != cap {
+		t.Fatalf("alert_attempts=%d, want %d", attempts, cap)
 	}
 }

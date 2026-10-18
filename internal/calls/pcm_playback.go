@@ -10,10 +10,17 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const pcmBytesPerSecond = 8000 * 2
+const (
+	pcmBytesPerSecond = 8000 * 2
+	// pcmJitterBuffer is the wall-clock credit the writer keeps ahead of the
+	// media clock when pacing begins or after a stall.
+	pcmJitterBuffer = 120 * time.Millisecond
+)
 
-// Keep a small 60 ms prebuffer ahead of the media clock, rather than filling
-// a multi-second kernel FIFO. This bounds stale speech after barge-in.
+// Keep a small jitter prebuffer ahead of the media clock, rather than filling
+// a multi-second kernel FIFO. The 120 ms credit absorbs scheduler and CPU
+// contention stalls (Piper, Whisper, and ffmpeg sharing one box) so the FIFO
+// runs dry far less often and speech does not stutter.
 type pacedPCMWriter struct {
 	ctx  context.Context
 	w    io.Writer
@@ -23,7 +30,7 @@ type pacedPCMWriter struct {
 func (w *pacedPCMWriter) Write(p []byte) (int, error) {
 	sent := 0
 	if w.next.IsZero() {
-		w.next = time.Now().Add(-40 * time.Millisecond)
+		w.next = time.Now().Add(-pcmJitterBuffer)
 	}
 	for len(p) > 0 {
 		if err := waitPCM(w.ctx, time.Until(w.next)); err != nil {
@@ -35,9 +42,12 @@ func (w *pacedPCMWriter) Write(p []byte) (int, error) {
 		sent += n
 		p = p[n:]
 		// Preserve the timeline across normal scheduler latency. Rebase only
-		// after a substantial stall so we never send a large catch-up burst.
-		if start.Sub(w.next) > 100*time.Millisecond {
-			w.next = start
+		// after a real stall that exhausted the jitter credit, restoring the
+		// credit so audio does not gap right after the stall. The threshold
+		// must exceed the credit itself, or every paced write would re-fund
+		// the credit and defeat the pacing entirely.
+		if start.Sub(w.next) > pcmJitterBuffer+100*time.Millisecond {
+			w.next = start.Add(-pcmJitterBuffer)
 		}
 		w.next = w.next.Add(time.Duration(n) * time.Second / pcmBytesPerSecond)
 		if err != nil {
@@ -88,7 +98,10 @@ func drainPCM(ctx context.Context, pipe *os.File) error {
 			return fmt.Errorf("PCM drain: %w", ioctlErr)
 		}
 		if pending == 0 {
-			return waitPCM(ctx, 240*time.Millisecond)
+			// The FIFO is empty, but baresip's decode and device pipeline can
+			// still hold more than this; wait long enough that the tail of a
+			// prompt is not clipped by the next prompt or a hangup.
+			return waitPCM(ctx, 500*time.Millisecond)
 		}
 		if err := waitPCM(ctx, 10*time.Millisecond); err != nil {
 			return err

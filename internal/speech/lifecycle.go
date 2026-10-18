@@ -22,7 +22,7 @@ const (
 	BundledPromptVoice          = "en_US-hfc_male-medium"
 	StaticWelcomeText           = "Welcome to VOXMail. Please enter your PIN, then press pound."
 	StaticMainText              = "You are signed in. Press 1 for email, 2 for settings, or 3 for information and instructions."
-	staticPromptManifestVersion = 5
+	staticPromptManifestVersion = 6
 )
 
 type StaticPromptManifest struct {
@@ -419,8 +419,9 @@ func (p *RuntimePool) Activate(voice string, speed int) (*Runtime, *Lease) {
 
 func SpeedExtra(speed int) []string {
 	speed = normalizeSpeed(speed)
-	// Piper's length_scale is inverse speed; 3 is the neutral middle setting.
-	return []string{"--length_scale", fmt.Sprintf("%.2f", 1.25-0.125*float64(speed))}
+	// Piper's length_scale is inverse speech rate: speed 3 is Piper's own
+	// natural pace (length_scale 1.0), 1 is slowest and 5 is fastest.
+	return []string{"--length_scale", fmt.Sprintf("%.2f", 1.375-0.125*float64(speed))}
 }
 
 func normalizeSpeed(speed int) int {
