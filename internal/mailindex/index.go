@@ -105,7 +105,7 @@ func (i Indexer) index(ctx context.Context, accountID, root string, purge bool) 
 		if err != nil {
 			return nil
 		}
-		messageID, err := i.Store.UpsertMailIndex(ctx, store.MailIndexInput{AccountID: accountID, Folder: message.Folder, Path: message.Path, MessageID: message.MessageID, Sender: message.From, Recipients: message.To, Cc: message.Cc, Subject: message.Subject, Date: message.Date, DateUTC: store.NormalizeMessageDate(message.Date), Read: message.Read, Attachments: len(message.Attachments), UpdatedAt: modTime(info), ScanID: scanID, SourceSize: info.Size()})
+		messageID, err := i.Store.UpsertMailIndex(ctx, store.MailIndexInput{AccountID: accountID, Folder: message.Folder, Path: message.Path, MessageID: message.MessageID, Sender: message.From, Recipients: message.To, Cc: message.Cc, Subject: message.Subject, Date: message.Date, DateUTC: store.NormalizeMessageDate(message.Date), Read: message.Read, Attachments: len(message.Attachments), UpdatedAt: modTime(info), ScanID: scanID, SourceSize: info.Size(), PathIsLive: func(candidate string) bool { _, statErr := os.Stat(candidate); return statErr == nil }})
 		if err != nil {
 			return err
 		}

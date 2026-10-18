@@ -95,7 +95,7 @@ func TestUpsertMailIndexRehomesDuplicateRow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	again, err := db.UpsertMailIndex(ctx, MailIndexInput{AccountID: "a11", Folder: "Inbox", Path: "/new:2,S", MessageID: "<m@example.com>", Subject: "Hi", Read: true, UpdatedAt: "t2", ScanID: "s2", SourceSize: 10})
+	again, err := db.UpsertMailIndex(ctx, MailIndexInput{AccountID: "a11", Folder: "Inbox", Path: "/new:2,S", MessageID: "<m@example.com>", Subject: "Hi", Read: true, UpdatedAt: "t2", ScanID: "s2", SourceSize: 10, PathIsLive: func(candidate string) bool { return candidate != "/old:2," }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,5 +112,33 @@ func TestUpsertMailIndexRehomesDuplicateRow(t *testing.T) {
 	}
 	if path != "/new:2,S" || read != 1 {
 		t.Fatalf("row not re-homed: path=%q read=%d", path, read)
+	}
+}
+
+func TestUpsertMailIndexKeepsLiveDuplicateCopies(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "mail.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	seedReadStateAccount(t, db, "a12", "u12")
+	first, err := db.UpsertMailIndex(ctx, MailIndexInput{AccountID: "a12", Folder: "Inbox", Path: "/copy-a:2,", MessageID: "<m@example.com>", Subject: "Hi", UpdatedAt: "t1", ScanID: "s1", SourceSize: 10, PathIsLive: func(string) bool { return true }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := db.UpsertMailIndex(ctx, MailIndexInput{AccountID: "a12", Folder: "Inbox", Path: "/copy-b:2,", MessageID: "<m@example.com>", Subject: "Hi", UpdatedAt: "t2", ScanID: "s2", SourceSize: 10, PathIsLive: func(string) bool { return true }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second == first {
+		t.Fatalf("live duplicate collapsed onto one row: %d", second)
+	}
+	var count int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM mail_messages WHERE message_id='<m@example.com>'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("expected one row per live copy, got %d", count)
 	}
 }
