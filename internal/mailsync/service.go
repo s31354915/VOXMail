@@ -2,6 +2,7 @@ package mailsync
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -156,7 +157,7 @@ func (s *Service) SyncDue(ctx context.Context) error {
 		return err
 	}
 	now := s.currentTime()
-	var syncErr error
+	due := make([]store.Account, 0, len(accounts))
 	for _, account := range accounts {
 		interval := time.Duration(account.SyncIntervalMinutes) * time.Minute
 		if interval <= 0 {
@@ -175,16 +176,36 @@ func (s *Service) SyncDue(ctx context.Context) error {
 		if run, err := s.Store.LatestSyncRun(ctx, account.ID, false); err == nil && failedRunInBackoff(run, now) {
 			continue
 		}
-		due := last.IsZero() || now.Sub(last) >= interval
-		if due {
+		if last.IsZero() || now.Sub(last) >= interval {
+			due = append(due, account)
+		}
+	}
+	// Due accounts used to sync strictly sequentially, so one slow provider
+	// held every other account's schedule hostage. Run them concurrently with
+	// a small bound; per-account ownership is still enforced by the busy map
+	// inside syncAccount.
+	const maxConcurrentSyncs = 4
+	sem := make(chan struct{}, maxConcurrentSyncs)
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var syncErr error
+	for _, account := range due {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(account store.Account) {
+			defer wg.Done()
+			defer func() { <-sem }()
 			if err := s.syncAccount(ctx, account, s.nextKind(ctx, account)); err != nil {
 				if s.Log != nil {
 					s.Log.Error("mail sync failed", "account", account.ID, "error", err)
 				}
+				errMu.Lock()
 				syncErr = errors.Join(syncErr, fmt.Errorf("account %s: %w", account.ID, err))
+				errMu.Unlock()
 			}
-		}
+		}(account)
 	}
+	wg.Wait()
 	return syncErr
 }
 
@@ -192,11 +213,13 @@ func failedRunInBackoff(run store.SyncRun, now time.Time) bool {
 	if run.Success {
 		return false
 	}
-	stamp := run.FinishedAt
-	if strings.TrimSpace(stamp) == "" {
-		stamp = run.StartedAt
+	// An unparseable FinishedAt used to defeat the backoff entirely, so a
+	// failing account retried on every scheduler tick. Fall back to
+	// StartedAt before giving up on the timestamp.
+	parsed, err := time.Parse(time.RFC3339Nano, run.FinishedAt)
+	if err != nil {
+		parsed, err = time.Parse(time.RFC3339Nano, run.StartedAt)
 	}
-	parsed, err := time.Parse(time.RFC3339Nano, stamp)
 	if err != nil {
 		return false
 	}
@@ -356,7 +379,13 @@ func (s *Service) StopAccount(ctx context.Context, accountID string) error {
 func (s *Service) nextKind(ctx context.Context, account store.Account) string {
 	run, err := s.Store.LatestSyncRun(ctx, account.ID, true)
 	if err != nil {
-		return "initial"
+		if errors.Is(err, sql.ErrNoRows) {
+			return "initial"
+		}
+		// A transient store failure must not downgrade a mature account to
+		// an initial sync: the initial cutoff prune would then apply to old
+		// mail again. Fall back to the safest ordinary kind instead.
+		return "incremental"
 	}
 	if run.Kind == "initial" {
 		return "incremental"

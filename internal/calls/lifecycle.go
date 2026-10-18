@@ -210,6 +210,7 @@ func (s *Service) closeCall(message bridge.Message) {
 		s.reportAlertOutcome(sess, AlertFailed)
 	}
 	s.releaseSessionSpeech(sess)
+	s.dropRemoteConnection(sess)
 	if s.Log != nil {
 		s.Log.Info("call closed", "call_id", message.CallID, "reason", message.Reason)
 	}

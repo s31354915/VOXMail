@@ -234,7 +234,7 @@ func (s *Service) streamSpeechChunks(sess *session, dir string, chunks []string,
 
 	for range chunks {
 		s.mu.Lock()
-		stale := sess.Closed || sess.playSequence != startSequence
+		stale := sess.Closed || sess.playSequence != startSequence || sess.playInterrupted
 		s.mu.Unlock()
 		if stale {
 			return
@@ -249,8 +249,8 @@ func (s *Service) streamSpeechChunks(sess *session, dir string, chunks []string,
 		case <-workerCtx.Done():
 			return
 		}
-		free <- item.slot
 		if item.err != nil {
+			free <- item.slot
 			if s.Log != nil {
 				s.Log.Warn("email body chunk synthesis failed", "error", item.err)
 			}
@@ -262,6 +262,10 @@ func (s *Service) streamSpeechChunks(sess *session, dir string, chunks []string,
 		err := s.playPrompt(sess, func(playCtx context.Context) error {
 			return play(playCtx, paths[item.slot])
 		})
+		// The slot returns only after its chunk finished playing. Handing it
+		// back earlier let the worker reuse the file while its audio was
+		// still on the line, so a long email could play the wrong chunk.
+		free <- item.slot
 		s.mu.Lock()
 		// Adopt the sequence our own play just produced (or a newer prompt
 		// replaced); the next iteration compares against the latest state,

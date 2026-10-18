@@ -281,7 +281,7 @@ func main() {
 			Runtime: speechRuntime,
 			Whisper: speech.Whisper{Binary: cfg.STTBinary, Model: cfg.STTModel},
 			Dir:     cfg.RecordingsDir,
-			Window:  15 * time.Second,
+			Window:  30 * time.Second,
 		},
 		Secrets:              secrets,
 		IMAPEndpointResolver: mailsync.CheckPublicIMAPEndpoint,

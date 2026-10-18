@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/voxmail/voxmail/internal/bridge"
+	remoteimap "github.com/voxmail/voxmail/internal/imap"
 	"github.com/voxmail/voxmail/internal/ivr"
 	"github.com/voxmail/voxmail/internal/keypad"
 	"github.com/voxmail/voxmail/internal/mailer"
@@ -60,6 +61,7 @@ type Service struct {
 
 	pinMu        sync.Mutex
 	pinLock      map[string]time.Time
+	pinNoLock    map[string]time.Time
 	taskMu       sync.Mutex
 	taskWG       sync.WaitGroup
 	tasksClosed  bool
@@ -93,6 +95,10 @@ func (s *Service) startDelayedTask(delay time.Duration, fn func()) context.Cance
 	parent := s.baseContext()
 	ctx, cancel := context.WithCancel(parent)
 	s.startTask(func() {
+		// Release the timer's context whether the timer fires, is canceled
+		// early, or the service shuts down. Without this the context lived
+		// until service shutdown and leaked for every completed task.
+		defer cancel()
 		timer := time.NewTimer(delay)
 		defer timer.Stop()
 		select {
@@ -425,7 +431,26 @@ type session struct {
 	promptMu             sync.Mutex
 	playCancel           context.CancelFunc
 	playSequence         uint64
-	greetAttempts        int
+	// playInterrupted is set when a keypress cancels the audio that is
+	// playing, and cleared when the next prompt starts. Handlers check it to
+	// skip what would follow the interrupted audio.
+	playInterrupted bool
+	greetAttempts   int
+	// PendingAttachmentRemove tracks the two-press confirmation before an
+	// attachment is removed in attachment_edit.
+	PendingAttachmentRemove bool
+	// PendingCancelConfirm tracks the two-press confirmation before the
+	// review menu's cancel discards the draft.
+	PendingCancelConfirm bool
+	// RemoteMu guards the per-call reuse of one authenticated IMAP
+	// connection for remote mutations (seen flags, moves). The connection is
+	// closed when the call tears down or when a mutation reports an error.
+	RemoteMu        sync.Mutex
+	RemoteConn      *remoteimap.Client
+	RemoteAccountID string
+	// FolderRoleCache memoizes role lookups for this call so repeated
+	// delete/move/send operations stop re-querying the store.
+	FolderRoleCache map[string]store.FolderRole
 }
 
 type draft struct {
@@ -556,6 +581,42 @@ func (s *Service) prompt(sess *session, text string) error {
 	})
 }
 
+// promptMenu speaks a menu prompt at the menu voice even while the session is
+// in an email state, where promptRuntime would read it at email speed and
+// burn airtime on a long menu.
+func (s *Service) promptMenu(sess *session, text string) error {
+	if s == nil || sess == nil {
+		return nil
+	}
+	if s.promptFn != nil {
+		return s.promptFn(sess, text)
+	}
+	if s.Media == nil || sess.TxPath == "" {
+		return nil
+	}
+	s.mu.Lock()
+	runtime := sess.Runtime
+	s.mu.Unlock()
+	if runtime == nil {
+		runtime = s.promptRuntime(sess)
+	}
+	return s.playPrompt(sess, func(ctx context.Context) error {
+		return s.Media.PlayWithRuntimeForUser(ctx, runtime, sess.UserID, sess.TxPath, text)
+	})
+}
+
+// wasInterrupted reports whether a keypress canceled the audio that just
+// finished playing, so a handler can skip what would follow it (the menu
+// after an email body) and let the pressed key take effect right away.
+func (s *Service) wasInterrupted(sess *session) bool {
+	if s == nil || sess == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return sess.playInterrupted
+}
+
 // All greetings, menus and email speech share cancellation and FIFO ownership.
 // Synthesis has its own bound; playback must not inherit the 45s dial timeout.
 func (s *Service) playPrompt(sess *session, play func(context.Context) error) error {
@@ -567,6 +628,7 @@ func (s *Service) playPrompt(sess *session, play func(context.Context) error) er
 	sess.playSequence++
 	sequence := sess.playSequence
 	sess.playCancel = cancel
+	sess.playInterrupted = false
 	s.beginMediaLocked(sess)
 	s.mu.Unlock()
 	sess.promptMu.Lock()
@@ -614,6 +676,7 @@ func (s *Service) interruptPrompt(callID string) {
 	var cancel context.CancelFunc
 	if sess != nil && !sess.Closed {
 		cancel = sess.playCancel
+		sess.playInterrupted = true
 	}
 	s.mu.Unlock()
 	if cancel != nil {
@@ -696,8 +759,6 @@ func menuPrompt(state string) string {
 		return "Press 0 for all unread mail, choose an account, press 9 for more if available, or press pound to go back."
 	case "account_menu":
 		return "Press 1 to listen to mail, 2 to send an email, 3 to refresh, or 4 for account settings when available."
-	case "folders":
-		return "Choose a folder. If you are at the root, press 0 for Inbox. Press pound to go back."
 	case "folder_action":
 		return "Press 1 to listen to messages here, or 2 to open nested folders."
 	case "contacts":
@@ -742,5 +803,5 @@ func menuPrompt(state string) string {
 	return "Press pound to go back or star to repeat."
 }
 func listPrompt(m store.MailSummary, cursor, total int) string {
-	return fmt.Sprintf("Message %d of %d. From %s. Subject %s. %s", cursor+1, total, m.Sender, m.Subject, menuPrompt("list"))
+	return fmt.Sprintf("Message %d of %d. From %s. Subject %s. %s", cursor+1, total, speech.SanitizeNonLatin(m.Sender), speech.SanitizeNonLatin(m.Subject), menuPrompt("list"))
 }

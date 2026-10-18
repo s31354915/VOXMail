@@ -18,7 +18,11 @@ import (
 
 func (s *Service) openAccounts(sess *session) {
 	accounts, err := s.Store.ListAccounts(s.baseContext(), sess.UserID)
-	if err != nil || len(accounts) == 0 {
+	if err != nil {
+		s.prompt(sess, "Your mail accounts are temporarily unavailable. Please try again in a moment.")
+		return
+	}
+	if len(accounts) == 0 {
 		s.prompt(sess, "No mail accounts are configured.")
 		return
 	}
@@ -50,22 +54,28 @@ func (s *Service) openMessages(sess *session, unreadOnly bool, description strin
 
 func (s *Service) handleAccountMenu(sess *session, key string) {
 	if key < "1" || key > "9" {
+		s.prompt(sess, "That key is not available here. Press pound to go back.")
 		return
 	}
 	s.mu.Lock()
-	if key == "9" && len(sess.Accounts) > (sess.AccountPage+1)*8 {
-		sess.AccountPage++
-		page := sess.AccountPage
-		accounts := append([]store.Account(nil), sess.Accounts...)
-		s.mu.Unlock()
-		s.prompt(sess, "Email. Press 0 for all unread mail. "+accountPrompt(accounts, page))
+	if key == "9" {
+		if len(sess.Accounts) > (sess.AccountPage+1)*8 {
+			sess.AccountPage++
+			page := sess.AccountPage
+			accounts := append([]store.Account(nil), sess.Accounts...)
+			s.mu.Unlock()
+			s.prompt(sess, "Email. Press 0 for all unread mail. "+accountPrompt(accounts, page))
+		} else {
+			s.mu.Unlock()
+			s.prompt(sess, "There are no more accounts. Press pound to go back.")
+		}
 		return
 	}
 	page := sess.AccountPage
-	index := int(key[0] - '1')
-	index += page * 8
-	if key == "9" || index >= len(sess.Accounts) {
+	index := page*8 + int(key[0]-'1')
+	if index >= len(sess.Accounts) {
 		s.mu.Unlock()
+		s.prompt(sess, "There is no account for that key. Press pound to go back.")
 		return
 	}
 	account := sess.Accounts[index]
@@ -136,9 +146,11 @@ func (s *Service) handleDraftEdit(sess *session, key string) {
 		sess.Draft.Body = ""
 		transitionLocked(sess, "body_method")
 	case "4":
+		sess.PendingAttachmentRemove = false
 		transitionLocked(sess, "attachment_edit")
 	default:
 		s.mu.Unlock()
+		s.prompt(sess, "That key is not available here. Press pound to go back.")
 		return
 	}
 	state := string(stateLocked(sess))
@@ -171,6 +183,7 @@ func (s *Service) handleRecipientEdit(sess *session, key string) {
 		transitionLocked(sess, "recipient_menu")
 	default:
 		s.mu.Unlock()
+		s.prompt(sess, "That key is not available here. Press pound to go back.")
 		return
 	}
 	state := string(stateLocked(sess))
@@ -188,12 +201,16 @@ func (s *Service) handleRecipientEdit(sess *session, key string) {
 func (s *Service) handleAttachmentEdit(sess *session, key string) {
 	switch key {
 	case "1":
+		s.mu.Lock()
+		sess.PendingAttachmentRemove = false
+		s.mu.Unlock()
 		s.startAudioAttachment(sess)
 	case "2", "3":
 		s.mu.Lock()
 		hasAttachment := len(sess.Draft.Attachments) > 0
-		if hasAttachment {
-			sess.Draft.Attachments = sess.Draft.Attachments[:len(sess.Draft.Attachments)-1]
+		pendingRemove := sess.PendingAttachmentRemove
+		if !hasAttachment {
+			sess.PendingAttachmentRemove = false
 		}
 		count := len(sess.Draft.Attachments)
 		s.mu.Unlock()
@@ -202,9 +219,26 @@ func (s *Service) handleAttachmentEdit(sess *session, key string) {
 			return
 		}
 		if key == "3" {
+			s.mu.Lock()
+			sess.PendingAttachmentRemove = false
+			s.mu.Unlock()
 			s.startAudioAttachment(sess)
 			return
 		}
+		// Removing an attachment used to be instant and irreversible. The
+		// first press of 2 now asks for confirmation; the second removes.
+		if !pendingRemove {
+			s.mu.Lock()
+			sess.PendingAttachmentRemove = true
+			s.mu.Unlock()
+			s.prompt(sess, fmt.Sprintf("Press 2 again to remove the last attachment, or pound to keep it. You have %d.", count))
+			return
+		}
+		s.mu.Lock()
+		sess.Draft.Attachments = sess.Draft.Attachments[:len(sess.Draft.Attachments)-1]
+		sess.PendingAttachmentRemove = false
+		count = len(sess.Draft.Attachments)
+		s.mu.Unlock()
 		s.prompt(sess, fmt.Sprintf("The last attachment was removed. %d attachments remain. Press 1 to add one, or pound to return.", count))
 	}
 }
@@ -262,20 +296,27 @@ func (s *Service) promptDraftList(sess *session) {
 func (s *Service) handleDraftList(sess *session, key string) {
 	if key == "9" {
 		s.mu.Lock()
-		if (sess.DraftPage+1)*8 < len(sess.Drafts) {
+		more := (sess.DraftPage+1)*8 < len(sess.Drafts)
+		if more {
 			sess.DraftPage++
 		}
 		s.mu.Unlock()
-		s.promptDraftList(sess)
+		if more {
+			s.promptDraftList(sess)
+		} else {
+			s.prompt(sess, "There are no more saved drafts. Press pound to go back.")
+		}
 		return
 	}
 	if key < "1" || key > "8" {
+		s.prompt(sess, "That key is not available here. Press pound to go back.")
 		return
 	}
 	s.mu.Lock()
 	index := sess.DraftPage*8 + int(key[0]-'1')
 	if index < 0 || index >= len(sess.Drafts) {
 		s.mu.Unlock()
+		s.prompt(sess, "There is no saved draft for that key. Press pound to go back.")
 		return
 	}
 	draftRecord := sess.Drafts[index]
@@ -288,23 +329,32 @@ func (s *Service) resumeDraft(sess *session, record store.DraftRecord) {
 		s.prompt(sess, "That draft is unavailable.")
 		return
 	}
+	// A missing, oversized, or unreadable attachment must not abort the whole
+	// resume: skip it, say so, and let the caller keep working the draft. A
+	// per-file cap and an aggregate cap keep a large draft from exhausting
+	// memory on the call path.
+	const maxResumeAttachmentBytes = 25 << 20
+	const maxResumeAttachmentsTotal = 50 << 20
 	attachments := make([]mailer.Attachment, 0, len(record.Attachments))
+	skippedAttachments := 0
+	var loadedAttachmentBytes int64
 	for _, saved := range record.Attachments {
 		path, ok := s.safeDraftAttachmentPath(sess, saved.Path)
 		if !ok {
-			s.prompt(sess, "That draft contains an unsafe attachment path.")
-			return
+			skippedAttachments++
+			continue
 		}
 		info, err := os.Stat(path)
-		if err != nil || !info.Mode().IsRegular() || info.Size() > 25<<20 {
-			s.prompt(sess, "A draft attachment is unavailable.")
-			return
+		if err != nil || !info.Mode().IsRegular() || info.Size() > maxResumeAttachmentBytes || loadedAttachmentBytes+info.Size() > maxResumeAttachmentsTotal {
+			skippedAttachments++
+			continue
 		}
 		data, err := os.ReadFile(path)
 		if err != nil {
-			s.prompt(sess, "A draft attachment could not be loaded.")
-			return
+			skippedAttachments++
+			continue
 		}
+		loadedAttachmentBytes += int64(len(data))
 		attachments = append(attachments, mailer.Attachment{Filename: saved.Filename, ContentType: saved.ContentType, Data: data})
 	}
 	d := draft{ID: record.ID, Subject: record.Subject, Body: record.Body, Cc: append([]string(nil), record.Cc...), Bcc: append([]string(nil), record.Bcc...), Attachments: attachments, ForwardOriginal: record.ForwardMode == "forward", OriginalMessageID: record.OriginalMessageID}
@@ -330,7 +380,11 @@ func (s *Service) resumeDraft(sess *session, record store.DraftRecord) {
 	}
 	state := string(stateLocked(sess))
 	s.mu.Unlock()
-	s.prompt(sess, "Draft resumed. "+menuPrompt(state))
+	resumed := "Draft resumed. "
+	if skippedAttachments > 0 {
+		resumed = fmt.Sprintf("Draft resumed, but %d of its attachments could not be loaded and were left out. ", skippedAttachments)
+	}
+	s.prompt(sess, resumed+menuPrompt(state))
 }
 
 func (s *Service) safeDraftAttachmentPath(sess *session, path string) (string, bool) {
@@ -382,11 +436,11 @@ func (s *Service) handleAccountSettings(sess *session, key string) {
 			}
 		}
 		s.mu.Unlock()
+		current, next := "off", "on"
 		if newValue {
-			s.prompt(sess, "Call alerts are enabled for this account. "+menuPrompt("account_settings"))
-		} else {
-			s.prompt(sess, "Call alerts are disabled for this account. "+menuPrompt("account_settings"))
+			current, next = "on", "off"
 		}
+		s.prompt(sess, fmt.Sprintf("Call alerts were %s for this account. They are now %s. %s", current, next, menuPrompt("account_settings")))
 	case "2":
 		s.openAccountAlertFolders(sess, account)
 	}
@@ -471,20 +525,27 @@ func (s *Service) promptAccountAlertFolders(sess *session) {
 func (s *Service) handleAccountAlertFolders(sess *session, key string) {
 	if key == "9" {
 		s.mu.Lock()
-		if (sess.AlertFolderPage+1)*8 < len(sess.AlertFolders) {
+		more := (sess.AlertFolderPage+1)*8 < len(sess.AlertFolders)
+		if more {
 			sess.AlertFolderPage++
 		}
 		s.mu.Unlock()
-		s.promptAccountAlertFolders(sess)
+		if more {
+			s.promptAccountAlertFolders(sess)
+		} else {
+			s.prompt(sess, "There are no more folders. Press pound when finished.")
+		}
 		return
 	}
 	if key < "1" || key > "8" {
+		s.prompt(sess, "That key is not available here. Press pound when finished.")
 		return
 	}
 	s.mu.Lock()
 	index := sess.AlertFolderPage*8 + int(key[0]-'1')
 	if index < 0 || index >= len(sess.AlertFolders) {
 		s.mu.Unlock()
+		s.prompt(sess, "There is no folder for that key. Press pound when finished.")
 		return
 	}
 	folder := sess.AlertFolders[index]
@@ -552,6 +613,22 @@ func (s *Service) refreshAccount(sess *session, accountID string) {
 	}
 	s.prompt(sess, "Refreshing this account now. Please wait.")
 	s.startTask(func() {
+		done := make(chan struct{})
+		defer close(done)
+		go func() {
+			// Long refreshes used to leave the caller in silence; reassure
+			// them periodically until the refresh finishes.
+			ticker := time.NewTicker(20 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-done:
+					return
+				case <-ticker.C:
+					s.prompt(sess, "Still refreshing. Please wait.")
+				}
+			}
+		}()
 		ctx, cancel := context.WithTimeout(s.baseContext(), 2*time.Minute)
 		defer cancel()
 		err := refresher.RefreshAccount(ctx, sess.UserID, accountID)
@@ -685,6 +762,8 @@ func (s *Service) handleFolderMenu(sess *session, key string) {
 			page = sess.FolderPage
 			s.mu.Unlock()
 			s.prompt(sess, folderPromptFor(account, folders, rolePaths, prefix, page, labels))
+		} else {
+			s.prompt(sess, "There are no more folders. Press pound to go back.")
 		}
 		return
 	}
@@ -702,6 +781,7 @@ func (s *Service) handleFolderMenu(sess *session, key string) {
 		return
 	}
 	if key < "1" || key > "8" {
+		s.prompt(sess, "That key is not available here. Press pound to go back.")
 		return
 	}
 	index := page*8 + int(key[0]-'1')
@@ -716,6 +796,7 @@ func (s *Service) handleFolderMenu(sess *session, key string) {
 		}
 	}
 	if index < 0 || index >= len(children) {
+		s.prompt(sess, "There is no folder for that key. Press pound to go back.")
 		return
 	}
 	s.mu.Lock()
@@ -814,7 +895,11 @@ func folderChildren(folders []string, prefix string) []string {
 
 func (s *Service) openContacts(sess *session) {
 	contacts, err := s.Store.ListContacts(s.baseContext(), sess.UserID)
-	if err != nil || len(contacts) == 0 {
+	if err != nil {
+		s.prompt(sess, "Your contacts are temporarily unavailable. Please try again in a moment.")
+		return
+	}
+	if len(contacts) == 0 {
 		s.prompt(sess, "You have no contacts.")
 		return
 	}
@@ -828,26 +913,28 @@ func (s *Service) openContacts(sess *session) {
 
 func (s *Service) handleContactMenu(sess *session, key string) {
 	if key < "1" || key > "9" {
+		s.prompt(sess, "That key is not available here. Press pound to go back.")
 		return
 	}
 	s.mu.Lock()
-	if key == "9" && len(sess.Contacts) > (sess.ContactPage+1)*8 {
-		sess.ContactPage++
-		page := sess.ContactPage
-		contacts := append([]store.Contact(nil), sess.Contacts...)
-		s.mu.Unlock()
-		s.prompt(sess, contactPrompt(contacts, page))
+	if key == "9" {
+		if len(sess.Contacts) > (sess.ContactPage+1)*8 {
+			sess.ContactPage++
+			page := sess.ContactPage
+			contacts := append([]store.Contact(nil), sess.Contacts...)
+			s.mu.Unlock()
+			s.prompt(sess, contactPrompt(contacts, page))
+		} else {
+			s.mu.Unlock()
+			s.prompt(sess, "There are no more contacts. Press pound to go back.")
+		}
 		return
 	}
 	page := sess.ContactPage
-	index := int(key[0] - '1')
-	index += page * 8
-	if key == "9" {
-		s.mu.Unlock()
-		return
-	}
+	index := page*8 + int(key[0]-'1')
 	if index >= len(sess.Contacts) {
 		s.mu.Unlock()
+		s.prompt(sess, "There is no contact for that key. Press pound to go back.")
 		return
 	}
 	contact := sess.Contacts[index]
@@ -901,7 +988,7 @@ func (s *Service) handleFieldMethod(sess *session, key, field string) {
 func (s *Service) handleSettingsMenu(sess *session, key string) {
 	switch key {
 	case "1":
-		s.prompt(sess, "Voice model and speech speed are managed in the web console.")
+		s.prompt(sess, "Voice model and speech speed are managed in the web console. Press 2 for call alerts, or 3 for contacts.")
 	case "2":
 		if !s.alertsAvailable(sess) {
 			s.prompt(sess, "Call alerts are disabled by the administrator.")
@@ -1078,7 +1165,11 @@ func recipientPrompt(d draft) string {
 	if strings.TrimSpace(d.To) != "" {
 		toCount = 1 + len(d.AdditionalTo)
 	}
-	return fmt.Sprintf("You have %d To recipient(s), %d Cc, and %d Bcc. Press 1 to add To, 2 to add Cc, 3 to add Bcc, or 4 to continue.", toCount, len(d.Cc), len(d.Bcc))
+	toLabel := "add To"
+	if toCount > 0 {
+		toLabel = "add another To"
+	}
+	return fmt.Sprintf("You have %d To recipient(s), %d Cc, and %d Bcc. Press 1 to %s, 2 to add Cc, 3 to add Bcc, or 4 to continue.", toCount, len(d.Cc), len(d.Bcc), toLabel)
 }
 
 func copyFolderLabels(labels map[string]string) map[string]string {
@@ -1097,15 +1188,15 @@ func folderLabel(account store.Account, folder string, labels ...map[string]stri
 }
 
 func mappedFolder(account store.Account, folder string) string {
+	// FolderMap maps remote names to local names. A folder that is a remote
+	// key resolves to its local name; anything else is already a local name
+	// and passes through unchanged. The former reverse-mapping branch
+	// compared the folder against mapped values and returned the folder
+	// itself, which was dead code.
 	var mapping map[string]string
 	if json.Unmarshal([]byte(account.FolderMap), &mapping) == nil {
 		if local := mapping[folder]; local != "" {
 			return local
-		}
-		for remote, local := range mapping {
-			if local == folder && remote != "" {
-				return local
-			}
 		}
 	}
 	return folder

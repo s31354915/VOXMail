@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -325,4 +326,76 @@ func groupDigits(value string) string {
 		}
 	}
 	return b.String()
+}
+
+// spokenScripts names the non-Latin scripts callers hit most often.
+var spokenScripts = []struct {
+	table *unicode.RangeTable
+	name  string
+}{
+	{unicode.Hebrew, "Hebrew"},
+	{unicode.Arabic, "Arabic"},
+	{unicode.Cyrillic, "Cyrillic"},
+	{unicode.Greek, "Greek"},
+	{unicode.Devanagari, "Devanagari"},
+	{unicode.Han, "Chinese"},
+	{unicode.Hiragana, "Japanese"},
+	{unicode.Katakana, "Japanese"},
+	{unicode.Hangul, "Korean"},
+	{unicode.Thai, "Thai"},
+	{unicode.Armenian, "Armenian"},
+}
+
+func spokenScriptName(r rune) string {
+	for _, script := range spokenScripts {
+		if unicode.Is(script.table, r) {
+			return script.name
+		}
+	}
+	return ""
+}
+
+// SanitizeNonLatin replaces runs of non-Latin text with a short spoken label
+// ("Hebrew text") so the voice engine never spells foreign characters out one
+// letter at a time. A run spans one script's letters plus the spaces, digits,
+// and punctuation between them, and ends at any letter of another script.
+// Latin text passes through untouched; letters from scripts without a spoken
+// name collapse into a generic "another language text" run.
+func SanitizeNonLatin(text string) string {
+	runes := []rune(text)
+	var out strings.Builder
+	for i := 0; i < len(runes); {
+		r := runes[i]
+		if !unicode.IsLetter(r) || unicode.Is(unicode.Latin, r) {
+			out.WriteRune(r)
+			i++
+			continue
+		}
+		name := spokenScriptName(r)
+		if name == "" {
+			name = "another language"
+		}
+		j := i + 1
+		lastScriptLetter := i
+		for j < len(runes) {
+			next := runes[j]
+			nextName := spokenScriptName(next)
+			isLetter := unicode.IsLetter(next)
+			latin := isLetter && unicode.Is(unicode.Latin, next)
+			unlistedNext := isLetter && !latin && nextName == ""
+			if latin || (nextName != "" && nextName != name) || (unlistedNext && name != "another language") {
+				break
+			}
+			if isLetter {
+				lastScriptLetter = j
+			}
+			j++
+		}
+		// Trailing separators stay outside the run, so the text around the
+		// label keeps its spacing.
+		out.WriteString(name)
+		out.WriteString(" text")
+		i = lastScriptLetter + 1
+	}
+	return out.String()
 }

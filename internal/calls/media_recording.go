@@ -21,7 +21,7 @@ const (
 	mediaSampleRate     int64 = 8000
 	mediaChannels       int64 = 1
 	mediaBytesPerSample       = 2 // signed little-endian 16-bit PCM
-	defaultSpeechWindow       = 15 * time.Second
+	defaultSpeechWindow       = 30 * time.Second
 	maxSpeechWindow           = 60 * time.Second
 )
 
@@ -70,6 +70,22 @@ func (r *VoiceRecorder) recordAndTranscribe(ctx context.Context, rawPath string,
 	case <-stop:
 	case <-ctx.Done():
 		return "", ctx.Err()
+	}
+	// The baresip writer buffers PCM before flushing it to the raw file.
+	// Reading the segment immediately after the window ends can miss the
+	// last bytes the caller actually spoke. Poll briefly for the file to
+	// reach the expected length; a caller who stopped speaking early costs
+	// at most this bounded wait.
+	expected := offset + pcmWindowBytes(window)
+	if rawInfo, statErr := os.Stat(rawPath); statErr == nil && rawInfo.Size() < expected {
+		deadline := time.Now().Add(300 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			time.Sleep(50 * time.Millisecond)
+			latest, latestErr := os.Stat(rawPath)
+			if latestErr != nil || latest.Size() >= expected {
+				break
+			}
+		}
 	}
 	info, err := os.Stat(rawPath)
 	if err != nil {

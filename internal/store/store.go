@@ -53,6 +53,11 @@ func openDB(path string, readOnly bool) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Deliberately one connection: backup-code verification and several
+	// fixtures assert single-connection semantics, and the sqlite driver
+	// surfaces SQLITE_BUSY to concurrent writers despite the busy timeout,
+	// which turned concurrent requests into 500s under a wider pool. Keep
+	// the pool at one until callers are transaction-safe under contention.
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	return db, nil

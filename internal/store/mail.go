@@ -2,9 +2,11 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -271,21 +273,18 @@ func (s *Store) CountUnread(ctx context.Context, userID string) (int, error) {
 }
 
 func (s *Store) CountUnreadForAccount(ctx context.Context, userID, accountID string) (int, error) {
-	accounts, err := s.ListAccounts(ctx, userID)
+	// This used to list every account of the user just to resolve one, which
+	// multiplied per-account work for callers looping over accounts.
+	var folderMap string
+	err := s.DB.QueryRowContext(ctx, `SELECT COALESCE(folder_map,'') FROM accounts WHERE id=? AND user_id=? AND COALESCE(deleting,0)=0`, accountID, userID).Scan(&folderMap)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
 	if err != nil {
 		return 0, err
 	}
-	var account *Account
-	for index := range accounts {
-		if accounts[index].ID == accountID {
-			account = &accounts[index]
-			break
-		}
-	}
-	if account == nil {
-		return 0, nil
-	}
-	inbox, err := s.InboxFolder(ctx, *account)
+	account := Account{ID: accountID, UserID: userID, FolderMap: folderMap}
+	inbox, err := s.InboxFolder(ctx, account)
 	if err != nil {
 		return 0, err
 	}
@@ -300,24 +299,29 @@ func (s *Store) CountUnreadForAccount(ctx context.Context, userID, accountID str
 // default. This function is intentionally the only fallback used by unread
 // queries, so Spam and Trash are never counted by name guessing.
 func (s *Store) InboxFolder(ctx context.Context, account Account) (string, error) {
-	role, err := s.FolderRole(ctx, account, "inbox")
-	if err == nil {
+	// One query covers both the mapped and the explicitly-excluded case;
+	// the previous shape queried folder_roles, then queried it again after
+	// an excluded role surfaced as ErrNoRows.
+	var remotePath, localPath string
+	err := s.DB.QueryRowContext(ctx, `SELECT remote_path, local_path FROM folder_roles WHERE account_id=? AND role='inbox' LIMIT 1`, account.ID).Scan(&remotePath, &localPath)
+	if errors.Is(err, sql.ErrNoRows) {
+		return inboxFolderLegacy(account), nil
+	}
+	if err != nil {
+		return "", err
+	}
+	localPath = filepathCleanFolder(localPath)
+	role, roleErr := s.resolveRolePolicy(ctx, account, FolderRole{AccountID: account.ID, Role: "inbox", RemotePath: remotePath, LocalPath: localPath})
+	if roleErr == nil {
 		return role.LocalPath, nil
 	}
-	if err != sql.ErrNoRows {
-		return "", err
+	if errors.Is(roleErr, sql.ErrNoRows) {
+		// An explicitly excluded Inbox role must yield its hidden path
+		// rather than automatically switching the user's role to a
+		// different conventional folder.
+		return localPath, nil
 	}
-	// An explicitly excluded Inbox role must yield its hidden path rather than
-	// automatically switching the user's role to a different conventional folder.
-	var local string
-	err = s.DB.QueryRowContext(ctx, `SELECT local_path FROM folder_roles WHERE account_id=? AND role='inbox'`, account.ID).Scan(&local)
-	if err == nil {
-		return filepathCleanFolder(local), nil
-	}
-	if err != sql.ErrNoRows {
-		return "", err
-	}
-	return inboxFolderLegacy(account), nil
+	return "", roleErr
 }
 
 // FolderRole returns the explicitly configured remote/local folder pair. It
@@ -485,8 +489,15 @@ func (s *Store) SaveDraft(ctx context.Context, draft DraftRecord) error {
 	if draft.UserID == "" || draft.AccountID == "" {
 		return fmt.Errorf("draft ownership and account are required")
 	}
+	callerProvided := draft.ID != ""
 	if draft.ID == "" {
-		draft.ID = fmt.Sprintf("draft-%d", time.Now().UnixNano())
+		// UnixNano IDs collided when two saves landed in the same
+		// nanosecond window or under clock adjustments; use a random ID.
+		var buf [8]byte
+		if _, err := rand.Read(buf[:]); err != nil {
+			return err
+		}
+		draft.ID = fmt.Sprintf("draft-%x", buf)
 	}
 	var owner string
 	if err := s.DB.QueryRowContext(ctx, `SELECT user_id FROM accounts WHERE id=?`, draft.AccountID).Scan(&owner); err != nil {
@@ -494,13 +505,13 @@ func (s *Store) SaveDraft(ctx context.Context, draft DraftRecord) error {
 	} else if owner != draft.UserID {
 		return fmt.Errorf("draft account does not belong to user")
 	}
-	if draft.ID != "" {
+	if callerProvided {
 		var existingUser string
 		err := s.DB.QueryRowContext(ctx, `SELECT user_id FROM drafts WHERE id=?`, draft.ID).Scan(&existingUser)
 		if err == nil && existingUser != draft.UserID {
 			return fmt.Errorf("draft belongs to another user")
 		}
-		if err != nil && err != sql.ErrNoRows {
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
 	}
