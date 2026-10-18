@@ -110,3 +110,19 @@ func TestEmailToSpeechSpeaksNumbersAsWords(t *testing.T) {
 		}
 	}
 }
+
+func TestSanitizeNonLatinLabelsForeignRuns(t *testing.T) {
+	cases := [][2]string{
+		{"שלום עולם", "Hebrew text"},
+		{"Hello שלום world", "Hello Hebrew text world"},
+		{"email from 東京 office", "email from Chinese text office"},
+		{"plain English subject", "plain English subject"},
+		{"Meeting at 10:30, room 4", "Meeting at 10:30, room 4"},
+		{"привет שלום", "Cyrillic text Hebrew text"},
+	}
+	for _, c := range cases {
+		if got := SanitizeNonLatin(c[0]); got != c[1] {
+			t.Errorf("SanitizeNonLatin(%q) = %q, want %q", c[0], got, c[1])
+		}
+	}
+}

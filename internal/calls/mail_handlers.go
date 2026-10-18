@@ -17,6 +17,7 @@ import (
 	"github.com/voxmail/voxmail/internal/mailer"
 	"github.com/voxmail/voxmail/internal/mailparse"
 	"github.com/voxmail/voxmail/internal/netguard"
+	"github.com/voxmail/voxmail/internal/speech"
 	"github.com/voxmail/voxmail/internal/store"
 )
 
@@ -85,23 +86,30 @@ func (s *Service) readMessage(sess *session, m store.MailSummary) {
 		s.updateSessionMessagePath(sess, m.ID, resolvedPath)
 		m.Path = resolvedPath
 	}
-	localPath, localErr := s.queueLocalReadState(sess, m, true)
-	if localErr != nil {
-		s.prompt(sess, "The local mail cache could not be updated.")
-		s.prompt(sess, menuPrompt("read"))
-		return
-	}
-	if localPath != m.Path {
-		s.updateSessionMessagePath(sess, m.ID, localPath)
+	// The unread marker is spent only after the message has started playing:
+	// a failed or interrupted opening must not mark mail the caller never
+	// heard.
+	markRead := func() {
+		localPath, err := s.queueLocalReadState(sess, m, true)
+		if err != nil {
+			s.prompt(sess, "I couldn't save that change just now. Try again in a moment.")
+			return
+		}
+		if localPath != m.Path {
+			s.updateSessionMessagePath(sess, m.ID, localPath)
+			m.Path = localPath
+		}
 	}
 	opening := "Email from"
 	if !m.Read {
 		opening = "New unread email from"
 	}
-	header := fmt.Sprintf("%s %s. Subject %s.", opening, parsed.From, parsed.Subject)
+	header := fmt.Sprintf("%s %s. Subject %s.", opening, speech.SanitizeNonLatin(parsed.From), speech.SanitizeNonLatin(parsed.Subject))
 	body := strings.TrimSpace(parsed.Text)
 	if body == "" {
 		body = "There is no readable email body."
+	} else if cleaned := speech.SanitizeNonLatin(body); cleaned != body {
+		body = cleaned + " Some of this message is written in a language I cannot read aloud."
 	}
 	s.mu.Lock()
 	sess.CurrentAttachments = append([]mailparse.Attachment(nil), parsed.Attachments...)
@@ -123,7 +131,7 @@ func (s *Service) readMessage(sess *session, m store.MailSummary) {
 			// Only the first few attachment names are spoken; a long list is
 			// summarized so it does not bury the message body.
 			if len(descriptions) < 3 {
-				descriptions = append(descriptions, fmt.Sprintf("%s, %s, %s", attachment.Name, kind, status))
+				descriptions = append(descriptions, fmt.Sprintf("%s, %s, %s", speech.SanitizeNonLatin(attachment.Name), kind, status))
 			}
 		}
 		summary := strings.Join(descriptions, ". ")
@@ -140,6 +148,7 @@ func (s *Service) readMessage(sess *session, m store.MailSummary) {
 	menu := menuPrompt("read")
 	if runeLen(body) <= singlePromptBodyRunes {
 		s.prompt(sess, header+" "+body+" "+menu)
+		markRead()
 		return
 	}
 	spoken, truncated := truncateForSpeech(body, maxSpokenBodyRunes)
@@ -156,10 +165,19 @@ func (s *Service) readMessage(sess *session, m store.MailSummary) {
 	// chunk by chunk while the next chunk synthesizes, and the menu follows
 	// as its own short prompt instead of being buried after a long body.
 	s.prompt(sess, first)
+	// A keypress during the opening spent its turn: skip the rest of the
+	// body and the menu so the pressed key takes effect right away.
+	if s.wasInterrupted(sess) {
+		return
+	}
+	markRead()
 	if len(chunks) > 0 {
 		s.playSpeechChunks(sess, chunks)
 	}
-	s.prompt(sess, menu)
+	if s.wasInterrupted(sess) {
+		return
+	}
+	s.promptMenu(sess, menu)
 }
 
 func (s *Service) attachmentMenu(sess *session) {
@@ -352,7 +370,7 @@ func (s *Service) promptMoveMenu(sess *session) {
 	if end < len(folders) {
 		next = " Press 0 for more folders."
 	}
-	s.prompt(sess, "Move message. "+strings.Join(parts, ". ")+"."+next+" Press pound to return.")
+	s.promptMenu(sess, "Move message. "+strings.Join(parts, ". ")+"."+next+" Press pound to return.")
 }
 
 func (s *Service) moveCurrent(sess *session, destination string) {
@@ -392,21 +410,21 @@ func (s *Service) moveCurrent(sess *session, destination string) {
 	if err := os.MkdirAll(targetDir, 0700); err != nil {
 		s.recordMutation(sess, message, "move", message.Folder, destination, "partial", err)
 		_ = s.rollbackRemoteMove(sess, message, destination, message.Folder)
-		s.prompt(sess, "The local mail cache could not be updated.")
+		s.prompt(sess, "I couldn't move that message just now. Try again in a moment.")
 		return
 	}
 	target := filepath.Join(targetDir, filepath.Base(message.Path))
 	if err := os.Rename(message.Path, target); err != nil {
 		s.recordMutation(sess, message, "move", message.Folder, destination, "partial", err)
 		_ = s.rollbackRemoteMove(sess, message, destination, message.Folder)
-		s.prompt(sess, "The local mail cache could not be updated.")
+		s.prompt(sess, "I couldn't move that message just now. Try again in a moment.")
 		return
 	}
 	if err := s.Store.MoveMailIndex(s.baseContext(), sess.UserID, message.ID, cleanDestination, target); err != nil {
 		_ = os.Rename(target, message.Path)
 		s.recordMutation(sess, message, "move", message.Folder, destination, "partial", err)
 		_ = s.rollbackRemoteMove(sess, message, destination, message.Folder)
-		s.prompt(sess, "The message moved, but the local index could not be updated.")
+		s.prompt(sess, "I couldn't move that message just now. Try again in a moment.")
 		return
 	}
 	s.recordMutation(sess, message, "move", message.Folder, destination, "success", nil)
@@ -422,16 +440,16 @@ func (s *Service) toggleRead(sess *session, message store.MailSummary) {
 	read := !message.Read
 	localPath, err := s.queueLocalReadState(sess, message, read)
 	if err != nil {
-		s.prompt(sess, "The local read state could not be updated.")
+		s.prompt(sess, "I couldn't save that change just now. Try again in a moment.")
 		return
 	}
 	if localPath != message.Path {
 		s.updateSessionMessagePath(sess, message.ID, localPath)
 	}
 	if read {
-		s.prompt(sess, "Message marked read locally and queued for synchronization.")
+		s.prompt(sess, "The message is marked read.")
 	} else {
-		s.prompt(sess, "Message marked unread locally and queued for synchronization.")
+		s.prompt(sess, "The message is marked unread.")
 	}
 }
 
@@ -999,6 +1017,7 @@ func (s *Service) resolveIMAPEndpoint(ctx context.Context, host string, port int
 // one. It returns the last message even when nothing playable remains so the
 // caller reports the usual unavailability prompt.
 func (s *Service) advanceToPlayable(sess *session) store.MailSummary {
+	skipped := 0
 	for attempt := 0; attempt < 9; attempt++ {
 		s.mu.Lock()
 		sess.Cursor = (sess.Cursor + 1) % len(sess.Messages)
@@ -1006,11 +1025,23 @@ func (s *Service) advanceToPlayable(sess *session) store.MailSummary {
 		s.mu.Unlock()
 		if file, _, err := s.openSessionMessage(sess, m); err == nil {
 			_ = file.Close()
+			// One notice with the count, instead of a single notice that
+			// undersells several skips in a row.
+			switch {
+			case skipped == 1:
+				s.prompt(sess, "Skipping a message that is no longer available.")
+			case skipped > 1:
+				s.prompt(sess, fmt.Sprintf("Skipping %d messages that are no longer available.", skipped))
+			}
 			return m
 		}
-		if attempt == 0 {
-			s.prompt(sess, "Skipping a message that is no longer available.")
-		}
+		skipped++
+	}
+	switch {
+	case skipped == 1:
+		s.prompt(sess, "Skipping a message that is no longer available.")
+	case skipped > 1:
+		s.prompt(sess, fmt.Sprintf("Skipping %d messages that are no longer available.", skipped))
 	}
 	s.mu.Lock()
 	m := sess.Messages[sess.Cursor]

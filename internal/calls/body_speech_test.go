@@ -4,7 +4,9 @@ import (
 	"context"
 	"os"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestSplitSpeechChunksGroupsSentencesUnderLimit(t *testing.T) {
@@ -110,5 +112,82 @@ func TestStreamSpeechChunksPlaysEveryChunk(t *testing.T) {
 	svc.streamSpeechChunks(sess, t.TempDir(), []string{"one", "two", "three", "four"}, synthesize, play)
 	if plays != 4 {
 		t.Fatalf("played %d of 4 chunks; the stream stopped early", plays)
+	}
+}
+
+// A chunk's buffer slot must stay reserved until its playback ends. Handing
+// the slot back early let the worker synthesize a later chunk into the same
+// file while that chunk's audio was still on the line.
+func TestStreamSpeechChunksKeepsSlotUntilPlaybackEnds(t *testing.T) {
+	svc := &Service{sessions: make(map[string]*session)}
+	sess := &session{CallID: "stream-slot"}
+	svc.sessions[sess.CallID] = sess
+
+	var mu sync.Mutex
+	var payloads []string
+	written := make(chan string, 8)
+	playStarted := make(chan struct{}, 1)
+	release := make(chan struct{})
+	synthesize := func(ctx context.Context, text, output string) error {
+		if err := os.WriteFile(output, []byte(text), 0600); err != nil {
+			return err
+		}
+		written <- text
+		return nil
+	}
+	play := func(ctx context.Context, path string) error {
+		mu.Lock()
+		first := len(payloads) == 0
+		mu.Unlock()
+		if first {
+			playStarted <- struct{}{}
+			<-release
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		mu.Lock()
+		payloads = append(payloads, string(data))
+		mu.Unlock()
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		svc.streamSpeechChunks(sess, t.TempDir(), []string{"one", "two", "three", "four"}, synthesize, play)
+	}()
+	<-playStarted
+	// While the first chunk holds its slot, a later chunk must not be
+	// synthesized into it. A buggy implementation writes "three" here.
+	overwrote := false
+	timeout := time.After(300 * time.Millisecond)
+waiting:
+	for {
+		select {
+		case text := <-written:
+			if text == "three" {
+				overwrote = true
+				break waiting
+			}
+		case <-timeout:
+			break waiting
+		}
+	}
+	close(release)
+	<-done
+	mu.Lock()
+	defer mu.Unlock()
+	if overwrote {
+		t.Fatalf("a later chunk was synthesized while the first chunk was still playing")
+	}
+	want := []string{"one", "two", "three", "four"}
+	if len(payloads) != len(want) {
+		t.Fatalf("played %d chunks, want %d", len(payloads), len(want))
+	}
+	for i, chunk := range want {
+		if payloads[i] != chunk {
+			t.Fatalf("chunk %d played %q, want %q", i, payloads[i], chunk)
+		}
 	}
 }

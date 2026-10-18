@@ -425,7 +425,11 @@ type session struct {
 	promptMu             sync.Mutex
 	playCancel           context.CancelFunc
 	playSequence         uint64
-	greetAttempts        int
+	// playInterrupted is set when a keypress cancels the audio that is
+	// playing, and cleared when the next prompt starts. Handlers check it to
+	// skip what would follow the interrupted audio.
+	playInterrupted bool
+	greetAttempts   int
 }
 
 type draft struct {
@@ -556,6 +560,42 @@ func (s *Service) prompt(sess *session, text string) error {
 	})
 }
 
+// promptMenu speaks a menu prompt at the menu voice even while the session is
+// in an email state, where promptRuntime would read it at email speed and
+// burn airtime on a long menu.
+func (s *Service) promptMenu(sess *session, text string) error {
+	if s == nil || sess == nil {
+		return nil
+	}
+	if s.promptFn != nil {
+		return s.promptFn(sess, text)
+	}
+	if s.Media == nil || sess.TxPath == "" {
+		return nil
+	}
+	s.mu.Lock()
+	runtime := sess.Runtime
+	s.mu.Unlock()
+	if runtime == nil {
+		runtime = s.promptRuntime(sess)
+	}
+	return s.playPrompt(sess, func(ctx context.Context) error {
+		return s.Media.PlayWithRuntimeForUser(ctx, runtime, sess.UserID, sess.TxPath, text)
+	})
+}
+
+// wasInterrupted reports whether a keypress canceled the audio that just
+// finished playing, so a handler can skip what would follow it (the menu
+// after an email body) and let the pressed key take effect right away.
+func (s *Service) wasInterrupted(sess *session) bool {
+	if s == nil || sess == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return sess.playInterrupted
+}
+
 // All greetings, menus and email speech share cancellation and FIFO ownership.
 // Synthesis has its own bound; playback must not inherit the 45s dial timeout.
 func (s *Service) playPrompt(sess *session, play func(context.Context) error) error {
@@ -567,6 +607,7 @@ func (s *Service) playPrompt(sess *session, play func(context.Context) error) er
 	sess.playSequence++
 	sequence := sess.playSequence
 	sess.playCancel = cancel
+	sess.playInterrupted = false
 	s.beginMediaLocked(sess)
 	s.mu.Unlock()
 	sess.promptMu.Lock()
@@ -614,6 +655,7 @@ func (s *Service) interruptPrompt(callID string) {
 	var cancel context.CancelFunc
 	if sess != nil && !sess.Closed {
 		cancel = sess.playCancel
+		sess.playInterrupted = true
 	}
 	s.mu.Unlock()
 	if cancel != nil {
@@ -742,5 +784,5 @@ func menuPrompt(state string) string {
 	return "Press pound to go back or star to repeat."
 }
 func listPrompt(m store.MailSummary, cursor, total int) string {
-	return fmt.Sprintf("Message %d of %d. From %s. Subject %s. %s", cursor+1, total, m.Sender, m.Subject, menuPrompt("list"))
+	return fmt.Sprintf("Message %d of %d. From %s. Subject %s. %s", cursor+1, total, speech.SanitizeNonLatin(m.Sender), speech.SanitizeNonLatin(m.Subject), menuPrompt("list"))
 }

@@ -99,7 +99,11 @@ func (s *Service) signedInPrompt(sess *session) string {
 	if len(parts) == 0 {
 		return "You have no unread email. Press 1 for email, 2 for settings, or 3 for information and instructions."
 	}
-	return fmt.Sprintf("You have %d unread emails, %s. Press 1 for email, 2 for settings, or 3 for information and instructions.", total, strings.Join(parts, ", "))
+	summary := fmt.Sprintf("You have %d unread emails", total)
+	if total == 1 {
+		summary = "You have 1 unread email"
+	}
+	return fmt.Sprintf("%s, %s. Press 1 for email, 2 for settings, or 3 for information and instructions.", summary, strings.Join(parts, ", "))
 }
 
 func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Message) error {
@@ -341,13 +345,20 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 			return nil
 		}
 		m := sess.Messages[sess.Cursor]
+		wrapped := ""
 		switch key {
 		case "1":
 			transitionLocked(sess, "read")
 		case "2":
+			if sess.Cursor == len(sess.Messages)-1 {
+				wrapped = "That was the last message. Starting over from the first."
+			}
 			sess.Cursor = (sess.Cursor + 1) % len(sess.Messages)
 			m = sess.Messages[sess.Cursor]
 		case "3":
+			if sess.Cursor == 0 {
+				wrapped = "That was the first message. Going back to the last one."
+			}
 			sess.Cursor = (sess.Cursor + len(sess.Messages) - 1) % len(sess.Messages)
 			m = sess.Messages[sess.Cursor]
 		case "4":
@@ -359,6 +370,9 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 		}
 		state, cursor, total := string(stateLocked(sess)), sess.Cursor, len(sess.Messages)
 		s.mu.Unlock()
+		if wrapped != "" {
+			s.prompt(sess, wrapped)
+		}
 		if state == "read" {
 			s.readMessage(sess, m)
 		} else if state == "confirm_delete" {
