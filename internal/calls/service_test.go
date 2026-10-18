@@ -1118,3 +1118,44 @@ func TestQueueLocalReadStateRollsBackWhenJournalCannotBeWritten(t *testing.T) {
 		t.Fatal("session changed despite journal failure")
 	}
 }
+
+func TestAdmitDuplicateIncomingKeepsSession(t *testing.T) {
+	svc, db := newTestService(t)
+	if err := db.CreateUser(context.Background(), store.User{ID: "u2", Username: "bob", PasswordHash: "x", PINHash: "y", Role: "user", Enabled: true}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	if err := db.AddWhitelist(context.Background(), store.WhitelistEntry{UserID: "u2", Phone: "+15557770000"}); err != nil {
+		t.Fatalf("AddWhitelist: %v", err)
+	}
+	message := bridge.Message{Type: "call_incoming", CallID: "dup-call", From: "sip:+15557770000@example.com"}
+	admitAndRead(t, svc, message)
+	svc.mu.Lock()
+	before := svc.sessions["dup-call"]
+	svc.mu.Unlock()
+	if before == nil {
+		t.Fatal("first admit did not create a session")
+	}
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	done := make(chan error, 1)
+	go func() { done <- svc.admit(server, message) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("duplicate admit: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("duplicate admit did not return")
+	}
+	client.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	if _, err := bufio.NewReader(client).ReadByte(); err == nil {
+		t.Fatal("duplicate call_incoming sent a second answer")
+	}
+	svc.mu.Lock()
+	after := svc.sessions["dup-call"]
+	svc.mu.Unlock()
+	if after != before {
+		t.Fatal("duplicate call_incoming replaced the admitted session")
+	}
+}

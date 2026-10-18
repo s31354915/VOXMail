@@ -76,3 +76,20 @@ func TestEmailToSpeechDatesAreSpokenNaturally(t *testing.T) {
 		}
 	}
 }
+
+func TestEmailToSpeechKeepsParagraphBreaks(t *testing.T) {
+	got := EmailToSpeech("Hi there,\n\nThanks for the update.\n\nBest,\nAlex")
+	want := "Hi there, Thanks for the update. Best, Alex"
+	if got != want {
+		t.Fatalf("EmailToSpeech=%q, want %q", got, want)
+	}
+	if got := EmailToSpeech("line one\nline two"); got != "line one line two" {
+		t.Fatalf("hard-wrapped newline collapsed wrongly: %q", got)
+	}
+	if got := EmailToSpeech("> old reply\n\nFresh text"); got != "old reply. Fresh text" {
+		t.Fatalf("quoted marker not stripped: %q", got)
+	}
+	if again := EmailToSpeech(got); again != got {
+		t.Fatalf("EmailToSpeech is not idempotent on paragraph output: %q", again)
+	}
+}

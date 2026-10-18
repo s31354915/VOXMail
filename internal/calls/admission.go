@@ -24,6 +24,14 @@ func (s *Service) admit(conn net.Conn, message bridge.Message) error {
 		return s.sendBridge(conn, bridge.Message{Type: "hangup", CallID: message.CallID, Code: 603, Reason: "caller not authorized"})
 	}
 	s.mu.Lock()
+	/* Baresip can report a lifecycle event more than once. A call ID is the
+	 * idempotency key: a duplicate call_incoming must not replace the
+	 * admitted session, because doing so reset the greeting guard and
+	 * re-spoke the welcome prompt. */
+	if existing := s.sessions[message.CallID]; existing != nil && !existing.Closed {
+		s.mu.Unlock()
+		return nil
+	}
 	shuttingDown := s.shuttingDown
 	busy := s.sipApplying || (s.MaxCalls > 0 && len(s.sessions) >= s.MaxCalls)
 	if !busy && !shuttingDown {
