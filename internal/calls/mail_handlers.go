@@ -52,8 +52,13 @@ func (s *Service) readMessage(sess *session, m store.MailSummary) {
 		s.prompt(sess, "The local mail cache could not be updated.")
 		return
 	}
-	body := parsed.Text
-	if strings.TrimSpace(body) == "" {
+	opening := "Email from"
+	if !m.Read {
+		opening = "New unread email from"
+	}
+	header := fmt.Sprintf("%s %s. Subject %s.", opening, parsed.From, parsed.Subject)
+	body := strings.TrimSpace(parsed.Text)
+	if body == "" {
 		body = "There is no readable email body."
 	}
 	s.mu.Lock()
@@ -61,8 +66,8 @@ func (s *Service) readMessage(sess *session, m store.MailSummary) {
 	sess.AttachmentPage = 0
 	s.mu.Unlock()
 	if len(parsed.Attachments) > 0 {
-		descriptions := make([]string, 0, len(parsed.Attachments))
 		playable := 0
+		descriptions := make([]string, 0, 3)
 		for _, attachment := range parsed.Attachments {
 			kind := attachment.ContentType
 			if kind == "" {
@@ -73,23 +78,46 @@ func (s *Service) readMessage(sess *session, m store.MailSummary) {
 				status = "playable"
 				playable++
 			}
-			descriptions = append(descriptions, fmt.Sprintf("%s, %s, %s", attachment.Name, kind, status))
+			// Only the first few attachment names are spoken; a long list is
+			// summarized so it does not bury the message body.
+			if len(descriptions) < 3 {
+				descriptions = append(descriptions, fmt.Sprintf("%s, %s, %s", attachment.Name, kind, status))
+			}
 		}
-		body += fmt.Sprintf(" There are %d attachments: %s.", len(parsed.Attachments), strings.Join(descriptions, ". "))
+		summary := strings.Join(descriptions, ". ")
+		if more := len(parsed.Attachments) - len(descriptions); more > 0 {
+			summary += fmt.Sprintf(". And %d more.", more)
+		}
+		body += fmt.Sprintf(" There are %d attachments: %s.", len(parsed.Attachments), summary)
 		if playable > 0 {
 			body += " Press 8 to listen to playable attachments."
 		} else {
 			body += " There are no playable attachments."
 		}
 	}
-	if len([]rune(body)) > 2800 {
-		body = string([]rune(body)[:2800]) + ". Message truncated."
+	menu := menuPrompt("read")
+	if runeLen(body) <= singlePromptBodyRunes {
+		s.prompt(sess, header+" "+body+" "+menu)
+		return
 	}
-	opening := "Email from"
-	if !m.Read {
-		opening = "New unread email from"
+	spoken, truncated := truncateForSpeech(body, maxSpokenBodyRunes)
+	if truncated {
+		spoken += " Message truncated."
 	}
-	s.prompt(sess, fmt.Sprintf("%s %s. Subject %s. %s %s", opening, parsed.From, parsed.Subject, body, menuPrompt("read")))
+	chunks := splitSpeechChunks(spoken, speechChunkRunes)
+	first := header
+	if len(chunks) > 0 {
+		first += " " + chunks[0]
+		chunks = chunks[1:]
+	}
+	// The header and first chunk play at once; the rest of the body streams
+	// chunk by chunk while the next chunk synthesizes, and the menu follows
+	// as its own short prompt instead of being buried after a long body.
+	s.prompt(sess, first)
+	if len(chunks) > 0 {
+		s.playSpeechChunks(sess, chunks)
+	}
+	s.prompt(sess, menu)
 }
 
 func (s *Service) attachmentMenu(sess *session) {

@@ -56,3 +56,23 @@ func contains(value, part string) bool {
 	}
 	return false
 }
+
+func TestEmailToSpeechBlockTagsBreakSentences(t *testing.T) {
+	got := EmailToSpeech("<p>First paragraph.</p><p>Second paragraph.</p><br>Third line.")
+	if got != "First paragraph. Second paragraph. Third line." {
+		t.Fatalf("EmailToSpeech paragraphs = %q", got)
+	}
+}
+
+func TestEmailToSpeechDatesAreSpokenNaturally(t *testing.T) {
+	for _, tc := range []struct{ input, want string }{
+		{"Meeting moved to 2026-10-17.", "Meeting moved to October 17, 2026."},
+		{"Due 10/17/2026 at noon.", "Due October 17, 2026 at noon."},
+		{"Order 48291047 shipped.", "Order 4 8 2 9 1 0 4 7 shipped."},
+		{"Version 2.3.4 shipped.", "Version 2.3.4 shipped."},
+	} {
+		if got := EmailToSpeech(tc.input); got != tc.want {
+			t.Errorf("EmailToSpeech(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}

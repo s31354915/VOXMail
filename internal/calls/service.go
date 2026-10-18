@@ -425,6 +425,7 @@ type session struct {
 	promptMu             sync.Mutex
 	playCancel           context.CancelFunc
 	playSequence         uint64
+	greetAttempts        int
 }
 
 type draft struct {
@@ -509,6 +510,16 @@ func (s *Service) armInactivityTimeoutLocked(sess *session) {
 // map in the call service.
 func (s *Service) greet(sess *session) {
 	if sess == nil || s.Media == nil {
+		return
+	}
+	// The welcome prompt is spoken at most once per call: a failed or
+	// interrupted greeting must never be re-spoken, which is how repeated
+	// welcome loops used to start.
+	s.mu.Lock()
+	sess.greetAttempts++
+	first := sess.greetAttempts == 1
+	s.mu.Unlock()
+	if !first {
 		return
 	}
 	if s.Media.GreetingPath != "" {
