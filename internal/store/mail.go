@@ -137,9 +137,9 @@ func scanMailSummary(rows *sql.Rows, m *MailSummary) error {
 	return nil
 }
 
-// ListMailPage returns one bounded keyset page. Newest messages sort first;
-// rows with invalid or missing dates keep deterministic ID order after them.
-// A nil Next cursor means completion.
+// ListMailPage returns one bounded keyset page. Valid normalized dates sort
+// first in chronological order; rows with invalid or missing dates are kept
+// in deterministic ID order after them. A nil Next cursor means completion.
 func (s *Store) ListMailPage(ctx context.Context, userID, accountID, folder string, unreadOnly bool, after *MailCursor, limit int) (MailPage, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 50
@@ -880,7 +880,7 @@ func (s *Store) UpsertRemoteFolder(ctx context.Context, accountID, remotePath, l
 	remotePath = folderpolicy.RemoteKey(strings.TrimSpace(remotePath))
 	localPath = filepathCleanFolder(localPath)
 	if accountID == "" || remotePath == "" {
-		return fmt.Errorf("account identity is required")
+		return fmt.Errorf("remote folder identity is required")
 	}
 	parent := ""
 	if slash := strings.LastIndex(strings.ReplaceAll(remotePath, "\\", "/"), "/"); slash > 0 {
@@ -914,7 +914,7 @@ FROM remote_folders WHERE account_id=? AND (remote_path=? OR (?='INBOX' AND lowe
 	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO account_folder_bindings(account_id,local_path,remote_path) VALUES(?,?,?)`, accountID, localPath, folderpolicy.RemoteKey(remotePath)); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO remote_folders(account_id,remote_path,local_path,parent_path,depth,role,display_name,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(account_id,remote_path) DO UPDATE SET local_path=excluded.local_path,parent_path=exited.parent_path,depth=excluded.depth,role=excluded.role,display_name=excluded.display_name,updated_at=excluded.updated_at`, accountID, remotePath, localPath, parent, depth, role, display, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO remote_folders(account_id,remote_path,local_path,parent_path,depth,role,display_name,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(account_id,remote_path) DO UPDATE SET local_path=excluded.local_path,parent_path=excluded.parent_path,depth=excluded.depth,role=excluded.role,display_name=excluded.display_name,updated_at=excluded.updated_at`, accountID, remotePath, localPath, parent, depth, role, display, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		return err
 	}
 	return tx.Commit()
