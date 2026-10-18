@@ -166,6 +166,7 @@ func (s *Service) closeCall(message bridge.Message) {
 	s.mu.Lock()
 	sess := s.sessions[message.CallID]
 	var alertDone chan<- bool
+	announced := false
 	if sess != nil {
 		sess.Closed = true
 		if sess.eventCancel != nil {
@@ -178,6 +179,13 @@ func (s *Service) closeCall(message bridge.Message) {
 		}
 		alertDone = sess.AlertDone
 		sess.AlertDone = nil
+		// An alert call that ends while its announcement is still playing
+		// counts as delivered. The close event can beat the announcement
+		// worker's completion callback (hangup on the last word, or the
+		// final FIFO drain finishing after the far end hung up); signaling
+		// failure here re-dialed the same message even when the subscriber
+		// heard the whole alert.
+		announced = stateLocked(sess) == "announce" && sess.mediaPlays > 0
 		if sess.playCancel != nil {
 			sess.playCancel()
 			sess.playCancel = nil
@@ -194,9 +202,13 @@ func (s *Service) closeCall(message bridge.Message) {
 	delete(s.sessions, message.CallID)
 	s.mu.Unlock()
 	if alertDone != nil {
-		signalAlert(alertDone, false)
+		signalAlert(alertDone, announced)
 	}
-	s.reportAlertOutcome(sess, AlertFailed)
+	if announced {
+		s.reportAlertOutcome(sess, AlertPlaybackCompleted)
+	} else {
+		s.reportAlertOutcome(sess, AlertFailed)
+	}
 	s.releaseSessionSpeech(sess)
 	if s.Log != nil {
 		s.Log.Info("call closed", "call_id", message.CallID, "reason", message.Reason)
