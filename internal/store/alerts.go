@@ -6,6 +6,14 @@ import (
 	"time"
 )
 
+// maxAlertAttempts bounds how many times one message may be claimed for an
+// alert call. A call that ends without a complete announcement (no answer,
+// hangup mid-announcement, playback failure) releases its claim, and without
+// this cap the same message would be re-dialed after every cooldown
+// indefinitely. Once the cap is reached the message stops alerting; the user
+// still sees it as unread in the IVR and console.
+const maxAlertAttempts = 3
+
 // AlertCandidate is an unseen, unsent message in an alert-enabled account.
 // Phone is the normalized alert number and Voice the user's TTS voice; the
 // alerts service rounds up candidates per user and dials the number.
@@ -47,7 +55,7 @@ JOIN settings s ON s.user_id = u.id
 LEFT JOIN alert_numbers n ON n.user_id=u.id AND n.active=1
 JOIN json_each(CASE WHEN json_valid(COALESCE(a.alert_folders,'[]')) THEN a.alert_folders ELSE '[]' END) af
   ON lower(trim(CAST(af.value AS TEXT))) = lower(trim(m.folder))
-WHERE m.is_read = 0 AND m.alerted = 0
+WHERE m.is_read = 0 AND m.alerted = 0 AND m.alert_attempts < ?
   AND a.call_alert_enabled = 1 AND s.alerts_enabled = 1 AND u.enabled = 1
   AND COALESCE(n.number,s.alert_phone,'') <> ''
   AND NOT EXISTS (SELECT 1 FROM alert_claims c WHERE c.message_id=m.id AND c.announced_at IS NULL)
@@ -56,7 +64,7 @@ SELECT id,account_id,folder,sender,subject,user_id,phone,voice,alert_folders,dat
 FROM eligible
 WHERE user_rank <= 10
 ORDER BY CASE WHEN message_date_utc IS NULL THEN 1 ELSE 0 END, message_date_utc DESC, id DESC
-LIMIT 100`)
+LIMIT 100`, maxAlertAttempts)
 	if err != nil {
 		return nil, err
 	}
@@ -101,13 +109,19 @@ LEFT JOIN alert_numbers n ON n.user_id=u.id AND n.active=1
 JOIN json_each(CASE WHEN json_valid(COALESCE(a.alert_folders,'[]')) THEN a.alert_folders ELSE '[]' END) af
   ON lower(trim(CAST(af.value AS TEXT))) = lower(trim(m.folder))
 WHERE m.id=? AND a.user_id=? AND m.is_read=0 AND m.alerted=0
+  AND m.alert_attempts < ?
   AND a.call_alert_enabled=1 AND s.alerts_enabled=1 AND u.enabled=1
   AND COALESCE(n.number,s.alert_phone,'') <> ''
-  AND COALESCE((SELECT alerts_available FROM system_settings WHERE id=1),0)=1`, claimedAt, id, userID)
+  AND COALESCE((SELECT alerts_available FROM system_settings WHERE id=1),0)=1`, claimedAt, id, userID, maxAlertAttempts)
 		if err != nil {
 			return nil, err
 		}
 		if count, _ := result.RowsAffected(); count == 1 {
+			// Record the attempt durably with the claim so a call that never
+			// completes its announcement still counts toward the retry cap.
+			if _, err := tx.ExecContext(ctx, `UPDATE mail_messages SET alert_attempts=alert_attempts+1 WHERE id=?`, id); err != nil {
+				return nil, err
+			}
 			claimed = append(claimed, id)
 		}
 	}

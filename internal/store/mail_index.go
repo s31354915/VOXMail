@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -78,13 +80,34 @@ type MailIndexInput struct {
 	UpdatedAt   string
 	ScanID      string
 	SourceSize  int64
+	// Alerted and AlertAttempts carry durable alert state from an existing
+	// row for the same message identity. UpsertMailIndex populates them when
+	// a message re-indexes under a new path so a sync cannot reset the
+	// announced mark or the alert retry cap.
+	Alerted       int
+	AlertAttempts int
 }
 
 func (s *Store) UpsertMailIndex(ctx context.Context, input MailIndexInput) (int64, error) {
 	if strings.TrimSpace(input.AccountID) == "" || strings.TrimSpace(input.Path) == "" {
 		return 0, fmt.Errorf("account and mail path are required")
 	}
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO mail_messages(account_id,folder,path,message_id,sender,recipients,cc,subject,message_date,message_date_utc,is_read,attachment_count,updated_at,last_seen_scan,source_size) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET folder=excluded.folder,message_id=excluded.message_id,sender=excluded.sender,recipients=excluded.recipients,cc=excluded.cc,subject=excluded.subject,message_date=excluded.message_date,message_date_utc=excluded.message_date_utc,is_read=excluded.is_read,attachment_count=excluded.attachment_count,updated_at=excluded.updated_at,last_seen_scan=excluded.last_seen_scan,source_size=excluded.source_size`, input.AccountID, input.Folder, input.Path, input.MessageID, input.Sender, input.Recipients, input.Cc, input.Subject, input.Date, input.DateUTC, input.Read, input.Attachments, input.UpdatedAt, input.ScanID, input.SourceSize)
+	// A message can re-index under a new path (flag rename, re-download,
+	// UID churn). Carry the announced mark and retry attempts from any
+	// existing row for the same message identity so a sync cannot reset
+	// them; without this the same message alerted again after every sync.
+	if strings.TrimSpace(input.MessageID) != "" {
+		var alerted, attempts int
+		err := s.DB.QueryRowContext(ctx, `SELECT COALESCE(MAX(alerted),0), COALESCE(MAX(alert_attempts),0) FROM mail_messages WHERE account_id=? AND folder=? AND path<>? AND message_id=?`, input.AccountID, input.Folder, input.Path, input.MessageID).Scan(&alerted, &attempts)
+		if err == nil {
+			if alerted != 0 || attempts > 0 {
+				input.Alerted, input.AlertAttempts = alerted, attempts
+			}
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return 0, err
+		}
+	}
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO mail_messages(account_id,folder,path,message_id,sender,recipients,cc,subject,message_date,message_date_utc,is_read,alerted,alert_attempts,attachment_count,updated_at,last_seen_scan,source_size) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET folder=excluded.folder,message_id=excluded.message_id,sender=excluded.sender,recipients=excluded.recipients,cc=excluded.cc,subject=excluded.subject,message_date=excluded.message_date,message_date_utc=excluded.message_date_utc,is_read=excluded.is_read,attachment_count=excluded.attachment_count,updated_at=excluded.updated_at,last_seen_scan=excluded.last_seen_scan,source_size=excluded.source_size`, input.AccountID, input.Folder, input.Path, input.MessageID, input.Sender, input.Recipients, input.Cc, input.Subject, input.Date, input.DateUTC, input.Read, input.Alerted, input.AlertAttempts, input.Attachments, input.UpdatedAt, input.ScanID, input.SourceSize)
 	if err != nil {
 		return 0, err
 	}
