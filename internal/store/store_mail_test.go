@@ -423,7 +423,7 @@ func TestUpdateMailIdentitySurvivesRemoteFolderChange(t *testing.T) {
 	if _, err := db.DB.ExecContext(ctx, `INSERT INTO mail_messages(account_id,folder,path,message_id,is_read,updated_at) VALUES('a2','Inbox','/mail/old','<stable@example.com>',0,'now')`); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.UpdateMailIdentity(ctx, "a2", "Archive/Projects", "<stable@example.com>", 42, 7, []string{"\\Seen"}); err != nil {
+	if err := db.UpdateMailIdentity(ctx, "a2", "Archive/Projects", "<stable@example.com>", 42, 7, []string{"\\Seen"}, false); err != nil {
 		t.Fatal(err)
 	}
 	var folder, path, flags string
@@ -454,7 +454,7 @@ func TestUpdateMailIdentityDoesNotGuessDuplicateMessageIDs(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := db.UpdateMailIdentity(ctx, "dup-account", "Other", "<duplicate@example.com>", 42, 7, []string{"\\Seen"}); err != nil {
+	if err := db.UpdateMailIdentity(ctx, "dup-account", "Other", "<duplicate@example.com>", 42, 7, []string{"\\Seen"}, false); err != nil {
 		t.Fatal(err)
 	}
 	var updated int
@@ -507,7 +507,7 @@ func TestUpdateMailIdentityByUIDUpdatesFlagsWithoutMessageID(t *testing.T) {
 	if _, err := db.DB.ExecContext(ctx, `INSERT INTO mail_messages(account_id,folder,path,imap_uid,uid_validity,is_read,updated_at) VALUES('a4','Inbox','/mail/no-message-id',9,4,0,'now')`); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.UpdateMailIdentityByUID(ctx, "a4", "Inbox", 9, 4, []string{"\\Seen", "\\Answered"}); err != nil {
+	if err := db.UpdateMailIdentityByUID(ctx, "a4", "Inbox", 9, 4, []string{"\\Seen", "\\Answered"}, false); err != nil {
 		t.Fatal(err)
 	}
 	var flags string
