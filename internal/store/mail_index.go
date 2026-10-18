@@ -107,6 +107,24 @@ func (s *Store) UpsertMailIndex(ctx context.Context, input MailIndexInput) (int6
 			return 0, err
 		}
 	}
+
+	// A message that re-indexes under a new path (flag rename, re-download,
+	// UID churn) must re-home its existing row instead of inserting a second
+	// row for the same message. Duplicates under stale paths surface as
+	// unplayable, always-unread messages in the call list until a purge scan
+	// removes them.
+	if strings.TrimSpace(input.MessageID) != "" {
+		var moveID int64
+		moveErr := s.DB.QueryRowContext(ctx, `SELECT id FROM mail_messages WHERE account_id=? AND folder=? AND message_id=? AND path<>? AND NOT EXISTS(SELECT 1 FROM mail_messages other WHERE other.path=?) ORDER BY updated_at DESC LIMIT 1`, input.AccountID, input.Folder, input.MessageID, input.Path, input.Path).Scan(&moveID)
+		if moveErr == nil && moveID != 0 {
+			if _, err := s.DB.ExecContext(ctx, `UPDATE mail_messages SET path=?,message_id=?,sender=?,recipients=?,cc=?,subject=?,message_date=?,message_date_utc=?,is_read=?,alerted=?,alert_attempts=?,attachment_count=?,updated_at=?,last_seen_scan=?,source_size=? WHERE id=?`, input.Path, input.MessageID, input.Sender, input.Recipients, input.Cc, input.Subject, input.Date, input.DateUTC, input.Read, input.Alerted, input.AlertAttempts, input.Attachments, input.UpdatedAt, input.ScanID, input.SourceSize, moveID); err != nil {
+				return 0, err
+			}
+			return moveID, nil
+		} else if moveErr != nil && !errors.Is(moveErr, sql.ErrNoRows) {
+			return 0, moveErr
+		}
+	}
 	_, err := s.DB.ExecContext(ctx, `INSERT INTO mail_messages(account_id,folder,path,message_id,sender,recipients,cc,subject,message_date,message_date_utc,is_read,alerted,alert_attempts,attachment_count,updated_at,last_seen_scan,source_size) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET folder=excluded.folder,message_id=excluded.message_id,sender=excluded.sender,recipients=excluded.recipients,cc=excluded.cc,subject=excluded.subject,message_date=excluded.message_date,message_date_utc=excluded.message_date_utc,is_read=excluded.is_read,attachment_count=excluded.attachment_count,updated_at=excluded.updated_at,last_seen_scan=excluded.last_seen_scan,source_size=excluded.source_size`, input.AccountID, input.Folder, input.Path, input.MessageID, input.Sender, input.Recipients, input.Cc, input.Subject, input.Date, input.DateUTC, input.Read, input.Alerted, input.AlertAttempts, input.Attachments, input.UpdatedAt, input.ScanID, input.SourceSize)
 	if err != nil {
 		return 0, err

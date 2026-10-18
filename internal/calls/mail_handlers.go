@@ -36,8 +36,36 @@ func (s *Service) savePendingContact(sess *session) {
 	s.prompt(sess, "Contact saved. "+menuPrompt("more_options"))
 }
 
-func (s *Service) readMessage(sess *session, m store.MailSummary) {
+// openSessionMessage opens a session message's file even when its indexed path
+// has gone stale. It re-reads the row's current path and the paths of duplicate
+// rows for the same message identity (an index pass can leave a stale duplicate
+// behind a flag rename), so the message stays playable instead of reporting
+// "not available", and returns the location that actually opened.
+func (s *Service) openSessionMessage(sess *session, m store.MailSummary) (*os.File, string, error) {
 	file, err := openMessageFile(m.Path)
+	if err == nil {
+		return file, m.Path, nil
+	}
+	if s.Store == nil {
+		return nil, "", err
+	}
+	own, siblings, lookupErr := s.Store.MailReadCandidates(s.baseContext(), sess.UserID, m.ID)
+	if lookupErr != nil {
+		return nil, "", err
+	}
+	for _, candidate := range append([]string{own}, siblings...) {
+		if candidate == "" || candidate == m.Path {
+			continue
+		}
+		if file, openErr := openMessageFile(candidate); openErr == nil {
+			return file, candidate, nil
+		}
+	}
+	return nil, "", err
+}
+
+func (s *Service) readMessage(sess *session, m store.MailSummary) {
+	file, resolvedPath, err := s.openSessionMessage(sess, m)
 	if err != nil {
 		s.prompt(sess, "That message is no longer available.")
 		s.prompt(sess, menuPrompt("read"))
@@ -48,6 +76,14 @@ func (s *Service) readMessage(sess *session, m store.MailSummary) {
 	if err != nil {
 		s.prompt(sess, "I could not read that message.")
 		return
+	}
+	// The listed path can go stale between the unread list snapshot and this
+	// read (a flag rename or a re-homed index row). Pointing the session at the
+	// location that opened keeps the follow-up mark-read, delete and forward
+	// actions working on the file that is actually present.
+	if resolvedPath != m.Path {
+		s.updateSessionMessagePath(sess, m.ID, resolvedPath)
+		m.Path = resolvedPath
 	}
 	localPath, localErr := s.queueLocalReadState(sess, m, true)
 	if localErr != nil {
@@ -956,4 +992,28 @@ func (s *Service) resolveIMAPEndpoint(ctx context.Context, host string, port int
 		return s.IMAPEndpointResolver(ctx, host, port)
 	}
 	return netguard.CheckAndPin(ctx, host, port, false)
+}
+
+// advanceToPlayable advances the read cursor to the next message whose file can
+// still be opened, announcing skipped messages instead of failing them one by
+// one. It returns the last message even when nothing playable remains so the
+// caller reports the usual unavailability prompt.
+func (s *Service) advanceToPlayable(sess *session) store.MailSummary {
+	for attempt := 0; attempt < 9; attempt++ {
+		s.mu.Lock()
+		sess.Cursor = (sess.Cursor + 1) % len(sess.Messages)
+		m := sess.Messages[sess.Cursor]
+		s.mu.Unlock()
+		if file, _, err := s.openSessionMessage(sess, m); err == nil {
+			_ = file.Close()
+			return m
+		}
+		if attempt == 0 {
+			s.prompt(sess, "Skipping a message that is no longer available.")
+		}
+	}
+	s.mu.Lock()
+	m := sess.Messages[sess.Cursor]
+	s.mu.Unlock()
+	return m
 }

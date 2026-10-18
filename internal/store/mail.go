@@ -778,7 +778,11 @@ func (s *Store) MoveMailIndex(ctx context.Context, userID string, id int64, fold
 	return nil
 }
 
-func (s *Store) UpdateMailIdentity(ctx context.Context, accountID, folder, messageID string, uid, uidValidity uint32, flags []string) error {
+// keepLocalRead preserves the row's current read state when the provider's
+// flags have not caught up with a local read change yet (the change is still
+// queued for mbsync), so a reconciliation pass cannot erase a read the user
+// just made.
+func (s *Store) UpdateMailIdentity(ctx context.Context, accountID, folder, messageID string, uid, uidValidity uint32, flags []string, keepLocalRead bool) error {
 	if accountID == "" || folder == "" || messageID == "" || uid == 0 || uidValidity == 0 {
 		return nil
 	}
@@ -807,7 +811,7 @@ func (s *Store) UpdateMailIdentity(ctx context.Context, accountID, folder, messa
 			break
 		}
 	}
-	_, err = s.DB.ExecContext(ctx, `UPDATE mail_messages SET folder=?,imap_uid=?,uid_validity=?,message_flags=?,is_read=?,updated_at=? WHERE id=? AND account_id=?`, folder, uid, uidValidity, strings.Join(flags, " "), seen, time.Now().UTC().Format(time.RFC3339Nano), id, accountID)
+	_, err = s.DB.ExecContext(ctx, `UPDATE mail_messages SET folder=?,imap_uid=?,uid_validity=?,message_flags=?,is_read=CASE WHEN ? THEN mail_messages.is_read ELSE ? END,updated_at=? WHERE id=? AND account_id=?`, folder, uid, uidValidity, strings.Join(flags, " "), keepLocalRead, seen, time.Now().UTC().Format(time.RFC3339Nano), id, accountID)
 	return err
 }
 
@@ -815,7 +819,7 @@ func (s *Store) UpdateMailIdentity(ctx context.Context, accountID, folder, messa
 // Message-ID header. UID plus UIDVALIDITY is the only stable identity
 // available in that case, and the folder is part of the lookup because UIDs
 // are scoped to an IMAP mailbox.
-func (s *Store) UpdateMailIdentityByUID(ctx context.Context, accountID, folder string, uid, uidValidity uint32, flags []string) error {
+func (s *Store) UpdateMailIdentityByUID(ctx context.Context, accountID, folder string, uid, uidValidity uint32, flags []string, keepLocalRead bool) error {
 	if accountID == "" || folder == "" || uid == 0 || uidValidity == 0 {
 		return nil
 	}
@@ -826,8 +830,39 @@ func (s *Store) UpdateMailIdentityByUID(ctx context.Context, accountID, folder s
 			break
 		}
 	}
-	_, err := s.DB.ExecContext(ctx, `UPDATE mail_messages SET imap_uid=?,uid_validity=?,message_flags=?,is_read=?,updated_at=? WHERE account_id=? AND folder=? AND imap_uid=? AND uid_validity=?`, uid, uidValidity, strings.Join(flags, " "), seen, time.Now().UTC().Format(time.RFC3339Nano), accountID, folder, uid, uidValidity)
+
+	_, err := s.DB.ExecContext(ctx, `UPDATE mail_messages SET imap_uid=?,uid_validity=?,message_flags=?,is_read=CASE WHEN ? THEN mail_messages.is_read ELSE ? END,updated_at=? WHERE account_id=? AND folder=? AND imap_uid=? AND uid_validity=?`, uid, uidValidity, strings.Join(flags, " "), keepLocalRead, seen, time.Now().UTC().Format(time.RFC3339Nano), accountID, folder, uid, uidValidity)
 	return err
+}
+
+// MailReadCandidates returns the locations where a message's file can still be
+// found after its indexed path went stale: the row's current path first (it may
+// have been renamed or re-homed since the session listed the message), then the
+// paths of duplicate rows for the same message identity, which an index pass
+// can leave behind when a flag change re-indexes the message under a new name.
+func (s *Store) MailReadCandidates(ctx context.Context, userID string, id int64) (string, []string, error) {
+	var accountID, folder, messageID, own string
+	err := s.DB.QueryRowContext(ctx, `SELECT m.account_id,m.folder,COALESCE(m.message_id,''),m.path FROM mail_messages m WHERE m.id=? AND m.account_id IN (SELECT id FROM accounts WHERE user_id=?)`, id, userID).Scan(&accountID, &folder, &messageID, &own)
+	if err != nil {
+		return "", nil, err
+	}
+	if strings.TrimSpace(messageID) == "" {
+		return own, nil, nil
+	}
+	rows, err := s.DB.QueryContext(ctx, `SELECT path FROM mail_messages WHERE account_id=? AND folder=? AND message_id=? AND path<>? ORDER BY updated_at DESC LIMIT 5`, accountID, folder, messageID, own)
+	if err != nil {
+		return own, nil, err
+	}
+	defer rows.Close()
+	var siblings []string
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return own, siblings, err
+		}
+		siblings = append(siblings, path)
+	}
+	return own, siblings, rows.Err()
 }
 
 // PruneRemoteFolders removes folder records no longer returned by a complete

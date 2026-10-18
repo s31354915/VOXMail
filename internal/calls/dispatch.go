@@ -415,10 +415,7 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 			s.mu.Unlock()
 			s.prompt(sess, menuPrompt("more_options"))
 		} else if key == "0" {
-			s.mu.Lock()
-			sess.Cursor = (sess.Cursor + 1) % len(sess.Messages)
-			m = sess.Messages[sess.Cursor]
-			s.mu.Unlock()
+			m = s.advanceToPlayable(sess)
 			s.readMessage(sess, m)
 		}
 	case "attachment_menu":
