@@ -163,7 +163,7 @@ func (s *Service) playSpeechChunks(sess *session, chunks []string) {
 			return runtime.Synthesize(ctx, text, output)
 		},
 		func(ctx context.Context, path string) error {
-			return s.Media.playWAV(ctx, sess.TxPath, path)
+			return s.Media.playWAVTail(ctx, sess.TxPath, path, pcmChunkDrainTail)
 		})
 }
 

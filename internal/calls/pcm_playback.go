@@ -14,11 +14,18 @@ const (
 	pcmBytesPerSecond = 8000 * 2
 	// pcmJitterBuffer is the wall-clock credit the writer keeps ahead of the
 	// media clock when pacing begins or after a stall.
-	pcmJitterBuffer = 120 * time.Millisecond
+	pcmJitterBuffer = 250 * time.Millisecond
+	// pcmDrainTail waits out baresip's device pipeline after the FIFO runs
+	// dry, so a prompt tail is not clipped by the next prompt or a hangup.
+	pcmDrainTail = 500 * time.Millisecond
+	// pcmChunkDrainTail is the shorter tail between streamed body chunks:
+	// the next chunk is the same speech continuing, so a long tail only
+	// adds the pause callers hear between chunks.
+	pcmChunkDrainTail = 250 * time.Millisecond
 )
 
-// Keep a small jitter prebuffer ahead of the media clock, rather than filling
-// a multi-second kernel FIFO. The 120 ms credit absorbs scheduler and CPU
+// Keep a jitter prebuffer ahead of the media clock, rather than filling
+// a multi-second kernel FIFO. The 250 ms credit absorbs scheduler and CPU
 // contention stalls (Piper, Whisper, and ffmpeg sharing one box) so the FIFO
 // runs dry far less often and speech does not stutter.
 type pacedPCMWriter struct {
@@ -79,7 +86,7 @@ func waitPCM(ctx context.Context, duration time.Duration) error {
 // FIFO writes acknowledge buffering, not consumption. Wait for the native
 // reader before completing playback; allow the final frame through the audio
 // buffer before an alert is allowed to hang up.
-func drainPCM(ctx context.Context, pipe *os.File) error {
+func drainPCM(ctx context.Context, pipe *os.File, tail time.Duration) error {
 	raw, err := pipe.SyscallConn()
 	if err != nil {
 		return err
@@ -99,9 +106,9 @@ func drainPCM(ctx context.Context, pipe *os.File) error {
 		}
 		if pending == 0 {
 			// The FIFO is empty, but baresip's decode and device pipeline can
-			// still hold more than this; wait long enough that the tail of a
-			// prompt is not clipped by the next prompt or a hangup.
-			return waitPCM(ctx, 500*time.Millisecond)
+			// still hold more than this; wait out the requested tail so the
+			// end of a prompt is not clipped by the next prompt or a hangup.
+			return waitPCM(ctx, tail)
 		}
 		if err := waitPCM(ctx, 10*time.Millisecond); err != nil {
 			return err

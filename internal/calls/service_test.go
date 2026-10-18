@@ -79,7 +79,7 @@ func TestPromptFIFOOpenRespectsCancellation(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
 	defer cancel()
-	err := (&PromptPlayer{Binary: "does-not-matter"}).playInput(ctx, path, "input.wav")
+	err := (&PromptPlayer{Binary: "does-not-matter"}).playInput(ctx, path, "input.wav", pcmDrainTail)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("playInput error=%v, want context deadline", err)
 	}
