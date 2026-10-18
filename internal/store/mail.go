@@ -45,7 +45,7 @@ func (s *Store) ListMail(ctx context.Context, userID string, unreadOnly bool) ([
 		}
 		query += ` AND (` + strings.Join(parts, ` OR `) + `)`
 	}
-	query += ` ORDER BY CASE WHEN m.message_date_utc IS NULL THEN 1 ELSE 0 END,m.message_date_utc,m.id DESC`
+	query += ` ORDER BY CASE WHEN m.message_date_utc IS NULL THEN 1 ELSE 0 END,m.message_date_utc DESC,m.id DESC`
 	rows, err := s.DB.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -104,7 +104,7 @@ func (s *Store) ListMailForAccount(ctx context.Context, userID, accountID, folde
 		}
 		query += ` AND m.is_read=0`
 	}
-	query += ` ORDER BY CASE WHEN m.message_date_utc IS NULL THEN 1 ELSE 0 END,m.message_date_utc,m.id DESC`
+	query += ` ORDER BY CASE WHEN m.message_date_utc IS NULL THEN 1 ELSE 0 END,m.message_date_utc DESC,m.id DESC`
 	rows, err := s.DB.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -137,9 +137,9 @@ func scanMailSummary(rows *sql.Rows, m *MailSummary) error {
 	return nil
 }
 
-// ListMailPage returns one bounded keyset page. Valid normalized dates sort
-// first in chronological order; rows with invalid or missing dates are kept
-// in deterministic ID order after them. A nil Next cursor means completion.
+// ListMailPage returns one bounded keyset page. Newest messages sort first;
+// rows with invalid or missing dates keep deterministic ID order after them.
+// A nil Next cursor means completion.
 func (s *Store) ListMailPage(ctx context.Context, userID, accountID, folder string, unreadOnly bool, after *MailCursor, limit int) (MailPage, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 50
@@ -223,11 +223,11 @@ func (s *Store) ListMailPage(ctx context.Context, userID, accountID, folder stri
 			query += ` AND m.message_date_utc IS NULL AND m.id < ?`
 			args = append(args, after.ID)
 		} else {
-			query += ` AND ((m.message_date_utc IS NOT NULL AND (m.message_date_utc > ? OR (m.message_date_utc=? AND m.id < ?))) OR m.message_date_utc IS NULL)`
+			query += ` AND (m.message_date_utc < ? OR (m.message_date_utc=? AND m.id < ?) OR m.message_date_utc IS NULL)`
 			args = append(args, *after.DateUTC, *after.DateUTC, after.ID)
 		}
 	}
-	query += ` ORDER BY CASE WHEN m.message_date_utc IS NULL THEN 1 ELSE 0 END,m.message_date_utc,m.id DESC LIMIT ?`
+	query += ` ORDER BY CASE WHEN m.message_date_utc IS NULL THEN 1 ELSE 0 END,m.message_date_utc DESC,m.id DESC LIMIT ?`
 	args = append(args, limit+1)
 	rows, err := s.DB.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -880,7 +880,7 @@ func (s *Store) UpsertRemoteFolder(ctx context.Context, accountID, remotePath, l
 	remotePath = folderpolicy.RemoteKey(strings.TrimSpace(remotePath))
 	localPath = filepathCleanFolder(localPath)
 	if accountID == "" || remotePath == "" {
-		return fmt.Errorf("remote folder identity is required")
+		return fmt.Errorf("account identity is required")
 	}
 	parent := ""
 	if slash := strings.LastIndex(strings.ReplaceAll(remotePath, "\\", "/"), "/"); slash > 0 {
@@ -914,7 +914,7 @@ FROM remote_folders WHERE account_id=? AND (remote_path=? OR (?='INBOX' AND lowe
 	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO account_folder_bindings(account_id,local_path,remote_path) VALUES(?,?,?)`, accountID, localPath, folderpolicy.RemoteKey(remotePath)); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO remote_folders(account_id,remote_path,local_path,parent_path,depth,role,display_name,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(account_id,remote_path) DO UPDATE SET local_path=excluded.local_path,parent_path=excluded.parent_path,depth=excluded.depth,role=excluded.role,display_name=excluded.display_name,updated_at=excluded.updated_at`, accountID, remotePath, localPath, parent, depth, role, display, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO remote_folders(account_id,remote_path,local_path,parent_path,depth,role,display_name,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(account_id,remote_path) DO UPDATE SET local_path=excluded.local_path,parent_path=exited.parent_path,depth=excluded.depth,role=excluded.role,display_name=excluded.display_name,updated_at=excluded.updated_at`, accountID, remotePath, localPath, parent, depth, role, display, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		return err
 	}
 	return tx.Commit()
