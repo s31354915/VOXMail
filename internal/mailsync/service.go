@@ -75,8 +75,8 @@ type SyncStore interface {
 	PhysicalFoldersForRemote(context.Context, string, string, string) ([]string, error)
 	UpsertRemoteFolder(context.Context, string, string, string, string) error
 	PruneRemoteFolders(context.Context, string, []string) error
-	UpdateMailIdentity(context.Context, string, string, string, uint32, uint32, []string) error
-	UpdateMailIdentityByUID(context.Context, string, string, uint32, uint32, []string) error
+	UpdateMailIdentity(context.Context, string, string, string, uint32, uint32, []string, bool) error
+	UpdateMailIdentityByUID(context.Context, string, string, uint32, uint32, []string, bool) error
 	QueuedMutationWatermark(context.Context, string) (int64, error)
 	QueuedReadMutations(context.Context, string, int64) ([]store.QueuedReadMutation, error)
 	LatestReadForIdentity(context.Context, string, []string, uint32, uint32) (store.QueuedReadMutation, error)
@@ -565,7 +565,7 @@ func (s *Service) syncAccountStarted(ctx context.Context, account store.Account,
 	// reconciliation, and an explicit manual refresh; doing it every five
 	// minutes would turn the incremental worker into a full IMAP scan.
 	if shouldReconcileRemote(kind) {
-		if err := s.reconcileRemoteIdentity(ctx, account, folderMap, imapAddress); err != nil {
+		if err := s.reconcileRemoteIdentity(ctx, account, folderMap, imapAddress, mutationWatermark); err != nil {
 			return err
 		}
 	}
@@ -635,7 +635,7 @@ func (s *Service) discoverSyncFolders(ctx context.Context, account store.Account
 	return folders, nil
 }
 
-func (s *Service) reconcileRemoteIdentity(ctx context.Context, account store.Account, mapping map[string]string, imapAddress string) error {
+func (s *Service) reconcileRemoteIdentity(ctx context.Context, account store.Account, mapping map[string]string, imapAddress string, mutationWatermark int64) error {
 	if s.Secrets == nil || strings.TrimSpace(account.IMAPPassword) == "" {
 		return nil
 	}
@@ -652,6 +652,30 @@ func (s *Service) reconcileRemoteIdentity(ctx context.Context, account store.Acc
 		return err
 	}
 	defer connection.Close()
+
+	// Local read changes that have not reached the provider yet must not be
+	// erased when the provider's flags are replayed into the index. A user
+	// who listened to a message minutes ago keeps that read state even when
+	// the server still reports it unread; mbsync pushes the flag on its next
+	// run and a later reconciliation aligns the remainder.
+	pendingReads := make(map[string]struct{})
+	if mutationWatermark > 0 {
+		pending, err := s.Store.QueuedReadMutations(ctx, account.ID, mutationWatermark)
+		if err != nil {
+			if s.Log != nil {
+				s.Log.Warn("mail reconciliation could not load pending read changes", "account_id", account.ID, "error", err)
+			}
+		} else {
+			for _, item := range pending {
+				if item.UID != 0 && item.UIDValidity != 0 {
+					pendingReads[fmt.Sprintf("uid:%d:%d", item.UID, item.UIDValidity)] = struct{}{}
+				}
+				if strings.TrimSpace(item.MessageID) != "" {
+					pendingReads["mid:"+item.MessageID] = struct{}{}
+				}
+			}
+		}
+	}
 	roles, err := s.Store.ListFolderRoles(ctx, account.UserID, account.ID)
 	if err != nil {
 		return err
@@ -692,11 +716,20 @@ func (s *Service) reconcileRemoteIdentity(ctx context.Context, account store.Acc
 			// rows created before the next sync recorded their IMAP UID. An alias
 			// may preserve a stale duplicate, but it must never cause deletion.
 			retainRemoteIdentity(remoteIdentities, physicalFolders, identity)
+			keepLocalRead := false
+			if _, ok := pendingReads[fmt.Sprintf("uid:%d:%d", identity.UID, identity.UIDValidity)]; ok {
+				keepLocalRead = true
+			}
+			if strings.TrimSpace(identity.MessageID) != "" {
+				if _, ok := pendingReads["mid:"+strings.TrimSpace(identity.MessageID)]; ok {
+					keepLocalRead = true
+				}
+			}
 			var updateErr error
 			if strings.TrimSpace(identity.MessageID) != "" {
-				updateErr = s.Store.UpdateMailIdentity(ctx, account.ID, localFolder, identity.MessageID, identity.UID, identity.UIDValidity, identity.Flags)
+				updateErr = s.Store.UpdateMailIdentity(ctx, account.ID, localFolder, identity.MessageID, identity.UID, identity.UIDValidity, identity.Flags, keepLocalRead)
 			} else {
-				updateErr = s.Store.UpdateMailIdentityByUID(ctx, account.ID, localFolder, identity.UID, identity.UIDValidity, identity.Flags)
+				updateErr = s.Store.UpdateMailIdentityByUID(ctx, account.ID, localFolder, identity.UID, identity.UIDValidity, identity.Flags, keepLocalRead)
 			}
 			if updateErr != nil {
 				return updateErr
