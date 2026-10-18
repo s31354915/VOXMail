@@ -1,6 +1,8 @@
 package calls
 
 import (
+	"context"
+	"os"
 	"strings"
 	"testing"
 )
@@ -87,5 +89,26 @@ func TestTruncateForSpeechPassthrough(t *testing.T) {
 	text := "Short body."
 	if truncated, ok := truncateForSpeech(text, 50); ok || truncated != text {
 		t.Fatalf("short text should pass through unchanged: ok=%v got=%q", ok, truncated)
+	}
+}
+
+func TestStreamSpeechChunksPlaysEveryChunk(t *testing.T) {
+	svc := &Service{sessions: make(map[string]*session)}
+	sess := &session{CallID: "stream"}
+	svc.sessions[sess.CallID] = sess
+	plays := 0
+	play := func(ctx context.Context, path string) error {
+		svc.mu.Lock()
+		sess.playSequence++
+		svc.mu.Unlock()
+		plays++
+		return nil
+	}
+	synthesize := func(ctx context.Context, text, output string) error {
+		return os.WriteFile(output, []byte("wav"), 0600)
+	}
+	svc.streamSpeechChunks(sess, t.TempDir(), []string{"one", "two", "three", "four"}, synthesize, play)
+	if plays != 4 {
+		t.Fatalf("played %d of 4 chunks; the stream stopped early", plays)
 	}
 }

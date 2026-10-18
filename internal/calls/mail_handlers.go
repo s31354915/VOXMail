@@ -37,9 +37,10 @@ func (s *Service) savePendingContact(sess *session) {
 }
 
 func (s *Service) readMessage(sess *session, m store.MailSummary) {
-	file, err := os.Open(m.Path)
+	file, err := openMessageFile(m.Path)
 	if err != nil {
 		s.prompt(sess, "That message is no longer available.")
+		s.prompt(sess, menuPrompt("read"))
 		return
 	}
 	parsed, err := mailparse.Parse(file)
@@ -48,9 +49,14 @@ func (s *Service) readMessage(sess *session, m store.MailSummary) {
 		s.prompt(sess, "I could not read that message.")
 		return
 	}
-	if _, localErr := s.queueLocalReadState(sess, m, true); localErr != nil {
+	localPath, localErr := s.queueLocalReadState(sess, m, true)
+	if localErr != nil {
 		s.prompt(sess, "The local mail cache could not be updated.")
+		s.prompt(sess, menuPrompt("read"))
 		return
+	}
+	if localPath != m.Path {
+		s.updateSessionMessagePath(sess, m.ID, localPath)
 	}
 	opening := "Email from"
 	if !m.Read {
@@ -378,9 +384,13 @@ func (s *Service) moveCurrent(sess *session, destination string) {
 
 func (s *Service) toggleRead(sess *session, message store.MailSummary) {
 	read := !message.Read
-	if _, err := s.queueLocalReadState(sess, message, read); err != nil {
+	localPath, err := s.queueLocalReadState(sess, message, read)
+	if err != nil {
 		s.prompt(sess, "The local read state could not be updated.")
 		return
+	}
+	if localPath != message.Path {
+		s.updateSessionMessagePath(sess, message.ID, localPath)
 	}
 	if read {
 		s.prompt(sess, "Message marked read locally and queued for synchronization.")
@@ -487,6 +497,21 @@ func (s *Service) deleteCurrent(sess *session) {
 		}
 		return
 	}
+	// The listed path can be stale: an earlier mark-read or toggle in this
+	// call renamed the maildir file. Resolve the current location before
+	// renaming into Trash.
+	source := pathAbs
+	if _, statErr := os.Stat(source); statErr != nil {
+		for _, candidate := range []string{mailparse.MaildirReadPath(pathAbs, true), mailparse.MaildirReadPath(pathAbs, false)} {
+			if candidate == pathAbs {
+				continue
+			}
+			if info, candErr := os.Stat(candidate); candErr == nil && info.Mode().IsRegular() {
+				source = candidate
+				break
+			}
+		}
+	}
 	trash := filepath.Join(rootAbs, trashName, "cur")
 	if !strings.HasPrefix(filepath.Clean(trash), rootAbs+string(filepath.Separator)) {
 		s.recordMutation(sess, m, "delete", m.Folder, trashName, "partial", errors.New("trash path escaped account root"))
@@ -500,18 +525,18 @@ func (s *Service) deleteCurrent(sess *session) {
 		s.prompt(sess, "I could not delete that message.")
 		return
 	}
-	target := filepath.Join(trash, filepath.Base(pathAbs))
+	target := filepath.Join(trash, filepath.Base(source))
 	if !strings.Contains(target, ":2,") {
 		target += ":2,S"
 	}
-	err := os.Rename(pathAbs, target)
+	err := os.Rename(source, target)
 	if err == nil {
 		if indexErr := s.Store.DeleteMailIndex(s.baseContext(), sess.UserID, m.ID); indexErr != nil {
 			err = indexErr
 		}
 	}
 	if err != nil {
-		if renameErr := os.Rename(target, pathAbs); renameErr != nil && s.Log != nil {
+		if renameErr := os.Rename(target, source); renameErr != nil && s.Log != nil {
 			s.Log.Warn("could not roll back local trash move", "message_id", m.ID, "error", renameErr)
 		}
 		_ = s.rollbackRemoteMove(sess, m, trashName, m.Folder)
@@ -520,12 +545,63 @@ func (s *Service) deleteCurrent(sess *session) {
 		s.recordMutation(sess, m, "delete", m.Folder, trashName, "success", nil)
 	}
 	s.mu.Lock()
+	if err == nil {
+		// Drop the deleted message from the session list and point the
+		// cursor at its neighbor, so later keys do not act on a message
+		// that is gone.
+		if sess.Cursor >= 0 && sess.Cursor < len(sess.Messages) && sess.Messages[sess.Cursor].ID == m.ID {
+			sess.Messages = append(sess.Messages[:sess.Cursor], sess.Messages[sess.Cursor+1:]...)
+			if sess.Cursor >= len(sess.Messages) {
+				if len(sess.Messages) > 0 {
+					sess.Cursor = len(sess.Messages) - 1
+				} else {
+					sess.Cursor = 0
+				}
+			}
+		}
+	}
 	transitionLocked(sess, "list")
 	s.mu.Unlock()
 	if err == nil {
 		s.prompt(sess, "Moved to trash.")
 	} else {
 		s.prompt(sess, "I could not delete that message.")
+	}
+}
+
+// openMessageFile opens a message by its listed path. A message whose read
+// flag changed earlier in the call was renamed on disk while the session list
+// may still hold the original path, so the renamed forms are tried before
+// giving up.
+func openMessageFile(path string) (*os.File, error) {
+	file, err := os.Open(path)
+	if err == nil {
+		return file, nil
+	}
+	for _, renamed := range []string{mailparse.MaildirReadPath(path, true), mailparse.MaildirReadPath(path, false)} {
+		if renamed == path {
+			continue
+		}
+		if retry, retryErr := os.Open(renamed); retryErr == nil {
+			return retry, nil
+		}
+	}
+	return nil, err
+}
+
+// updateSessionMessagePath refreshes the on-disk path of a message in the
+// session list after the maildir file was renamed (for example when the read
+// flag was set), so later keys in the same call do not fail on a stale path.
+func (s *Service) updateSessionMessagePath(sess *session, messageID int64, path string) {
+	if s == nil || sess == nil || path == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range sess.Messages {
+		if sess.Messages[i].ID == messageID {
+			sess.Messages[i].Path = path
+		}
 	}
 }
 

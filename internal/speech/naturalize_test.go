@@ -15,9 +15,9 @@ func TestEmailToSpeechUnicodeCurrency(t *testing.T) {
 	for _, tc := range []struct {
 		input, want string
 	}{
-		{"€12.50", "12 euros and 50 cents"},
+		{"€12.50", "twelve euros and fifty cents"},
 		{"£7", "7 pounds"},
-		{"$3.25", "3 dollars and 25 cents"},
+		{"$3.25", "3 dollars and twenty-five cents"},
 	} {
 		if got := EmailToSpeech(tc.input); got != tc.want {
 			t.Fatalf("EmailToSpeech(%q)=%q, want %q", tc.input, got, tc.want)
@@ -66,13 +66,47 @@ func TestEmailToSpeechBlockTagsBreakSentences(t *testing.T) {
 
 func TestEmailToSpeechDatesAreSpokenNaturally(t *testing.T) {
 	for _, tc := range []struct{ input, want string }{
-		{"Meeting moved to 2026-10-17.", "Meeting moved to October 17, 2026."},
-		{"Due 10/17/2026 at noon.", "Due October 17, 2026 at noon."},
+		{"Meeting moved to 2026-10-17.", "Meeting moved to October seventeen, two thousand twenty-six."},
+		{"Due 10/17/2026 at noon.", "Due October seventeen, two thousand twenty-six at noon."},
 		{"Order 48291047 shipped.", "Order 4 8 2 9 1 0 4 7 shipped."},
 		{"Version 2.3.4 shipped.", "Version 2.3.4 shipped."},
 	} {
 		if got := EmailToSpeech(tc.input); got != tc.want {
 			t.Errorf("EmailToSpeech(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
+
+func TestEmailToSpeechKeepsParagraphBreaks(t *testing.T) {
+	got := EmailToSpeech("Hi there,\n\nThanks for the update.\n\nBest,\nAlex")
+	want := "Hi there, Thanks for the update. Best, Alex"
+	if got != want {
+		t.Fatalf("EmailToSpeech=%q, want %q", got, want)
+	}
+	if got := EmailToSpeech("line one\nline two"); got != "line one line two" {
+		t.Fatalf("hard-wrapped newline collapsed wrongly: %q", got)
+	}
+	if got := EmailToSpeech("> old reply\n\nFresh text"); got != "old reply. Fresh text" {
+		t.Fatalf("quoted marker not stripped: %q", got)
+	}
+	if again := EmailToSpeech(got); again != got {
+		t.Fatalf("EmailToSpeech is not idempotent on paragraph output: %q", again)
+	}
+}
+
+func TestEmailToSpeechSpeaksNumbersAsWords(t *testing.T) {
+	for _, tc := range []struct{ input, want string }{
+		{"Email 1 of 6125", "Email 1 of six thousand one hundred twenty-five"},
+		{"You have 1,000 messages", "You have one thousand messages"},
+		{"version 3.5 released", "version three point five released"},
+		{"meeting at 3:30 pm", "meeting at three thirty p m"},
+		{"10:05 deadline", "ten oh five deadline"},
+		{"dated 2026-10-18", "dated October eighteen, two thousand twenty-six"},
+		{"Order 48291047 shipped.", "Order 4 8 2 9 1 0 4 7 shipped."},
+		{"Version 2.3.4 shipped.", "Version 2.3.4 shipped."},
+	} {
+		if got := EmailToSpeech(tc.input); got != tc.want {
+			t.Errorf("EmailToSpeech(%q)=%q, want %q", tc.input, got, tc.want)
 		}
 	}
 }

@@ -154,14 +154,29 @@ func (s *Service) playSpeechChunks(sess *session, chunks []string) {
 		}
 		return
 	}
-	s.mu.Lock()
-	startSequence := sess.playSequence
-	s.mu.Unlock()
-
 	dir := s.Media.Dir
 	if dir == "" {
 		dir = filepath.Dir(sess.TxPath)
 	}
+	s.streamSpeechChunks(sess, dir, chunks,
+		func(ctx context.Context, text, output string) error {
+			return runtime.Synthesize(ctx, text, output)
+		},
+		func(ctx context.Context, path string) error {
+			return s.Media.playWAVTail(ctx, sess.TxPath, path, pcmChunkDrainTail)
+		})
+}
+
+// streamSpeechChunks owns the double-buffered streaming loop, split from
+// playSpeechChunks so tests can drive it with fake synthesis and playback.
+// The staleness check re-reads playSequence after every chunk this loop
+// plays: playPrompt advances the sequence for each chunk, so comparing
+// against a pre-loop snapshot made the stream stop after its first chunk.
+func (s *Service) streamSpeechChunks(sess *session, dir string, chunks []string, synthesize func(context.Context, string, string) error, play func(context.Context, string) error) {
+	s.mu.Lock()
+	startSequence := sess.playSequence
+	s.mu.Unlock()
+
 	paths := make([]string, bodyChunkSlots)
 	releases := make([]func(), bodyChunkSlots)
 	for i := range paths {
@@ -200,7 +215,7 @@ func (s *Service) playSpeechChunks(sess *session, chunks []string) {
 			case <-workerCtx.Done():
 				return
 			}
-			err := runtime.Synthesize(workerCtx, chunk, paths[slot])
+			err := synthesize(workerCtx, chunk, paths[slot])
 			select {
 			case ready <- produced{slot: slot, err: err}:
 			case <-workerCtx.Done():
@@ -239,11 +254,20 @@ func (s *Service) playSpeechChunks(sess *session, chunks []string) {
 			if s.Log != nil {
 				s.Log.Warn("email body chunk synthesis failed", "error", item.err)
 			}
+			// A failed chunk used to end the rest of the body in silence;
+			// say so before the menu follows.
+			s.prompt(sess, "The rest of this message could not be read.")
 			return
 		}
 		err := s.playPrompt(sess, func(playCtx context.Context) error {
-			return s.Media.playWAV(playCtx, sess.TxPath, paths[item.slot])
+			return play(playCtx, paths[item.slot])
 		})
+		s.mu.Lock()
+		// Adopt the sequence our own play just produced (or a newer prompt
+		// replaced); the next iteration compares against the latest state,
+		// not the pre-loop snapshot.
+		startSequence = sess.playSequence
+		s.mu.Unlock()
 		if err != nil {
 			if !errors.Is(err, context.Canceled) && s.Log != nil {
 				s.Log.Warn("email body chunk playback failed", "error", err)

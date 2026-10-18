@@ -82,7 +82,7 @@ func (p *PromptPlayer) PlayWithRuntimeForUser(ctx context.Context, runtime *spee
 	staticVoiceMatches := runtime == nil || staticVoice == "" || strings.TrimSuffix(filepath.Base(runtime.Piper.Model), filepath.Ext(runtime.Piper.Model)) == staticVoice
 	if static := staticMuAssets; static != "" && staticVoiceMatches {
 		if _, err := os.Stat(static); err == nil {
-			return p.playWAV(ctx, fifo, static)
+			return p.playWAVTail(ctx, fifo, static, pcmDrainTail)
 		}
 	}
 
@@ -90,7 +90,7 @@ func (p *PromptPlayer) PlayWithRuntimeForUser(ctx context.Context, runtime *spee
 		if cached, ok := p.dynamicPromptPath(userID, runtime, text); ok {
 			releaseCached := maintenance.Protect(cached)
 			if _, err := os.Stat(cached); err == nil {
-				err := p.playWAV(ctx, fifo, cached)
+				err := p.playWAVTail(ctx, fifo, cached, pcmDrainTail)
 				releaseCached()
 				return err
 			}
@@ -118,16 +118,16 @@ func (p *PromptPlayer) PlayWithRuntimeForUser(ctx context.Context, runtime *spee
 				defer releaseCached()
 				if err := p.activateDynamicPrompt(wav, cached); err == nil {
 					p.pruneDynamicPrompts()
-					return p.playWAV(ctx, fifo, cached)
+					return p.playWAVTail(ctx, fifo, cached, pcmDrainTail)
 				}
 			}
 		}
-		return p.playWAV(ctx, fifo, wav)
+		return p.playWAVTail(ctx, fifo, wav, pcmDrainTail)
 	}
 	if err := p.Piper.Synthesize(ctx, text, wav); err != nil {
 		return err
 	}
-	return p.playWAV(ctx, fifo, wav)
+	return p.playWAVTail(ctx, fifo, wav, pcmDrainTail)
 }
 
 func (p *PromptPlayer) dynamicPromptPath(userID string, runtime *speech.Runtime, text string) (string, bool) {
@@ -397,7 +397,7 @@ func (p *PromptPlayer) PlayGreetingWithRuntime(ctx context.Context, runtime *spe
 		p.staticMu.RUnlock()
 		if greeting != "" {
 			if _, err := os.Stat(greeting); err == nil {
-				return p.playWAV(ctx, fifo, greeting)
+				return p.playWAVTail(ctx, fifo, greeting, pcmDrainTail)
 			}
 		}
 		// A selected voice may not have an in-memory static index after restart.
@@ -411,23 +411,29 @@ func (p *PromptPlayer) PlayGreetingWithRuntime(ctx context.Context, runtime *spe
 	if p.GreetingPath == "" {
 		return fmt.Errorf("static greeting is not configured")
 	}
-	return p.playWAV(ctx, fifo, p.GreetingPath)
+	return p.playWAVTail(ctx, fifo, p.GreetingPath, pcmDrainTail)
 }
 
 // PlayMedia converts an extracted audio or video attachment to the raw PCM
 // format expected by the per-call baresip FIFO. Video is intentionally
 // rendered audio-only; no video frames are ever sent to a phone call.
 func (p *PromptPlayer) PlayMedia(ctx context.Context, fifo, input string) error {
-	return p.playInput(ctx, fifo, input)
+	return p.playInput(ctx, fifo, input, pcmDrainTail)
 }
 
 func (p *PromptPlayer) playWAV(ctx context.Context, fifo, wav string) error {
-	release := maintenance.Protect(wav)
-	defer release()
-	return p.playInput(ctx, fifo, wav)
+	return p.playWAVTail(ctx, fifo, wav, pcmDrainTail)
 }
 
-func (p *PromptPlayer) playInput(ctx context.Context, fifo, input string) error {
+// playWAVTail plays a wav with an explicit drain tail. Streamed body chunks
+// use the shorter tail so chunks follow each other without a long pause.
+func (p *PromptPlayer) playWAVTail(ctx context.Context, fifo, wav string, drainTail time.Duration) error {
+	release := maintenance.Protect(wav)
+	defer release()
+	return p.playInput(ctx, fifo, wav, drainTail)
+}
+
+func (p *PromptPlayer) playInput(ctx context.Context, fifo, input string, drainTail time.Duration) error {
 	if p == nil {
 		return fmt.Errorf("prompt player is not configured")
 	}
@@ -456,7 +462,10 @@ func (p *PromptPlayer) playInput(ctx context.Context, fifo, input string) error 
 		output = &pacedPCMWriter{ctx: mediaCtx, w: pipe}
 	}
 	writer := &pcmLimitWriter{w: output, max: 8_000 * 2 * 600}
-	cmd := process.New(mediaCtx, "ffmpeg", binary, 0, "-nostdin", "-i", input, "-vn", "-ar", "8000", "-ac", "1", "-f", "s16le", "pipe:1")
+	// Loudness normalization keeps quiet emails audible and loud ones from
+	// clipping after the phone-band downscale, which callers heard as
+	// "not clear" speech.
+	cmd := process.New(mediaCtx, "ffmpeg", binary, 0, "-nostdin", "-i", input, "-vn", "-af", "loudnorm=I=-16:TP=-1.5:LRA=11", "-ar", "8000", "-ac", "1", "-f", "s16le", "pipe:1")
 	cmd.Stdout = writer
 	if err := cmd.Run(); err != nil {
 		if mediaCtx.Err() != nil {
@@ -478,7 +487,7 @@ func (p *PromptPlayer) playInput(ctx context.Context, fifo, input string) error 
 		if err := pipe.Close(); err != nil {
 			return err
 		}
-		return drainPCM(mediaCtx, observer)
+		return drainPCM(mediaCtx, observer, drainTail)
 	}
 	return nil
 }

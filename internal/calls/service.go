@@ -530,8 +530,13 @@ func (s *Service) greet(sess *session) {
 			return
 		}
 		if s.Log != nil {
-			s.Log.Warn("static greeting unavailable; falling back to synthesis", "error", err)
+			s.Log.Warn("static greeting unavailable; falling back to the pin prompt", "error", err)
 		}
+		// The greeting may have failed after part of it already played, and
+		// the greet guard allows only one welcome per call. Never re-speak
+		// the full welcome: the PIN instruction is the useful part.
+		s.prompt(sess, menuPrompt("pin"))
+		return
 	}
 	s.prompt(sess, speech.StaticWelcomeText)
 }

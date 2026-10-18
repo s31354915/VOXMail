@@ -380,6 +380,9 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 			s.mu.Unlock()
 			return nil
 		}
+		if sess.Cursor < 0 || sess.Cursor >= len(sess.Messages) {
+			sess.Cursor = 0
+		}
 		m := sess.Messages[sess.Cursor]
 		s.mu.Unlock()
 		if key == "1" {
