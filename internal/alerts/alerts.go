@@ -275,9 +275,11 @@ func (s *Service) clearInflight(ids []int64) {
 func (s *Service) finishAlert(ctx context.Context, userID string, ids []int64, done <-chan bool) {
 	defer s.releasePending(userID)
 	success := false
+	canceled := false
 	select {
 	case success = <-done:
 	case <-ctx.Done():
+		canceled = true
 	}
 	s.clearInflight(ids)
 	cleanupCtx, cleanupCancel := lifecycle.CleanupContext(ctx)
@@ -286,7 +288,21 @@ func (s *Service) finishAlert(ctx context.Context, userID string, ids []int64, d
 		if err := s.Store.MarkAlertMessagesNotified(cleanupCtx, userID, ids); err != nil && s.Log != nil {
 			s.Log.Warn("could not mark alert messages notified", "error", err)
 		}
-	} else if err := s.Store.ReleaseAlertClaims(cleanupCtx, userID, ids); err != nil && s.Log != nil {
+		return
+	}
+	if canceled {
+		// The round context was canceled while the call may still be
+		// connecting or playing. Releasing the claims here re-alerted the
+		// same messages even when the subscriber heard the announcement.
+		// Keep the claims: the outcome callback still marks them notified
+		// if the call completes, and the store's stale-claim sweep
+		// eventually clears any that never do.
+		if s.Log != nil {
+			s.Log.Warn("alert round canceled; keeping message claims", "user_id", userID)
+		}
+		return
+	}
+	if err := s.Store.ReleaseAlertClaims(cleanupCtx, userID, ids); err != nil && s.Log != nil {
 		s.Log.Warn("could not release failed alert claims", "error", err)
 	}
 }
@@ -424,10 +440,28 @@ func dialURI(phone, domain string) string {
 func alertText(list []store.AlertCandidate) string {
 	if len(list) == 1 {
 		c := list[0]
-		return "You have new email in " + strings.TrimSpace(c.Folder) + "."
+		return "You have new email in " + friendlyFolderName(c.Folder) + "."
 	}
 	c := list[0]
-	return fmt.Sprintf("You have %d new email messages. The latest is in %s.", len(list), strings.TrimSpace(c.Folder))
+	return fmt.Sprintf("You have %d new email messages. The latest is in %s.", len(list), friendlyFolderName(c.Folder))
+}
+
+// friendlyFolderName turns a raw maildir or IMAP folder path into something
+// pleasant to hear. Raw names like "INBOX.Genealogy/Correspondence" read as
+// letter-by-letter or punctuation noise over the phone.
+func friendlyFolderName(folder string) string {
+	folder = strings.TrimSpace(folder)
+	if folder == "" {
+		return "your inbox"
+	}
+	folder = strings.TrimPrefix(folder, "INBOX.")
+	folder = strings.ReplaceAll(folder, "/", " ")
+	folder = strings.ReplaceAll(folder, ".", " ")
+	folder = strings.Join(strings.Fields(folder), " ")
+	if folder == "" {
+		return "your inbox"
+	}
+	return folder
 }
 
 func describe(c store.AlertCandidate) string {
@@ -439,5 +473,5 @@ func describe(c store.AlertCandidate) string {
 	if subject == "" {
 		subject = "with no subject line"
 	}
-	return fmt.Sprintf("%s. From %s. Subject %s.", strings.TrimSpace(c.Folder), sender, subject)
+	return fmt.Sprintf("%s. From %s. Subject %s.", friendlyFolderName(c.Folder), sender, subject)
 }

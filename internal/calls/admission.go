@@ -51,8 +51,10 @@ func (s *Service) admit(conn net.Conn, message bridge.Message) error {
 		return err
 	}
 	s.mu.Lock()
-	sess := s.sessions[message.CallID]
-	if s.Media != nil {
+	// The session can disappear between the answer and this lookup (the call
+	// closed, or the user's sessions were invalidated); guard the nil case
+	// instead of panicking inside the bridge event loop.
+	if sess := s.sessions[message.CallID]; sess != nil && s.Media != nil {
 		sess.Runtime, sess.Lease, sess.EmailRuntime, sess.EmailLease = s.Media.ActivateForUserSpeeds(user.ID)
 	}
 	s.mu.Unlock()
@@ -68,6 +70,15 @@ func (s *Service) pinLockedUntil(phone string) time.Time {
 	until := time.Time{}
 	if s.pinLock != nil {
 		until = s.pinLock[phone]
+	}
+	if until.IsZero() {
+		// An admitted caller was very recently confirmed unlocked; skip the
+		// per-call store lookup instead of querying the database for every
+		// incoming call.
+		if checked, ok := s.pinNoLock[phone]; ok && now.Sub(checked) < 30*time.Second {
+			s.pinMu.Unlock()
+			return time.Time{}
+		}
 	}
 	s.pinMu.Unlock()
 	if until.After(now) {
@@ -90,6 +101,14 @@ func (s *Service) pinLockedUntil(phone string) time.Time {
 			s.pinLock[phone] = persisted
 			s.pinMu.Unlock()
 			return persisted
+		}
+		if err == nil {
+			s.pinMu.Lock()
+			if s.pinNoLock == nil {
+				s.pinNoLock = make(map[string]time.Time)
+			}
+			s.pinNoLock[phone] = now
+			s.pinMu.Unlock()
 		}
 	}
 	return time.Time{}

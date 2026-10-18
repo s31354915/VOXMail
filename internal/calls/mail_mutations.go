@@ -11,6 +11,13 @@ import (
 	"github.com/voxmail/voxmail/internal/store"
 )
 
+// remoteConnection returns an authenticated IMAP client for the message's
+// account. One connection is opened per call and reused for every mutation
+// (mark seen, move, reconciliation), then closed when the call tears down;
+// opening a fresh TLS connection and logging in for each mutation added
+// seconds of latency to every delete or move. Callers must not close the
+// returned client: call dropRemoteConnection instead. Any mutation error
+// should drop the connection so the next attempt reconnects.
 func (s *Service) remoteConnection(sess *session, message store.MailSummary) (*remoteimap.Client, store.Account, error) {
 	if s.Store == nil || s.Secrets == nil {
 		return nil, store.Account{}, fmt.Errorf("remote mail credentials are unavailable")
@@ -23,6 +30,15 @@ func (s *Service) remoteConnection(sess *session, message store.MailSummary) (*r
 	for _, account := range accounts {
 		if account.ID != message.AccountID {
 			continue
+		}
+		if sess != nil {
+			sess.RemoteMu.Lock()
+			if sess.RemoteConn != nil && sess.RemoteAccountID == account.ID {
+				connection := sess.RemoteConn
+				sess.RemoteMu.Unlock()
+				return connection, account, nil
+			}
+			sess.RemoteMu.Unlock()
 		}
 		password, err := s.Secrets.Open(account.IMAPPassword)
 		if err != nil {
@@ -40,9 +56,34 @@ func (s *Service) remoteConnection(sess *session, message store.MailSummary) (*r
 		if err != nil {
 			return nil, store.Account{}, err
 		}
+		if sess != nil {
+			sess.RemoteMu.Lock()
+			if sess.RemoteConn != nil && sess.RemoteAccountID != account.ID {
+				_ = sess.RemoteConn.Close()
+			}
+			sess.RemoteConn = connection
+			sess.RemoteAccountID = account.ID
+			sess.RemoteMu.Unlock()
+		}
 		return connection, account, nil
 	}
 	return nil, store.Account{}, fmt.Errorf("mail account was not found")
+}
+
+// dropRemoteConnection closes and forgets the session's cached IMAP
+// connection. Called on call teardown and after any mutation error.
+func (s *Service) dropRemoteConnection(sess *session) {
+	if sess == nil {
+		return
+	}
+	sess.RemoteMu.Lock()
+	connection := sess.RemoteConn
+	sess.RemoteConn = nil
+	sess.RemoteAccountID = ""
+	sess.RemoteMu.Unlock()
+	if connection != nil {
+		_ = connection.Close()
+	}
 }
 
 func (s *Service) setRemoteSeen(sess *session, message store.MailSummary, seen bool) error {
@@ -66,10 +107,15 @@ func (s *Service) setRemoteSeen(sess *session, message store.MailSummary, seen b
 	} else {
 		mutationErr = connection.SetSeen(remoteFolderName, message.MessageID, seen)
 	}
-	if mutationErr == nil || !errors.Is(mutationErr, remoteimap.ErrMutationUncertain) {
+	if mutationErr == nil {
+		return nil
+	}
+	// A failed or uncertain mutation leaves the cached connection in an
+	// unknown state: drop it so the next mutation opens a fresh one.
+	s.dropRemoteConnection(sess)
+	if !errors.Is(mutationErr, remoteimap.ErrMutationUncertain) {
 		return mutationErr
 	}
-	_ = connection.Close()
 	return s.reconcileRemoteSeen(sess, message, seen, mutationErr)
 }
 
@@ -95,19 +141,24 @@ func (s *Service) moveRemote(sess *session, message store.MailSummary, destinati
 	} else {
 		mutationErr = connection.Move(source, target, message.MessageID)
 	}
-	if mutationErr == nil || !errors.Is(mutationErr, remoteimap.ErrMutationUncertain) {
+	if mutationErr == nil {
+		return nil
+	}
+	s.dropRemoteConnection(sess)
+	if !errors.Is(mutationErr, remoteimap.ErrMutationUncertain) {
 		return mutationErr
 	}
-	_ = connection.Close()
 	return s.reconcileRemoteMove(sess, message, destination, mutationErr)
 }
 
 func (s *Service) reconcileRemoteSeen(sess *session, message store.MailSummary, seen bool, original error) error {
+	// Reconciliation reuses the session's cached connection when it is still
+	// healthy; the original error already dropped it, so this opens a fresh
+	// one and leaves it cached for later mutations.
 	connection, account, err := s.remoteConnection(sess, message)
 	if err != nil {
 		return fmt.Errorf("%w: read-state confirmation connection failed after %v: %v", remoteimap.ErrMutationUncertain, original, err)
 	}
-	defer connection.Close()
 	folder, err := s.Store.RemoteFolderForLocal(s.eventContext(sess), sess.UserID, account.ID, message.Folder)
 	if err != nil {
 		return fmt.Errorf("%w: read-state identity resolution failed: %v", remoteimap.ErrMutationUncertain, err)
@@ -138,7 +189,6 @@ func (s *Service) reconcileRemoteMove(sess *session, message store.MailSummary, 
 	if err != nil {
 		return fmt.Errorf("%w: move confirmation connection failed after %v: %v", remoteimap.ErrMutationUncertain, original, err)
 	}
-	defer connection.Close()
 	source, err := s.Store.RemoteFolderForLocal(s.eventContext(sess), sess.UserID, account.ID, message.Folder)
 	if err != nil {
 		return fmt.Errorf("%w: move source identity resolution failed: %v", remoteimap.ErrMutationUncertain, err)

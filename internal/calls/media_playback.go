@@ -35,9 +35,17 @@ type PromptPlayer struct {
 	Dir          string
 	staticMu     sync.RWMutex
 	StaticByKey  map[string]map[string]string
+	staticOrder  []string
 	dynamicMu    sync.Mutex
 	dynamicClean time.Time
+	initMu       sync.Mutex
 }
+
+// maxStaticVoiceEntries bounds the per-voice static prompt index. Each entry
+// holds a fully synthesized prompt set for one voice, speed, and model
+// fingerprint; without a bound, switching voices or speeds over a long-lived
+// process accumulated every old set forever.
+const maxStaticVoiceEntries = 8
 
 const (
 	maxDynamicPromptFiles = 512
@@ -61,12 +69,7 @@ func (p *PromptPlayer) PlayWithRuntimeForUser(ctx context.Context, runtime *spee
 	if p == nil || fifo == "" || text == "" {
 		return nil
 	}
-	if p.Binary == "" {
-		p.Binary = "ffmpeg"
-	}
-	if p.Dir == "" {
-		p.Dir = filepath.Dir(fifo)
-	}
+	p.initPlaybackDefaults(fifo)
 	p.staticMu.RLock()
 	staticVoice := p.StaticVoice
 	staticAssets := p.Static
@@ -260,13 +263,15 @@ func (p *PromptPlayer) activateDynamicPrompt(source, destination string) error {
 }
 
 type pcmLimitWriter struct {
-	w   io.Writer
-	n   int64
-	max int64
+	w          io.Writer
+	n          int64
+	max        int64
+	overflowed bool
 }
 
 func (w *pcmLimitWriter) Write(p []byte) (int, error) {
 	if int64(len(p)) > w.max-w.n {
+		w.overflowed = true
 		return 0, fmt.Errorf("decoded audio exceeds playback limit")
 	}
 	n, err := w.w.Write(p)
@@ -283,6 +288,11 @@ func openPCMWriter(ctx context.Context, path string) (*os.File, error) {
 		return nil, err
 	}
 	isFIFO := info.Mode()&os.ModeNamedPipe != 0
+	// The retry loop previously ran until the context expired, which for a
+	// prompt playback is minutes. A FIFO with no reader that stays busy for
+	// seconds is not going to recover on its own, and every retry second was
+	// dead air for the caller. Bound the wait and fail the prompt.
+	retryDeadline := time.Now().Add(5 * time.Second)
 	for {
 		file, openErr := os.OpenFile(path, os.O_WRONLY|syscall.O_NONBLOCK, 0600)
 		if openErr == nil {
@@ -294,6 +304,9 @@ func openPCMWriter(ctx context.Context, path string) (*os.File, error) {
 		var errno syscall.Errno
 		if !isFIFO || (!errors.As(openErr, &errno) || (errno != syscall.ENXIO && errno != syscall.EAGAIN && errno != syscall.EWOULDBLOCK)) {
 			return nil, openErr
+		}
+		if time.Now().After(retryDeadline) {
+			return nil, fmt.Errorf("audio output never became writable: %w", openErr)
 		}
 		timer := time.NewTimer(20 * time.Millisecond)
 		select {
@@ -360,16 +373,60 @@ func (p *PromptPlayer) SetStaticPromptsForSpeed(assets map[string]string, voice 
 	if p.StaticByKey == nil {
 		p.StaticByKey = make(map[string]map[string]string)
 	}
+	if p.staticOrder == nil {
+		p.staticOrder = make([]string, 0, maxStaticVoiceEntries)
+	}
 	key := voice + "|" + fmt.Sprint(speed)
 	if len(fingerprint) > 0 {
 		key += "|" + fingerprint[0]
 	}
+	if _, exists := p.StaticByKey[key]; !exists {
+		p.staticOrder = append(p.staticOrder, key)
+	}
 	p.StaticByKey[key] = copyAssets
+	for len(p.staticOrder) > maxStaticVoiceEntries {
+		oldest := p.staticOrder[0]
+		p.staticOrder = p.staticOrder[1:]
+		delete(p.StaticByKey, oldest)
+	}
 	if p.Static == nil || (speed == 3 && (p.StaticVoice == "" || p.StaticVoice == voice)) {
 		p.Static = copyAssets
 		p.StaticVoice = voice
 	}
 	p.staticMu.Unlock()
+}
+
+// initPlaybackDefaults lazily configures the ffmpeg binary and prompt
+// directory. Binary and Dir used to be written from concurrent playback
+// goroutines without any lock, a data race the race detector flags and that
+// could leave one goroutine reading a stale binary name.
+func (p *PromptPlayer) initPlaybackDefaults(fifo string) {
+	if p == nil {
+		return
+	}
+	p.initMu.Lock()
+	defer p.initMu.Unlock()
+	if p.Binary == "" {
+		p.Binary = "ffmpeg"
+	}
+	if p.Dir == "" {
+		p.Dir = filepath.Dir(fifo)
+	}
+}
+
+// playbackBinary reads the configured ffmpeg binary under the same lock that
+// guards its lazy initialization.
+func (p *PromptPlayer) playbackBinary(fifo string) string {
+	if p == nil {
+		return "ffmpeg"
+	}
+	p.initPlaybackDefaults(fifo)
+	p.initMu.Lock()
+	defer p.initMu.Unlock()
+	if p.Binary == "" {
+		return "ffmpeg"
+	}
+	return p.Binary
 }
 
 func staticRuntimeKey(runtime *speech.Runtime) string {
@@ -437,10 +494,7 @@ func (p *PromptPlayer) playInput(ctx context.Context, fifo, input string, drainT
 	if p == nil {
 		return fmt.Errorf("prompt player is not configured")
 	}
-	binary := p.Binary
-	if binary == "" {
-		binary = "ffmpeg"
-	}
+	binary := p.playbackBinary(fifo)
 	const maxPlaybackDuration = process.PlaybackTimeout
 	mediaCtx, cancel := context.WithTimeout(ctx, maxPlaybackDuration)
 	defer cancel()
@@ -471,9 +525,14 @@ func (p *PromptPlayer) playInput(ctx context.Context, fifo, input string, drainT
 		if mediaCtx.Err() != nil {
 			return mediaCtx.Err()
 		}
-		return fmt.Errorf("prompt conversion: %w", err)
+		// Reaching the playback cap is a normal stop, not a failure: the
+		// listener heard the capped audio and should get the normal tail
+		// drain instead of an error callers report as a failed prompt.
+		if !writer.overflowed {
+			return fmt.Errorf("prompt conversion: %w", err)
+		}
 	}
-	if writer.n == 0 {
+	if writer.n == 0 && !writer.overflowed {
 		return fmt.Errorf("decoded audio is empty")
 	}
 	if info.Mode()&os.ModeNamedPipe != 0 {

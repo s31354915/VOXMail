@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/voxmail/voxmail/internal/bridge"
+	remoteimap "github.com/voxmail/voxmail/internal/imap"
 	"github.com/voxmail/voxmail/internal/ivr"
 	"github.com/voxmail/voxmail/internal/keypad"
 	"github.com/voxmail/voxmail/internal/mailer"
@@ -60,6 +61,7 @@ type Service struct {
 
 	pinMu        sync.Mutex
 	pinLock      map[string]time.Time
+	pinNoLock    map[string]time.Time
 	taskMu       sync.Mutex
 	taskWG       sync.WaitGroup
 	tasksClosed  bool
@@ -93,6 +95,10 @@ func (s *Service) startDelayedTask(delay time.Duration, fn func()) context.Cance
 	parent := s.baseContext()
 	ctx, cancel := context.WithCancel(parent)
 	s.startTask(func() {
+		// Release the timer's context whether the timer fires, is canceled
+		// early, or the service shuts down. Without this the context lived
+		// until service shutdown and leaked for every completed task.
+		defer cancel()
 		timer := time.NewTimer(delay)
 		defer timer.Stop()
 		select {
@@ -430,6 +436,21 @@ type session struct {
 	// skip what would follow the interrupted audio.
 	playInterrupted bool
 	greetAttempts   int
+	// PendingAttachmentRemove tracks the two-press confirmation before an
+	// attachment is removed in attachment_edit.
+	PendingAttachmentRemove bool
+	// PendingCancelConfirm tracks the two-press confirmation before the
+	// review menu's cancel discards the draft.
+	PendingCancelConfirm bool
+	// RemoteMu guards the per-call reuse of one authenticated IMAP
+	// connection for remote mutations (seen flags, moves). The connection is
+	// closed when the call tears down or when a mutation reports an error.
+	RemoteMu        sync.Mutex
+	RemoteConn      *remoteimap.Client
+	RemoteAccountID string
+	// FolderRoleCache memoizes role lookups for this call so repeated
+	// delete/move/send operations stop re-querying the store.
+	FolderRoleCache map[string]store.FolderRole
 }
 
 type draft struct {
@@ -738,8 +759,6 @@ func menuPrompt(state string) string {
 		return "Press 0 for all unread mail, choose an account, press 9 for more if available, or press pound to go back."
 	case "account_menu":
 		return "Press 1 to listen to mail, 2 to send an email, 3 to refresh, or 4 for account settings when available."
-	case "folders":
-		return "Choose a folder. If you are at the root, press 0 for Inbox. Press pound to go back."
 	case "folder_action":
 		return "Press 1 to listen to messages here, or 2 to open nested folders."
 	case "contacts":

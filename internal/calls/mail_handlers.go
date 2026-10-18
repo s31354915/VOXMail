@@ -394,6 +394,7 @@ func (s *Service) moveCurrent(sess *session, destination string) {
 		s.prompt(sess, "That destination is not allowed.")
 		return
 	}
+	s.prompt(sess, "Working on the mail server. One moment.")
 	if err := s.moveRemote(sess, message, destination); err != nil {
 		status := "failed"
 		prompt := "I could not move that message on the mail server."
@@ -499,6 +500,40 @@ func (s *Service) queueLocalReadState(sess *session, message store.MailSummary, 
 	return localPath, nil
 }
 
+// cachedFolderRole resolves a folder role for one of the session's accounts
+// and memoizes the result on the session. A call that deletes, moves, or saves
+// several messages used to re-list every account and re-query folder_roles
+// for every single mutation.
+func (s *Service) cachedFolderRole(sess *session, accountID, role string) (local, remote string) {
+	if sess == nil {
+		return "", ""
+	}
+	s.mu.Lock()
+	key := accountID + "|" + role
+	if sess.FolderRoleCache == nil {
+		sess.FolderRoleCache = make(map[string]store.FolderRole)
+	}
+	if cached, ok := sess.FolderRoleCache[key]; ok {
+		s.mu.Unlock()
+		return cached.LocalPath, cached.RemotePath
+	}
+	s.mu.Unlock()
+	if accounts, err := s.Store.ListAccounts(s.baseContext(), sess.UserID); err == nil {
+		for _, account := range accounts {
+			if account.ID != accountID {
+				continue
+			}
+			if found, roleErr := s.Store.FolderRole(s.baseContext(), account, role); roleErr == nil {
+				local, remote = found.LocalPath, found.RemotePath
+			}
+		}
+	}
+	s.mu.Lock()
+	sess.FolderRoleCache[key] = store.FolderRole{AccountID: accountID, Role: role, LocalPath: local, RemotePath: remote}
+	s.mu.Unlock()
+	return local, remote
+}
+
 func (s *Service) deleteCurrent(sess *session) {
 	s.mu.Lock()
 	if len(sess.Messages) == 0 {
@@ -519,22 +554,16 @@ func (s *Service) deleteCurrent(sess *session) {
 		s.prompt(sess, "I could not delete that message.")
 		return
 	}
-	trashName := ""
-	trashRemote := ""
-	if accounts, err := s.Store.ListAccounts(s.baseContext(), sess.UserID); err == nil {
-		for _, account := range accounts {
-			if account.ID != m.AccountID {
-				continue
-			}
-			if role, roleErr := s.Store.FolderRole(s.baseContext(), account, "trash"); roleErr == nil {
-				trashName, trashRemote = role.LocalPath, role.RemotePath
-			}
-		}
-	}
+	trashName, trashRemote := s.cachedFolderRole(sess, m.AccountID, "trash")
 	if trashRemote == "" || trashName == "" {
-		s.prompt(sess, "A Trash folder has not been mapped for this account.")
+		// The caller can fix this themselves: folder roles are mapped in the
+		// web console, so point there instead of stopping at a dead end.
+		s.prompt(sess, "A Trash folder has not been mapped for this account. Map it in the web console to delete mail over the phone.")
 		return
 	}
+	// The remote move hits the mail server and can take a few seconds;
+	// without a working prompt the caller hears silence and retries keys.
+	s.prompt(sess, "Working on the mail server. One moment.")
 	if err := s.moveRemote(sess, m, trashName); err != nil {
 		status := "failed"
 		if errors.Is(err, remoteimap.ErrMutationUncertain) {
@@ -898,7 +927,8 @@ func (s *Service) saveDraft(sess *session) {
 	remoteAppendSkipped := d.ID != ""
 	if !remoteAppendSkipped {
 		if account, ok := findAccount(accounts, accountID); ok {
-			if role, roleErr := s.Store.FolderRole(s.baseContext(), account, "drafts"); roleErr == nil && (s.Secrets != nil || s.DraftAppender != nil) {
+			draftsLocal, draftsRemote := s.cachedFolderRole(sess, accountID, "drafts")
+			if role := (store.FolderRole{AccountID: accountID, Role: "drafts", RemotePath: draftsRemote, LocalPath: draftsLocal}); role.RemotePath != "" && (s.Secrets != nil || s.DraftAppender != nil) {
 				to, cc, bcc := draftAddresses(d)
 				raw := mailer.BuildMessageWithAttachments(account.Email, account.SenderName, to, cc, bcc, d.Subject, d.Body, d.Attachments)
 				if s.DraftAppender != nil {

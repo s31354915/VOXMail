@@ -2,12 +2,15 @@ package calls
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/voxmail/voxmail/internal/process"
 	"net/mail"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/voxmail/voxmail/internal/speech"
 
 	"github.com/voxmail/voxmail/internal/keypad"
 	"github.com/voxmail/voxmail/internal/mailer"
@@ -42,7 +45,7 @@ func (s *Service) startVoiceRecording(sess *session) {
 	sess.RecordStop = stop
 	sess.RecordCancel = cancel
 	s.mu.Unlock()
-	s.prompt(sess, "Speak your message after the tone. Press 0 when finished, or pound to cancel.")
+	s.prompt(sess, "Speak your message now. The recording stops after about 30 seconds. Press 0 when finished, or pound to cancel.")
 	info, err := os.Stat(sess.RxPath)
 	if err != nil {
 		cancel()
@@ -61,19 +64,34 @@ func (s *Service) startVoiceRecording(sess *session) {
 		s.mu.Lock()
 		sess.RecordStop = nil
 		sess.RecordCancel = nil
+		empty := false
 		if string(stateLocked(sess)) == "recording" && !sess.Closed {
-			if err == nil {
+			if err == nil && strings.TrimSpace(text) != "" {
 				sess.Draft.Body = strings.TrimSpace(text)
 				transitionLocked(sess, "review")
 				sess.EditingDraft = false
 			} else {
+				empty = err == nil
 				transitionLocked(sess, "body_method")
 				sess.Editor = nil
 			}
 		}
+		closed := sess.Closed
 		s.mu.Unlock()
+		if closed {
+			return
+		}
 		if err != nil {
-			s.prompt(sess, "I could not understand the recording. Choose keypad or speech entry again.")
+			// Pressing pound cancels the recording on purpose; a failure
+			// message after an intentional cancel reads as an error.
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			s.prompt(sess, "The recording could not be transcribed. Choose keypad or speech entry again.")
+			return
+		}
+		if empty {
+			s.prompt(sess, "I did not hear anything in that recording. Choose keypad or speech entry again.")
 			return
 		}
 		s.prompt(sess, menuPrompt("review"))
@@ -102,7 +120,7 @@ func (s *Service) startSubjectVoice(sess *session) {
 	sess.RecordStop = stop
 	sess.RecordCancel = cancel
 	s.mu.Unlock()
-	s.prompt(sess, "Speak the subject after the tone. Press 0 when finished, or pound to cancel.")
+	s.prompt(sess, "Speak the subject now. The recording stops after about 30 seconds. Press 0 when finished, or pound to cancel.")
 	s.startTask(func() {
 		defer cancel()
 		text, recordErr := s.Recorder.RecordAndTranscribeUntil(ctx, sess.RxPath, offset, stop)
@@ -122,13 +140,21 @@ func (s *Service) startSubjectVoice(sess *session) {
 				transitionLocked(sess, "subject_method")
 			}
 		}
+		empty := recordErr == nil && strings.TrimSpace(sess.Draft.Subject) == "" && string(stateLocked(sess)) != "recording_subject"
 		closed := sess.Closed
 		s.mu.Unlock()
 		if closed {
 			return
 		}
 		if recordErr != nil {
-			s.prompt(sess, "I could not understand the subject. Choose keypad or speech entry again.")
+			if errors.Is(recordErr, context.Canceled) {
+				return
+			}
+			s.prompt(sess, "The subject recording could not be transcribed. Choose keypad or speech entry again.")
+			return
+		}
+		if empty {
+			s.prompt(sess, "I did not hear anything in that recording. Choose keypad or speech entry again.")
 			return
 		}
 		s.mu.Lock()
@@ -156,16 +182,20 @@ func (s *Service) startAudioAttachment(sess *session) {
 	sess.RecordStop = stop
 	offset := info.Size()
 	s.mu.Unlock()
-	s.prompt(sess, fmt.Sprintf("Speak after the tone. Press 0 when finished. The recording is limited to %d seconds.", int(s.Recorder.audioWindow()/time.Second)))
+	s.prompt(sess, fmt.Sprintf("Speak now. Press 0 when finished. The recording is limited to %d seconds.", int(s.Recorder.audioWindow()/time.Second)))
 	s.startTask(func() {
 		data, recordErr := s.Recorder.RecordAudioUntil(ctx, sess.RxPath, offset, stop)
 		cancel()
 		s.mu.Lock()
 		sess.RecordCancel = nil
 		sess.RecordStop = nil
+		empty := false
 		if string(stateLocked(sess)) == "audio_recording" && !sess.Closed {
-			if recordErr == nil {
+			if recordErr == nil && len(data) > 0 {
 				sess.Draft.Attachments = append(sess.Draft.Attachments, mailer.Attachment{Filename: fmt.Sprintf("voxmail-audio-%d.wav", time.Now().Unix()), ContentType: "audio/wav", Data: data})
+				transitionLocked(sess, "review")
+			} else {
+				empty = recordErr == nil
 				transitionLocked(sess, "review")
 			}
 		}
@@ -176,12 +206,21 @@ func (s *Service) startAudioAttachment(sess *session) {
 			return
 		}
 		if recordErr != nil {
+			// An intentional cancel (pressing 0 to stop) must not read as a
+			// failure.
+			if errors.Is(recordErr, context.Canceled) {
+				return
+			}
 			if stillRecording {
 				s.mu.Lock()
 				transitionLocked(sess, "review")
 				s.mu.Unlock()
 			}
 			s.prompt(sess, "The audio attachment could not be recorded. Returning to review.")
+			return
+		}
+		if empty {
+			s.prompt(sess, "I did not hear anything in that recording. Returning to review.")
 			return
 		}
 		s.prompt(sess, "Audio attachment added. "+menuPrompt("review"))
@@ -373,9 +412,15 @@ func (s *Service) handleFieldConfirmation(sess *session, key string) {
 	if key == "2" {
 		transitionLocked(sess, state)
 		sess.Editor = newIVREditor(state)
+		// Re-entering used to start from a blank editor, throwing away the
+		// text the caller had already typed. Seed the editor with the value
+		// they just confirmed against so star-key edits work naturally.
+		if sess.Editor != nil {
+			sess.Editor.Text = value
+		}
 		sess.ConfirmValue, sess.ConfirmState, sess.ConfirmRecipientKind = "", "", ""
 		s.mu.Unlock()
-		s.prompt(sess, menuPrompt(state))
+		s.prompt(sess, "Editing your previous entry. "+menuPrompt(state))
 		return
 	}
 	if key != "1" {
@@ -453,10 +498,21 @@ func (s *Service) handleMoreOptions(sess *session, key string) {
 		s.mu.Unlock()
 		s.prompt(sess, "Enter a name for this sender using the keypad, then press pound.")
 	case "2":
-		s.prompt(sess, "The message date is "+message.Date+". Press pound to return.")
+		s.prompt(sess, "The message date is "+speakable(message.Date, 80)+". Press pound to return.")
 	case "3":
-		s.prompt(sess, "The recipients are "+message.Recipients+". Press pound to return.")
+		s.prompt(sess, "The recipients are "+speakable(message.Recipients, 400)+". Press pound to return.")
 	case "4":
-		s.prompt(sess, "The subject is "+message.Subject+". Press pound to return.")
+		s.prompt(sess, "The subject is "+speakable(message.Subject, 300)+". Press pound to return.")
 	}
+}
+
+// speakable bounds a raw header value (a pathological recipient list or
+// subject line cannot turn a menu read into minutes of uninterrupted speech)
+// and sanitizes it for text-to-speech.
+func speakable(value string, max int) string {
+	text, truncated := truncateForSpeech(value, max)
+	if truncated {
+		text += ", and more"
+	}
+	return speech.SanitizeNonLatin(text)
 }

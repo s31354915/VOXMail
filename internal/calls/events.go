@@ -15,7 +15,10 @@ import (
 const callEventQueueSize = 32
 
 // A lost release event must not disable this key for the rest of the call.
-const dtmfReleaseGrace = 2 * time.Second
+// Two seconds was long enough to swallow a caller's fast repeat presses of
+// the same digit (press 1 twice quickly to confirm, for example); the grace
+// only needs to cover a stray duplicate callback, not a deliberate press.
+const dtmfReleaseGrace = 250 * time.Millisecond
 
 type activeTone struct {
 	digit string
@@ -127,9 +130,29 @@ func (d *callEventDispatcher) dispatch(message bridge.Message) error {
 	default:
 		d.mu.Unlock()
 		if message.Type == "dtmf" {
+			// DTMF is level-triggered user input. The caller's newest press
+			// matters more than a queued burst of older presses, so make
+			// room by recycling the oldest job instead of silently dropping
+			// the newest press. Control events are never discarded: the one
+			// drained job is re-queued behind the burst.
+			var drained callEventJob
+			select {
+			case drained = <-worker.queue:
+			default:
+			}
+			if drained.message.Type != "" && drained.message.Type != "dtmf" {
+				select {
+				case worker.queue <- drained:
+				default:
+				}
+			}
+			select {
+			case worker.queue <- callEventJob{message: message, navigationVersion: navigationVersion, hasNavigationStamp: hasNavigationStamp}:
+				d.trace(message, "queued after making room")
+				return nil
+			default:
+			}
 			d.trace(message, "queue full")
-			// DTMF is level-triggered user input; dropping excess digits is
-			// safer than allowing an unbounded backlog to outlive the call.
 			if d.service.Log != nil {
 				d.service.Log.Warn("dropping excess DTMF events", "call_id", message.CallID)
 			}
@@ -156,6 +179,11 @@ func (d *callEventDispatcher) newWorkerLocked(callID string) *callEventWorker {
 
 func (d *callEventDispatcher) runWorker(callID string, worker *callEventWorker) {
 	defer close(worker.done)
+	// Bind the worker context once for the worker's lifetime. Rebinding on
+	// every queued job re-acquired the service lock for each event and
+	// churned the session's event context for no benefit: the worker context
+	// never changes while this goroutine runs.
+	d.service.bindEventContext(callID, worker.ctx, worker.cancel)
 	for {
 		select {
 		case <-worker.ctx.Done():
@@ -169,7 +197,6 @@ func (d *callEventDispatcher) runWorker(callID string, worker *callEventWorker) 
 			if !ok {
 				return
 			}
-			d.service.bindEventContext(callID, worker.ctx, worker.cancel)
 			if job.hasNavigationStamp && !d.service.navigationVersionIsCurrent(callID, job.navigationVersion) {
 				d.trace(job.message, "stale navigation ignored")
 				continue

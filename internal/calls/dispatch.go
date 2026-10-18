@@ -10,6 +10,7 @@ import (
 	"github.com/voxmail/voxmail/internal/auth"
 	"github.com/voxmail/voxmail/internal/bridge"
 	"github.com/voxmail/voxmail/internal/ivr"
+	"github.com/voxmail/voxmail/internal/store"
 )
 
 func (s *Service) handleDTMF(conn net.Conn, message bridge.Message) error {
@@ -43,9 +44,11 @@ func (s *Service) handleDTMF(conn net.Conn, message bridge.Message) error {
 	s.mu.Unlock()
 	user, err := s.Store.UserByID(s.baseContext(), userID)
 	if err != nil || !auth.Check(user.PINHash, pin) {
+		var remaining int
 		s.mu.Lock()
 		sess.PIN = ""
 		sess.Failures++
+		remaining = 3 - sess.Failures
 		if sess.Failures >= 3 {
 			phone := sess.Phone
 			s.mu.Unlock()
@@ -56,7 +59,7 @@ func (s *Service) handleDTMF(conn net.Conn, message bridge.Message) error {
 			return s.sendBridge(conn, bridge.Message{Type: "hangup", CallID: message.CallID, Code: 603, Reason: "PIN verification failed"})
 		}
 		s.mu.Unlock()
-		s.prompt(sess, "That PIN was not accepted. Try again, or press star to clear.")
+		s.prompt(sess, pinFailureNotice(remaining))
 		return nil
 	}
 	s.mu.Lock()
@@ -85,10 +88,12 @@ func (s *Service) signedInPrompt(sess *session) string {
 		return "You are signed in. Press 1 for email, 2 for settings, or 3 for information and instructions."
 	}
 	total := 0
+	unchecked := 0
 	parts := make([]string, 0, len(accounts))
 	for _, account := range accounts {
 		count, listErr := s.Store.CountUnreadForAccount(s.baseContext(), sess.UserID, account.ID)
 		if listErr != nil {
+			unchecked++
 			continue
 		}
 		total += count
@@ -96,12 +101,21 @@ func (s *Service) signedInPrompt(sess *session) string {
 			parts = append(parts, fmt.Sprintf("%d in %s", count, account.CanonicalName))
 		}
 	}
-	if len(parts) == 0 {
+	if len(parts) == 0 && unchecked == 0 {
 		return "You have no unread email. Press 1 for email, 2 for settings, or 3 for information and instructions."
 	}
 	summary := fmt.Sprintf("You have %d unread emails", total)
 	if total == 1 {
 		summary = "You have 1 unread email"
+	}
+	if unchecked > 0 {
+		if total == 1 {
+			summary = "You have at least 1 unread email"
+		} else if total > 1 {
+			summary = fmt.Sprintf("You have at least %d unread emails", total)
+		} else {
+			summary = "Some accounts could not be checked for unread email"
+		}
 	}
 	return fmt.Sprintf("%s, %s. Press 1 for email, 2 for settings, or 3 for information and instructions.", summary, strings.Join(parts, ", "))
 }
@@ -435,9 +449,22 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 	case "attachment_menu":
 		if key == "0" {
 			s.mu.Lock()
-			sess.AttachmentPage++
+			playable := 0
+			for _, attachment := range sess.CurrentAttachments {
+				if attachment.Playable && len(attachment.Data) > 0 {
+					playable++
+				}
+			}
+			more := (sess.AttachmentPage+1)*9 < playable
+			if more {
+				sess.AttachmentPage++
+			}
 			s.mu.Unlock()
-			s.attachmentMenu(sess)
+			if more {
+				s.attachmentMenu(sess)
+			} else {
+				s.prompt(sess, "There are no more attachments. Press pound to return.")
+			}
 			return nil
 		}
 		if key < "1" || key > "9" {
@@ -462,11 +489,16 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 	case "move_menu":
 		if key == "0" {
 			s.mu.Lock()
-			if (sess.MovePage+1)*9 < len(sess.MoveFolders) {
+			more := (sess.MovePage+1)*9 < len(sess.MoveFolders)
+			if more {
 				sess.MovePage++
 			}
 			s.mu.Unlock()
-			s.promptMoveMenu(sess)
+			if more {
+				s.promptMoveMenu(sess)
+			} else {
+				s.prompt(sess, "There are no more folders. Press pound to return.")
+			}
 			return nil
 		}
 		if key < "1" || key > "9" {
@@ -476,6 +508,7 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 		index := sess.MovePage*9 + int(key[0]-'1')
 		if index >= len(sess.MoveFolders) {
 			s.mu.Unlock()
+			s.prompt(sess, "There is no folder for that key. Press pound to return.")
 			return nil
 		}
 		destination := sess.MoveFolders[index]
@@ -498,8 +531,21 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 		} else if key == "2" {
 			s.mu.Lock()
 			transitionLocked(sess, "list")
+			var m store.MailSummary
+			cursor, total := 0, 0
+			if len(sess.Messages) > 0 {
+				if sess.Cursor < 0 || sess.Cursor >= len(sess.Messages) {
+					sess.Cursor = 0
+				}
+				m = sess.Messages[sess.Cursor]
+				cursor, total = sess.Cursor, len(sess.Messages)
+			}
 			s.mu.Unlock()
-			s.prompt(sess, menuPrompt("list"))
+			if total > 0 {
+				s.prompt(sess, listPrompt(m, cursor, total))
+			} else {
+				s.prompt(sess, menuPrompt("list"))
+			}
 		}
 	case "review":
 		if key == "1" {
@@ -507,10 +553,7 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 		} else if key == "2" {
 			s.saveDraft(sess)
 		} else if key == "3" {
-			s.mu.Lock()
-			transitionLocked(sess, "main")
-			s.mu.Unlock()
-			s.prompt(sess, "Composition cancelled.")
+			s.handleReviewCancel(sess)
 		} else if key == "4" {
 			s.mu.Lock()
 			transitionLocked(sess, "draft_edit")
@@ -550,4 +593,34 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 		}
 	}
 	return nil
+}
+
+// pinFailureNotice words the wrong-PIN prompt with the lockout countdown so
+// the caller knows how many attempts remain before this number is locked out.
+func pinFailureNotice(remaining int) string {
+	if remaining == 1 {
+		return "That PIN was not accepted. One attempt remains before this number is locked out. Try again, or press star to clear."
+	}
+	return fmt.Sprintf("That PIN was not accepted. %d attempts remain before lockout. Try again, or press star to clear.", remaining)
+}
+
+// handleReviewCancel implements the review menu's cancel key. A single press
+// used to discard a fully typed email with no confirmation; the first press
+// now asks, and the second discards.
+func (s *Service) handleReviewCancel(sess *session) {
+	s.mu.Lock()
+	confirmed := sess.PendingCancelConfirm
+	sess.PendingCancelConfirm = false
+	s.mu.Unlock()
+	if confirmed {
+		s.mu.Lock()
+		transitionLocked(sess, "main")
+		s.mu.Unlock()
+		s.prompt(sess, "Composition cancelled.")
+		return
+	}
+	s.mu.Lock()
+	sess.PendingCancelConfirm = true
+	s.mu.Unlock()
+	s.prompt(sess, "Press 3 again to cancel this email, or pound to go back.")
 }
