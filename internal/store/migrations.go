@@ -311,6 +311,11 @@ FROM remote_folders WHERE local_path<>''`); err != nil {
 	}); err != nil {
 		return err
 	}
+	if err := s.applyColumnMigration(ctx, 27, "mail_messages", []struct{ name, declaration string }{
+		{"alert_attempts", "INTEGER NOT NULL DEFAULT 0"},
+	}); err != nil {
+		return err
+	}
 	return nil
 }
 

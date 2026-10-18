@@ -311,8 +311,8 @@ func TestMailDateOrderingAndKeysetPagination(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(all) != 3 || all[0].Subject != "message-0" || all[1].Subject != "message-1" || all[2].Subject != "message-2" {
-		t.Fatalf("date ordering=%+v", all)
+	if len(all) != 3 || all[0].Subject != "message-1" || all[1].Subject != "message-0" || all[2].Subject != "message-2" {
+		t.Fatalf("date ordering (newest first)=%+v", all)
 	}
 	if all[0].DateUTC == nil || all[1].DateUTC == nil || all[2].DateUTC != nil {
 		t.Fatalf("normalized dates=%v,%v,%v", all[0].DateUTC, all[1].DateUTC, all[2].DateUTC)
@@ -321,7 +321,7 @@ func TestMailDateOrderingAndKeysetPagination(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(first.Messages) != 2 || first.Next == nil {
+	if len(first.Messages) != 2 || first.Next == nil || first.Messages[0].Subject != "message-1" || first.Messages[1].Subject != "message-0" {
 		t.Fatalf("first page=%+v", first)
 	}
 	second, err := db.ListMailPage(ctx, "date-user", "date-account", "", false, first.Next, 2)

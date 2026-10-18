@@ -45,7 +45,7 @@ func (s *Store) ListMail(ctx context.Context, userID string, unreadOnly bool) ([
 		}
 		query += ` AND (` + strings.Join(parts, ` OR `) + `)`
 	}
-	query += ` ORDER BY CASE WHEN m.message_date_utc IS NULL THEN 1 ELSE 0 END,m.message_date_utc,m.id DESC`
+	query += ` ORDER BY CASE WHEN m.message_date_utc IS NULL THEN 1 ELSE 0 END,m.message_date_utc DESC,m.id DESC`
 	rows, err := s.DB.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -104,7 +104,7 @@ func (s *Store) ListMailForAccount(ctx context.Context, userID, accountID, folde
 		}
 		query += ` AND m.is_read=0`
 	}
-	query += ` ORDER BY CASE WHEN m.message_date_utc IS NULL THEN 1 ELSE 0 END,m.message_date_utc,m.id DESC`
+	query += ` ORDER BY CASE WHEN m.message_date_utc IS NULL THEN 1 ELSE 0 END,m.message_date_utc DESC,m.id DESC`
 	rows, err := s.DB.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -223,11 +223,11 @@ func (s *Store) ListMailPage(ctx context.Context, userID, accountID, folder stri
 			query += ` AND m.message_date_utc IS NULL AND m.id < ?`
 			args = append(args, after.ID)
 		} else {
-			query += ` AND ((m.message_date_utc IS NOT NULL AND (m.message_date_utc > ? OR (m.message_date_utc=? AND m.id < ?))) OR m.message_date_utc IS NULL)`
+			query += ` AND (m.message_date_utc < ? OR (m.message_date_utc=? AND m.id < ?) OR m.message_date_utc IS NULL)`
 			args = append(args, *after.DateUTC, *after.DateUTC, after.ID)
 		}
 	}
-	query += ` ORDER BY CASE WHEN m.message_date_utc IS NULL THEN 1 ELSE 0 END,m.message_date_utc,m.id DESC LIMIT ?`
+	query += ` ORDER BY CASE WHEN m.message_date_utc IS NULL THEN 1 ELSE 0 END,m.message_date_utc DESC,m.id DESC LIMIT ?`
 	args = append(args, limit+1)
 	rows, err := s.DB.QueryContext(ctx, query, args...)
 	if err != nil {
