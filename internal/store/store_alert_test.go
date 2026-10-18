@@ -307,3 +307,131 @@ func TestAlertClaimsSurviveAndReleaseLifecycle(t *testing.T) {
 		t.Fatalf("announced message remained pending: %+v err=%v", remaining, err)
 	}
 }
+
+func seedAlertCapStore(t *testing.T, ctx context.Context, db *Store, userID, accountID string) {
+	t.Helper()
+	if err := db.CreateUser(ctx, User{ID: userID, Username: userID, PasswordHash: "x", PINHash: "y", Role: "user", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.ExecContext(ctx, `UPDATE settings SET alerts_enabled=1, alert_phone='+15551212' WHERE user_id=?`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.ExecContext(ctx, `INSERT INTO accounts(id,user_id,canonical_name,email,sender_name,imap_host,imap_user,imap_password,smtp_host,smtp_user,smtp_password,folder_map,alert_folders,call_alert_enabled,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1,'now')`, accountID, userID, "cap", userID+"@example.com", "Cap", "imap", "u", "p", "smtp", "u", "p", "{}", `["INBOX"]`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetAlertsAvailable(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func insertAlertMessage(t *testing.T, ctx context.Context, db *Store, accountID, path string, attempts int) int64 {
+	t.Helper()
+	result, err := db.DB.ExecContext(ctx, `INSERT INTO mail_messages(account_id,folder,path,is_read,alerted,alert_attempts,updated_at) VALUES(?,?,?,0,0,?,'now')`, accountID, "INBOX", path, attempts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func TestAlertAttemptsCapExcludesFromPending(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "mail.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	seedAlertCapStore(t, ctx, db, "cap-user", "cap-account")
+	attempted := insertAlertMessage(t, ctx, db, "cap-account", "/m/cap/1", 2)
+	capped := insertAlertMessage(t, ctx, db, "cap-account", "/m/cap/2", maxAlertAttempts)
+
+	pending, err := db.PendingAlerts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].MessageID != attempted {
+		t.Fatalf("pending alerts=%+v, want only message %d", pending, attempted)
+	}
+
+	claimed, err := db.ClaimAlertMessages(ctx, "cap-user", []int64{attempted, capped})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 || claimed[0] != attempted {
+		t.Fatalf("claimed=%+v, want only message %d", claimed, attempted)
+	}
+	var attempts int
+	if err := db.DB.QueryRowContext(ctx, `SELECT alert_attempts FROM mail_messages WHERE id=?`, attempted).Scan(&attempts); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 3 {
+		t.Fatalf("claim did not record the attempt: alert_attempts=%d", attempts)
+	}
+	if err := db.ReleaseAlertClaims(ctx, "cap-user", []int64{attempted}); err != nil {
+		t.Fatal(err)
+	}
+	pending, err = db.PendingAlerts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("capped messages still pending: %+v", pending)
+	}
+	_ = capped
+}
+
+func TestUpsertMailIndexCarriesAlertState(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "mail.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	seedAlertCapStore(t, ctx, db, "carry-user", "carry-account")
+	dateUTC := int64(100)
+	input := MailIndexInput{AccountID: "carry-account", Folder: "INBOX", Path: "/m/carry/a", MessageID: "<first@example.com>", Sender: "Peach", Date: "Wed, 01 Jan 2025 11:00:00 +0000", DateUTC: &dateUTC, UpdatedAt: "now", ScanID: "s1"}
+	if _, err := db.UpsertMailIndex(ctx, input); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.ExecContext(ctx, `UPDATE mail_messages SET alerted=1, alert_attempts=2 WHERE path='/m/carry/a'`); err != nil {
+		t.Fatal(err)
+	}
+	input.Path = "/m/carry/b"
+	if _, err := db.UpsertMailIndex(ctx, input); err != nil {
+		t.Fatal(err)
+	}
+	var alerted, attempts int
+	if err := db.DB.QueryRowContext(ctx, `SELECT alerted, alert_attempts FROM mail_messages WHERE path='/m/carry/b'`).Scan(&alerted, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if alerted != 1 || attempts != 2 {
+		t.Fatalf("re-indexed message lost alert state: alerted=%d attempts=%d", alerted, attempts)
+	}
+	// A different message in the same folder starts clean.
+	other := input
+	other.Path = "/m/carry/c"
+	other.MessageID = "<second@example.com>"
+	if _, err := db.UpsertMailIndex(ctx, other); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DB.QueryRowContext(ctx, `SELECT alerted, alert_attempts FROM mail_messages WHERE path='/m/carry/c'`).Scan(&alerted, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if alerted != 0 || attempts != 0 {
+		t.Fatalf("unrelated message inherited alert state: alerted=%d attempts=%d", alerted, attempts)
+	}
+	// Re-upserting the same path keeps the announced mark.
+	input.Path = "/m/carry/b"
+	if _, err := db.UpsertMailIndex(ctx, input); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DB.QueryRowContext(ctx, `SELECT alerted, alert_attempts FROM mail_messages WHERE path='/m/carry/b'`).Scan(&alerted, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if alerted != 1 || attempts != 2 {
+		t.Fatalf("same-path upsert clobbered alert state: alerted=%d attempts=%d", alerted, attempts)
+	}
+}
