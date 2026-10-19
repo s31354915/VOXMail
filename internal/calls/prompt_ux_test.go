@@ -72,14 +72,16 @@ func TestConfirmationCanEditOrStartOverWithoutChangingDraft(t *testing.T) {
 
 func TestRepeatIncludesActualChoicesAndReadback(t *testing.T) {
 	svc := &Service{}
-	for _, tc := range []struct {
+	tests := []struct {
 		sess session
 		want string
 	}{
 		{session{State: "accounts", Accounts: []store.Account{{CanonicalName: "Personal"}}}, "Personal"},
 		{session{State: "list", Messages: []store.MailSummary{{Sender: "Sam", Subject: "Meeting"}}}, "Meeting"},
 		{session{State: "field_confirm", ConfirmState: "compose", ConfirmValue: "a+1@example.com"}, "plus, one, at"},
-	} {
+	}
+	for i := range tests {
+		tc := &tests[i]
 		if got := svc.promptForState(&tc.sess); !strings.Contains(got, tc.want) {
 			t.Errorf("repeat %s: %q missing %q", tc.sess.State, got, tc.want)
 		}
