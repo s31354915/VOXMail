@@ -787,25 +787,59 @@ func (s *Store) MarkMailReadAtPath(ctx context.Context, userID string, id int64,
 	if strings.TrimSpace(path) == "" {
 		return fmt.Errorf("maildir path is required")
 	}
-	result, err := s.DB.ExecContext(ctx, `UPDATE mail_messages SET is_read=?,path=?,updated_at=? WHERE id=? AND account_id IN (SELECT id FROM accounts WHERE user_id=?)`, read, path, time.Now().UTC().Format(time.RFC3339Nano), id, userID)
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var accountID string
+	err = tx.QueryRowContext(ctx, `SELECT m.account_id FROM mail_messages m JOIN accounts a ON a.id=m.account_id WHERE m.id=? AND a.user_id=?`, id, userID).Scan(&accountID)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("message was not found")
+	}
+	if err != nil {
+		return err
+	}
+	// The indexer may have already indexed the renamed file under the target
+	// path; merge that row instead of crashing on UNIQUE(path).
+	if err := s.mergeMailPathCollision(ctx, tx, accountID, id, path); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE mail_messages SET is_read=?,path=?,updated_at=? WHERE id=? AND account_id=?`, read, path, time.Now().UTC().Format(time.RFC3339Nano), id, accountID)
 	if err != nil {
 		return err
 	}
 	if count, _ := result.RowsAffected(); count != 1 {
 		return fmt.Errorf("message was not found")
 	}
-	return nil
+	return tx.Commit()
 }
 
 func (s *Store) MoveMailIndex(ctx context.Context, userID string, id int64, folder, path string) error {
-	result, err := s.DB.ExecContext(ctx, `UPDATE mail_messages SET folder=?,path=?,updated_at=? WHERE id=? AND account_id IN (SELECT id FROM accounts WHERE user_id=?)`, folder, path, time.Now().UTC().Format(time.RFC3339Nano), id, userID)
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var accountID string
+	err = tx.QueryRowContext(ctx, `SELECT m.account_id FROM mail_messages m JOIN accounts a ON a.id=m.account_id WHERE m.id=? AND a.user_id=?`, id, userID).Scan(&accountID)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("message was not found")
+	}
+	if err != nil {
+		return err
+	}
+	if err := s.mergeMailPathCollision(ctx, tx, accountID, id, path); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE mail_messages SET folder=?,path=?,updated_at=? WHERE id=? AND account_id=?`, folder, path, time.Now().UTC().Format(time.RFC3339Nano), id, accountID)
 	if err != nil {
 		return err
 	}
 	if count, _ := result.RowsAffected(); count != 1 {
 		return fmt.Errorf("message was not found")
 	}
-	return nil
+	return tx.Commit()
 }
 
 // keepLocalRead preserves the row's current read state when the provider's

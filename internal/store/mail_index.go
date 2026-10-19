@@ -115,9 +115,10 @@ func (s *Store) UpsertMailIndex(ctx context.Context, input MailIndexInput) (int6
 	// UID churn). Carry the announced mark and retry attempts from any
 	// existing row for the same message identity so a sync cannot reset
 	// them; without this the same message alerted again after every sync.
-	if strings.TrimSpace(input.MessageID) != "" {
+	if input.PathIsLive != nil || strings.TrimSpace(input.MessageID) != "" {
+		patterns := maildirBaseLike(maildirBaseName(input.Path))
 		var alerted, attempts int
-		err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(alerted),0), COALESCE(MAX(alert_attempts),0) FROM mail_messages WHERE account_id=? AND folder=? AND path<>? AND message_id=?`, input.AccountID, input.Folder, input.Path, input.MessageID).Scan(&alerted, &attempts)
+		err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(alerted),0), COALESCE(MAX(alert_attempts),0) FROM mail_messages WHERE account_id=? AND folder=? AND path<>? AND ((?<>'' AND message_id=?) OR path LIKE ? ESCAPE '\' OR path LIKE ? ESCAPE '\' OR path LIKE ? ESCAPE '\')`, input.AccountID, input.Folder, input.Path, input.MessageID, input.MessageID, patterns[0], patterns[1], patterns[2]).Scan(&alerted, &attempts)
 		if err == nil {
 			if alerted != 0 || attempts > 0 {
 				input.Alerted, input.AlertAttempts = alerted, attempts
@@ -131,11 +132,16 @@ func (s *Store) UpsertMailIndex(ctx context.Context, input MailIndexInput) (int6
 	// UID churn) must re-home its existing row instead of inserting a second
 	// row for the same message. Duplicates under stale paths surface as
 	// unplayable, always-unread messages in the call list until a purge scan
-	// removes them. Only rows whose file no longer exists on disk count as
-	// stale: a folder can legitimately hold several copies of the same
-	// message, and every live copy needs its own row.
-	if strings.TrimSpace(input.MessageID) != "" && input.PathIsLive != nil {
-		candidateRows, err := tx.QueryContext(ctx, `SELECT id,path,is_read FROM mail_messages WHERE account_id=? AND folder=? AND message_id=? AND path<>? AND NOT EXISTS(SELECT 1 FROM mail_messages other WHERE other.path=?) ORDER BY updated_at DESC`, input.AccountID, input.Folder, input.MessageID, input.Path, input.Path)
+	// removes them, and a row inserted for the renamed file collides with the
+	// concurrent mark_read path update on UNIQUE(path). Identity is the
+	// Message-ID header when the message carries one, and otherwise the
+	// immutable Maildir base filename, which a new/ to cur/:2,S rename keeps.
+	// Only rows whose file no longer exists on disk count as stale: a folder
+	// can legitimately hold several copies of the same message, and every
+	// live copy needs its own row.
+	if input.PathIsLive != nil {
+		patterns := maildirBaseLike(maildirBaseName(input.Path))
+		candidateRows, err := tx.QueryContext(ctx, `SELECT id,path,is_read FROM mail_messages WHERE account_id=? AND folder=? AND path<>? AND NOT EXISTS(SELECT 1 FROM mail_messages other WHERE other.path=?) AND ((?<>'' AND message_id=?) OR path LIKE ? ESCAPE '\' OR path LIKE ? ESCAPE '\' OR path LIKE ? ESCAPE '\') ORDER BY updated_at DESC`, input.AccountID, input.Folder, input.Path, input.Path, input.MessageID, input.MessageID, patterns[0], patterns[1], patterns[2])
 		if err != nil {
 			return 0, err
 		}
@@ -167,7 +173,7 @@ func (s *Store) UpsertMailIndex(ctx context.Context, input MailIndexInput) (int6
 					deadRead = true
 				}
 			}
-			if _, err := tx.ExecContext(ctx, `UPDATE mail_messages SET path=?,message_id=?,sender=?,recipients=?,cc=?,subject=?,message_date=?,message_date_utc=?,is_read=?,alerted=?,alert_attempts=?,attachment_count=?,updated_at=?,last_seen_scan=?,source_size=? WHERE id=?`, input.Path, input.MessageID, input.Sender, input.Recipients, input.Cc, input.Subject, input.Date, input.DateUTC, deadRead, input.Alerted, input.AlertAttempts, input.Attachments, input.UpdatedAt, input.ScanID, input.SourceSize, moveID); err != nil {
+			if _, err := tx.ExecContext(ctx, `UPDATE mail_messages SET path=?,message_id=CASE WHEN TRIM(?)<>'' THEN ? ELSE message_id END,sender=?,recipients=?,cc=?,subject=?,message_date=?,message_date_utc=?,is_read=?,alerted=?,alert_attempts=?,attachment_count=?,updated_at=?,last_seen_scan=?,source_size=? WHERE id=?`, input.Path, input.MessageID, input.MessageID, input.Sender, input.Recipients, input.Cc, input.Subject, input.Date, input.DateUTC, deadRead, input.Alerted, input.AlertAttempts, input.Attachments, input.UpdatedAt, input.ScanID, input.SourceSize, moveID); err != nil {
 				return 0, err
 			}
 			for _, candidate := range stale[1:] {
