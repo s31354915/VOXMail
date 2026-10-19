@@ -419,7 +419,7 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.Ready != nil {
 		if err := s.Ready(ctx); err != nil {
-			writeReady(http.StatusServiceUnavailable, "not_ready", err.Error())
+			writeReady(http.StatusServiceUnavailable, "not_ready", safeReadinessReason(err.Error()))
 			return
 		}
 	}
@@ -435,7 +435,15 @@ func (s *Server) apiInfo(w http.ResponseWriter, r *http.Request) {
 		}
 		setupAvailable = count == 0
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"name": "VOXMail", "api_version": "v1", "setup_available": setupAvailable, "offline_mode": s.OfflineMode})
+	// offline mode is deployment state, not first-run state: it is only
+	// disclosed to an authenticated session, while setup_available stays
+	// public because the first-run console needs it before any account
+	// exists.
+	payload := map[string]any{"name": "VOXMail", "api_version": "v1", "setup_available": setupAvailable}
+	if _, authed := s.Sessions.Get(sessionToken(r)); authed {
+		payload["offline_mode"] = s.OfflineMode
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 func (s *Server) asset(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")

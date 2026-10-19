@@ -57,12 +57,14 @@ func (s *Server) startPreview(w http.ResponseWriter, userID, voice string, speed
 			oldest = id
 		}
 	}
-	if len(s.previewJobs) >= maxPreviewJobs && oldest != "" {
+	// A completed preview another user has not downloaded yet keeps its slot
+	// until it expires; only a failed job is evicted early.
+	if len(s.previewJobs) >= maxPreviewJobs && oldest != "" && s.previewJobs[oldest].Status == "failed" {
 		delete(s.previewJobs, oldest)
 	}
 	if len(s.previewJobs) >= maxPreviewJobs {
 		s.previewMu.Unlock()
-		writeError(w, http.StatusTooManyRequests, "voice preview capacity is full; retry after a running preview finishes")
+		writeError(w, http.StatusTooManyRequests, "voice preview capacity is full; retry in a few minutes")
 		return
 	}
 	ctx, cancel := context.WithTimeout(s.voiceCtx, previewTimeout)

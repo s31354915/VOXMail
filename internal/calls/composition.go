@@ -315,6 +315,13 @@ func (s *Service) handleCompose(sess *session, key string) {
 	}
 	_, done := sess.Editor.Press(key[0])
 	if !done {
+		// Say the field is full the moment it fills up, not only when the
+		// caller presses pound: swallowed keystrokes otherwise look like
+		// the keypad stopped working.
+		if sess.Editor.Overflowed && !sess.Editor.OverflowPrompted {
+			sess.Editor.OverflowPrompted = true
+			s.startTask(func() { s.prompt(sess, "That entry is too long. Press star to delete a character, then try again.") })
+		}
 		return
 	}
 	if sess.Editor.Overflowed {

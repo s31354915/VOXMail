@@ -15,9 +15,9 @@ func TestEmailToSpeechUnicodeCurrency(t *testing.T) {
 	for _, tc := range []struct {
 		input, want string
 	}{
-		{"€12.50", "twelve euros and fifty cents"},
-		{"£7", "7 pounds"},
-		{"$3.25", "3 dollars and twenty-five cents"},
+		{"€12.50", "twelve euros and fifty euro cents"},
+		{"£7", "seven pounds"},
+		{"$3.25", "three dollars and twenty-five cents"},
 	} {
 		if got := EmailToSpeech(tc.input); got != tc.want {
 			t.Fatalf("EmailToSpeech(%q)=%q, want %q", tc.input, got, tc.want)

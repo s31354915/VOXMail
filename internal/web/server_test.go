@@ -1579,14 +1579,17 @@ func TestTOTPReplayAndBackupCodeConcurrency(t *testing.T) {
 		t.Fatal(err)
 	}
 	svc := &Server{Store: db}
-	if !svc.consumeTOTPReplay(ctx, "totp-user", 100) {
-		t.Fatal("first TOTP step was rejected")
+	if replay, err := svc.consumeTOTPReplay(ctx, "totp-user", 100); err != nil || !replay {
+		t.Fatalf("first TOTP step was rejected: replay=%v err=%v", replay, err)
 	}
-	if svc.consumeTOTPReplay(ctx, "totp-user", 100) || svc.consumeTOTPReplay(ctx, "totp-user", 99) {
-		t.Fatal("TOTP replay or older step was accepted")
+	if replay, err := svc.consumeTOTPReplay(ctx, "totp-user", 100); err != nil || replay {
+		t.Fatalf("TOTP replay was accepted: replay=%v err=%v", replay, err)
 	}
-	if !svc.consumeTOTPReplay(ctx, "totp-user", 101) {
-		t.Fatal("newer TOTP step was rejected")
+	if older, err := svc.consumeTOTPReplay(ctx, "totp-user", 99); err != nil || older {
+		t.Fatalf("older TOTP step was accepted: older=%v err=%v", older, err)
+	}
+	if replay, err := svc.consumeTOTPReplay(ctx, "totp-user", 101); err != nil || !replay {
+		t.Fatalf("newer TOTP step was rejected: replay=%v err=%v", replay, err)
 	}
 
 	hash, err := auth.Hash("backup-code")

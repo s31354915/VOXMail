@@ -10,6 +10,9 @@ const (
 	sessionMaxTotal   = 4096
 	sessionMaxPerUser = 16
 	sessionReapPeriod = time.Minute
+	// Sessions live half a day and slide on use: an actively used session
+	// is renewed so a long working session is not cut off mid-task.
+	sessionLifetime = 12 * time.Hour
 )
 
 type sessionGrant struct {
@@ -24,7 +27,7 @@ type sessionGrant struct {
 // undisclosed until commit; failed verification releases the reservation.
 func (s *Server) reserveSession(w http.ResponseWriter, userID string) (*sessionGrant, bool) {
 	token, csrf := newID(), newID()
-	if !s.Sessions.Put(token, Session{UserID: userID, CSRF: csrf, Expires: s.Sessions.currentTime().Add(12 * time.Hour)}) {
+	if !s.Sessions.Put(token, Session{UserID: userID, CSRF: csrf, Expires: s.Sessions.currentTime().Add(sessionLifetime)}) {
 		w.Header().Set("Retry-After", "60")
 		writeError(w, http.StatusTooManyRequests, "session limit reached; sign out of another session or try again later")
 		return nil, false
@@ -44,8 +47,8 @@ func (g *sessionGrant) commit(w http.ResponseWriter, r *http.Request) bool {
 		return false
 	}
 	g.issued = true
-	secure := r.TLS != nil || (g.server.trustedProxy(r) && strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https"))
-	http.SetCookie(w, &http.Cookie{Name: "voxmail_session", Value: g.token, Path: "/", HttpOnly: true, Secure: secure, SameSite: http.SameSiteStrictMode, MaxAge: 43200})
+	secure := g.server.secureCookie(r)
+	http.SetCookie(w, &http.Cookie{Name: "voxmail_session", Value: g.token, Path: "/", HttpOnly: true, Secure: secure, SameSite: http.SameSiteStrictMode, MaxAge: int(sessionLifetime / time.Second)})
 	w.Header().Set("X-CSRF-Token", g.csrf)
 	return true
 }
@@ -54,7 +57,7 @@ func (g *sessionGrant) commit(w http.ResponseWriter, r *http.Request) bool {
 // allocating the replacement lets other concurrent logins steal that space.
 func (s *Server) replaceUserSession(w http.ResponseWriter, r *http.Request, userID string) bool {
 	token, csrf := newID(), newID()
-	session := Session{UserID: userID, CSRF: csrf, Expires: s.Sessions.currentTime().Add(12 * time.Hour)}
+	session := Session{UserID: userID, CSRF: csrf, Expires: s.Sessions.currentTime().Add(sessionLifetime)}
 	if !s.Sessions.replaceUser(token, session) {
 		w.Header().Set("Retry-After", "60")
 		writeError(w, http.StatusTooManyRequests, "session limit reached; sign out of another session or try again later")
@@ -62,6 +65,11 @@ func (s *Server) replaceUserSession(w http.ResponseWriter, r *http.Request, user
 	}
 	grant := &sessionGrant{server: s, store: s.Sessions, token: token, csrf: csrf}
 	return grant.commit(w, r)
+}
+
+// secureCookie mirrors the login cookie's transport rules for refreshed cookies.
+func (s *Server) secureCookie(r *http.Request) bool {
+	return r.TLS != nil || (s.trustedProxy(r) && strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https"))
 }
 
 func (s *SessionStore) currentTime() time.Time {
@@ -102,6 +110,27 @@ func (s *SessionStore) Get(token string) (Session, bool) {
 	}
 	s.reapLocked()
 	return session, true
+}
+
+// GetRenew returns the live session for the token, sliding its expiry forward
+// when more than half of the session lifetime has elapsed so an actively used
+// session is not cut off mid-task. The second result reports a renewal.
+func (s *SessionStore) GetRenew(token string) (Session, bool, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	session, ok := s.byToken[token]
+	if !ok || !s.currentTime().Before(session.Expires) {
+		s.deleteLocked(token)
+		return Session{}, false, false
+	}
+	renewed := false
+	if s.currentTime().Add(sessionLifetime / 2).After(session.Expires) {
+		session.Expires = s.currentTime().Add(sessionLifetime)
+		s.byToken[token] = session
+		renewed = true
+	}
+	s.reapLocked()
+	return session, renewed, true
 }
 
 func (s *SessionStore) deleteLocked(token string) {

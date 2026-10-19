@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/mail"
 	"strings"
 
 	"github.com/voxmail/voxmail/internal/phone"
@@ -36,6 +37,10 @@ func (s *Server) createContact(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "name and email are required")
 		return
 	}
+	if _, err := mail.ParseAddress(strings.TrimSpace(c.Email)); err != nil {
+		writeError(w, http.StatusBadRequest, "contact email is invalid")
+		return
+	}
 	id, err := s.Store.AddContact(r.Context(), c)
 	if err != nil {
 		writeError(w, http.StatusConflict, "contact already exists")
@@ -60,6 +65,10 @@ func (s *Server) updateContact(w http.ResponseWriter, r *http.Request) {
 	c.UserID = u.ID
 	if strings.TrimSpace(c.Name) == "" || strings.TrimSpace(c.Email) == "" {
 		writeError(w, http.StatusBadRequest, "name and email are required")
+		return
+	}
+	if _, err := mail.ParseAddress(strings.TrimSpace(c.Email)); err != nil {
+		writeError(w, http.StatusBadRequest, "contact email is invalid")
 		return
 	}
 	if err := s.Store.UpdateContact(r.Context(), c); err != nil {

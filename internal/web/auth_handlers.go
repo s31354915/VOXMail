@@ -117,11 +117,25 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer grant.cancel()
-	totpSecret := s.openTOTPSecret(u.TOTPSecret)
+	totpSecret, totpErr := s.openTOTPSecret(u.TOTPSecret)
+	if totpErr != nil {
+		if s.log() != nil {
+			s.log().Warn("stored authenticator secret is unavailable", "user_id", u.ID, "error", totpErr)
+		}
+		// Not a credential failure: the user's secret cannot be read, so
+		// this attempt does not count against the login rate limit.
+		writeError(w, http.StatusServiceUnavailable, "two-factor verification is temporarily unavailable; try again shortly")
+		return
+	}
 	if totpSecret != "" {
 		step, valid := auth.TOTPWithStep(totpSecret, req.TOTP, time.Now().UTC())
 		if valid {
-			if !s.consumeTOTPReplay(r.Context(), u.ID, step) {
+			accepted, replayErr := s.consumeTOTPReplay(r.Context(), u.ID, step)
+			if replayErr != nil {
+				writeError(w, http.StatusServiceUnavailable, "two-factor verification is temporarily unavailable; try again shortly")
+				return
+			}
+			if !accepted {
 				credentialFailure = true
 				writeError(w, http.StatusUnauthorized, "authenticator or backup code required")
 				return
@@ -164,10 +178,19 @@ func (s *Server) allowRecoveryRequest(r *http.Request, email string) bool {
 			}
 		}
 		for len(s.recoveryRate) > 4096 {
-			for key := range s.recoveryRate {
-				delete(s.recoveryRate, key)
+			// Evict the oldest bucket rather than an arbitrary one, so a
+			// flood cannot reset an active rate limit by chance.
+			oldestKey := ""
+			var oldestStart time.Time
+			for key, state := range s.recoveryRate {
+				if oldestKey == "" || state.Started.Before(oldestStart) {
+					oldestKey, oldestStart = key, state.Started
+				}
+			}
+			if oldestKey == "" {
 				break
 			}
+			delete(s.recoveryRate, oldestKey)
 		}
 	}
 	allowed := true

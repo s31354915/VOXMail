@@ -2,6 +2,7 @@ package calls
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -45,7 +46,7 @@ func (w *pacedPCMWriter) Write(p []byte) (int, error) {
 		}
 		size := min(len(p), pcmBytesPerSecond/50)
 		start := time.Now()
-		n, err := w.w.Write(p[:size])
+		n, err := w.writeResilient(p[:size])
 		sent += n
 		p = p[n:]
 		// Preserve the timeline across normal scheduler latency. Rebase only
@@ -66,6 +67,26 @@ func (w *pacedPCMWriter) Write(p []byte) (int, error) {
 	}
 	return sent, nil
 }
+
+// writeResilient retries a chunk that hit EAGAIN. Pollable FIFO writes park
+// until the reader drains, but a descriptor that is not pollable can surface
+// EAGAIN mid-prompt; treat it as "not writable yet" rather than aborting the
+// sentence the caller is in the middle of hearing.
+func (w *pacedPCMWriter) writeResilient(p []byte) (int, error) {
+	for {
+		n, err := w.w.Write(p)
+		if err == nil || n > 0 {
+			return n, err
+		}
+		if !errors.Is(err, unix.EAGAIN) && !errors.Is(err, unix.EWOULDBLOCK) {
+			return n, err
+		}
+		if waitErr := waitPCM(w.ctx, 20*time.Millisecond); waitErr != nil {
+			return 0, waitErr
+		}
+	}
+}
+
 func waitPCM(ctx context.Context, duration time.Duration) error {
 	if err := ctx.Err(); err != nil {
 		return err

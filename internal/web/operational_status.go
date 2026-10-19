@@ -67,6 +67,18 @@ func operationalFailure(message string) *OperationalFailure {
 	if status := toolExitStatus.FindString(lower); status != "" {
 		f.Diagnostic = "Child process " + status
 	}
+	return f
+}
+
+// sipRegistrationFailure classifies an error the SIP runtime raised. Numeric
+// response codes are only meaningful in that context: elsewhere an IMAP or
+// SMTP status line such as "554 ..." would be mislabeled as a SIP registrar
+// failure, so the generic classifier never applies that mapping.
+func sipRegistrationFailure(message string) *OperationalFailure {
+	f := operationalFailure(message)
+	if f == nil {
+		return nil
+	}
 	if code := sipFailureCode.FindString(strings.TrimSpace(message)); code != "" {
 		code = strings.TrimSpace(code)
 		f.Diagnostic = "SIP response " + code
@@ -113,7 +125,7 @@ func (s *Server) operationalStatus(w http.ResponseWriter, r *http.Request) {
 				status.SIPFailure.Diagnostic = "SIP response " + strconv.Itoa(code)
 			}
 		} else {
-			status.SIPFailure = operationalFailure(status.Runtime.LastError)
+			status.SIPFailure = sipRegistrationFailure(status.Runtime.LastError)
 		}
 	}
 	if s.shuttingDown() {

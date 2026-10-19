@@ -271,7 +271,11 @@ func removeTree(ctx context.Context, path string, remaining *int, report *Cleanu
 		return false, err
 	}
 	report.RemovedFiles++
-	report.RemovedBytes += info.Size()
+	if !info.IsDir() {
+		// Directory st_size is filesystem bookkeeping, not bytes the
+		// deployment can free, so only files count here.
+		report.RemovedBytes += info.Size()
+	}
 	return true, nil
 }
 

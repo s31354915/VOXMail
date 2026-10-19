@@ -30,7 +30,7 @@ func (c Cache) Paths(voice string, speed int, prompts map[string]string) map[str
 	paths := make(map[string]string, len(prompts))
 	active := filepath.Join(c.Root, "active")
 	for key, text := range prompts {
-		digest := sha256.Sum256([]byte(voice + fmt.Sprint(speed) + key + text))
+		digest := sha256.Sum256([]byte(voice + "\x00" + fmt.Sprint(speed) + "\x00" + key + "\x00" + text))
 		name := hex.EncodeToString(digest[:]) + ".wav"
 		path := filepath.Join(active, name)
 		if ValidWAV(path) {
@@ -51,7 +51,7 @@ func (c Cache) Build(ctx context.Context, voice string, speed int, prompts map[s
 	defer os.RemoveAll(stage)
 	manifest := Manifest{Voice: voice, Speed: speed, Assets: make(map[string]string, len(prompts))}
 	for key, text := range prompts {
-		digest := sha256.Sum256([]byte(voice + fmt.Sprint(speed) + key + text))
+		digest := sha256.Sum256([]byte(voice + "\x00" + fmt.Sprint(speed) + "\x00" + key + "\x00" + text))
 		name := hex.EncodeToString(digest[:]) + ".wav"
 		path := filepath.Join(stage, name)
 		if err := c.Synth.Synthesize(ctx, text, path); err != nil {

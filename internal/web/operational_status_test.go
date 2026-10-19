@@ -31,7 +31,7 @@ func TestOperationalFailureDoesNotEchoProviderOutput(t *testing.T) {
 		{"500 Provider failure", "operation_failed"}, {"unknown provider output", "operation_failed"},
 	} {
 		t.Run(tc.category+"/"+tc.signal, func(t *testing.T) {
-			failure := operationalFailure(tc.signal + " password=SensitivePassword token=SensitiveToken https://user:SensitivePassword@provider.test/private")
+			failure := sipRegistrationFailure(tc.signal + " password=SensitivePassword token=SensitiveToken https://user:SensitivePassword@provider.test/private")
 			if failure == nil || failure.Category != tc.category || failure.Reason == "" || failure.Action == "" {
 				t.Fatalf("missing useful cause: %+v", failure)
 			}
