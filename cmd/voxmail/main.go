@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -135,6 +136,54 @@ func (v *voiceActivator) PreviewVoice(ctx context.Context, name string, speed in
 	return os.ReadFile(path)
 }
 
+// promptWarmState carries the background static-prompt warm-up result.
+// The web console reads it under the lock so status answers stay race-free
+// while generation runs.
+type promptWarmState struct {
+	mu       sync.Mutex
+	manifest speech.StaticPromptManifest
+	err      error
+	warming  bool
+}
+
+// warmStaticPrompts prepares the static greeting and main-menu prompts in
+// the background and publishes the result to the prompt player. A failure
+// keeps the player on dynamic synthesis and the previous manifest's assets.
+func warmStaticPrompts(ctx context.Context, cfg config.Config, log *slog.Logger, piperModel, promptDir, mainMenuPath, manifestPath string, state *promptWarmState, player *calls.PromptPlayer, fingerprint string) {
+	promptContext, promptCancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer promptCancel()
+	manifest, promptErr := speech.PrepareStaticPrompts(promptContext, speech.Piper{Binary: cfg.PiperBinary, Model: piperModel}, cfg.GreetingPath, mainMenuPath, manifestPath)
+	state.mu.Lock()
+	state.manifest = manifest
+	state.err = promptErr
+	state.warming = false
+	state.mu.Unlock()
+	if promptErr != nil {
+		log.Warn("static prompts unavailable; only existing recordings will be used", "error", promptErr)
+	}
+	staticPrompts := make(map[string]string)
+	staticTexts := speech.StaticPromptTexts()
+	for key, relative := range manifest.Assets {
+		if text, ok := staticTexts[key]; ok {
+			path := filepath.Join(promptDir, relative)
+			if speech.ValidWAV(path) {
+				staticPrompts[text] = path
+			}
+		}
+	}
+	// Older deployments have a version-one manifest containing only the main
+	// menu. Keep that shipped asset usable until the next successful model
+	// regeneration upgrades the manifest.
+	if len(staticPrompts) == 0 {
+		if speech.ValidWAV(mainMenuPath) {
+			staticPrompts[speech.StaticMainText] = mainMenuPath
+		}
+	}
+	if promptErr == nil && player != nil {
+		player.SetStaticPromptsForSpeed(staticPrompts, manifest.VoiceModel, 3, fingerprint)
+	}
+}
+
 func main() {
 	const shutdownBudget = 45 * time.Second
 	log := slog.New(slog.NewJSONHandler(os.Stdout, diagnostics.HandlerOptions()))
@@ -186,30 +235,13 @@ func main() {
 	promptDir := filepath.Join(cfg.DataDir, "prompts")
 	mainMenuPath := filepath.Join(promptDir, "main-menu.wav")
 	manifestPath := filepath.Join(promptDir, "static-prompts.json")
-	promptContext, promptCancel := context.WithTimeout(signalContext, 5*time.Minute)
-	staticManifest, promptErr := speech.PrepareStaticPrompts(promptContext, speech.Piper{Binary: cfg.PiperBinary, Model: piperModel}, cfg.GreetingPath, mainMenuPath, manifestPath)
-	promptCancel()
-	if promptErr != nil {
-		log.Warn("static prompts unavailable; only existing recordings will be used", "error", promptErr)
-	}
-	staticPrompts := make(map[string]string)
-	staticTexts := speech.StaticPromptTexts()
-	for key, relative := range staticManifest.Assets {
-		if text, ok := staticTexts[key]; ok {
-			path := filepath.Join(promptDir, relative)
-			if speech.ValidWAV(path) {
-				staticPrompts[text] = path
-			}
-		}
-	}
-	// Older deployments have a version-one manifest containing only the main
-	// menu. Keep that shipped asset usable until the next successful model
-	// regeneration upgrades the manifest.
-	if len(staticPrompts) == 0 {
-		if speech.ValidWAV(mainMenuPath) {
-			staticPrompts[speech.StaticMainText] = mainMenuPath
-		}
-	}
+	// Static prompt warm-up no longer blocks the listener. The HTTP server
+	// binds first, so health checks and the web console answer during a
+	// cold start's prompt regeneration instead of holding /readyz for the
+	// whole synthesis window (INC-2026-0612, VXE-4). The warm-up job
+	// started below fills promptWarm and hands the result to the prompt
+	// player; until then calls fall back to on-demand synthesis.
+	promptWarm := &promptWarmState{warming: true}
 	db, err := store.Open(cfg.DBPath)
 	if err != nil {
 		log.Error("cannot open database", "error", err)
@@ -262,12 +294,7 @@ func main() {
 		Pool:         speechPool,
 		Store:        db,
 		GreetingPath: cfg.GreetingPath,
-		Static:       staticPrompts,
-		StaticVoice:  staticManifest.VoiceModel,
 		Dir:          promptDir,
-	}
-	if promptErr == nil {
-		promptPlayer.SetStaticPromptsForSpeed(staticPrompts, staticManifest.VoiceModel, 3, speechRuntime.Fingerprint)
 	}
 	promptPlayer.PruneDynamicPrompts()
 	bridgeService := &calls.Service{
@@ -307,14 +334,21 @@ func main() {
 		}
 		promptState := "ready"
 		promptError := ""
-		if promptErr != nil {
+		promptWarm.mu.Lock()
+		warmManifest, warmErr, warming := promptWarm.manifest, promptWarm.err, promptWarm.warming
+		promptWarm.mu.Unlock()
+		switch {
+		case warmErr != nil:
 			promptState = "backup"
 			if !speech.ValidWAV(cfg.GreetingPath) {
 				promptState = "unavailable"
 			}
 			promptError = "Configured voice prompts could not be generated; check server logs."
+		case warming:
+			promptState = "backup"
+			promptError = "Voice prompts are regenerating in the background; calls synthesize on demand until they finish."
 		}
-		return web.RuntimeStatus{PromptState: promptState, PromptVoice: staticManifest.VoiceModel, PromptError: promptError, Process: sipStatus.Process, Bridge: bridgeState, Registration: sipStatus.Registration, Media: mediaState, LastError: sipStatus.LastError, ErrorCategory: sipStatus.ErrorCategory, ResponseCode: sipStatus.ResponseCode}
+		return web.RuntimeStatus{PromptState: promptState, PromptVoice: warmManifest.VoiceModel, PromptError: promptError, Process: sipStatus.Process, Bridge: bridgeState, Registration: sipStatus.Registration, Media: mediaState, LastError: sipStatus.LastError, ErrorCategory: sipStatus.ErrorCategory, ResponseCode: sipStatus.ResponseCode}
 	}
 	voiceInstaller := speech.AdministratorVoiceInstaller{Validate: func(ctx context.Context, model string) error {
 		return (speech.Piper{Binary: cfg.PiperBinary, Model: model}).Warm(ctx, filepath.Join(cfg.DataDir, "run", "speech"))
@@ -364,6 +398,9 @@ func main() {
 		webApp.Sync = syncService
 	}
 	sipBridge.SetLifetime(application.RuntimeContext())
+	application.Start(lifecycle.LocalWorker, func(ctx context.Context) {
+		warmStaticPrompts(ctx, cfg, log, piperModel, promptDir, mainMenuPath, manifestPath, promptWarm, promptPlayer, speechRuntime.Fingerprint)
+	})
 	application.Start(lifecycle.LocalWorker, func(ctx context.Context) {
 		if err := webApp.RunAccountCleanup(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Error("account cleanup stopped", "error", err)

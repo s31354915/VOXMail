@@ -98,13 +98,26 @@ func (s *Store) UpsertMailIndex(ctx context.Context, input MailIndexInput) (int6
 	if strings.TrimSpace(input.AccountID) == "" || strings.TrimSpace(input.Path) == "" {
 		return 0, fmt.Errorf("account and mail path are required")
 	}
+	// The identity lookup, the re-home decision, and the final insert must
+	// run atomically. Previously each step was its own autocommit
+	// statement, so two scans of the same folder could interleave: both
+	// observed "no stale row and no row at this path" and both inserted,
+	// leaving two rows for the same message under different paths. The
+	// duplicate survives until the next scan's re-home pass and, in the
+	// meantime, surfaces as an always-unread, unplayable entry.
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	// A message can re-index under a new path (flag rename, re-download,
 	// UID churn). Carry the announced mark and retry attempts from any
 	// existing row for the same message identity so a sync cannot reset
 	// them; without this the same message alerted again after every sync.
 	if strings.TrimSpace(input.MessageID) != "" {
 		var alerted, attempts int
-		err := s.DB.QueryRowContext(ctx, `SELECT COALESCE(MAX(alerted),0), COALESCE(MAX(alert_attempts),0) FROM mail_messages WHERE account_id=? AND folder=? AND path<>? AND message_id=?`, input.AccountID, input.Folder, input.Path, input.MessageID).Scan(&alerted, &attempts)
+		err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(alerted),0), COALESCE(MAX(alert_attempts),0) FROM mail_messages WHERE account_id=? AND folder=? AND path<>? AND message_id=?`, input.AccountID, input.Folder, input.Path, input.MessageID).Scan(&alerted, &attempts)
 		if err == nil {
 			if alerted != 0 || attempts > 0 {
 				input.Alerted, input.AlertAttempts = alerted, attempts
@@ -122,7 +135,7 @@ func (s *Store) UpsertMailIndex(ctx context.Context, input MailIndexInput) (int6
 	// stale: a folder can legitimately hold several copies of the same
 	// message, and every live copy needs its own row.
 	if strings.TrimSpace(input.MessageID) != "" && input.PathIsLive != nil {
-		candidateRows, err := s.DB.QueryContext(ctx, `SELECT id,path,is_read FROM mail_messages WHERE account_id=? AND folder=? AND message_id=? AND path<>? AND NOT EXISTS(SELECT 1 FROM mail_messages other WHERE other.path=?) ORDER BY updated_at DESC`, input.AccountID, input.Folder, input.MessageID, input.Path, input.Path)
+		candidateRows, err := tx.QueryContext(ctx, `SELECT id,path,is_read FROM mail_messages WHERE account_id=? AND folder=? AND message_id=? AND path<>? AND NOT EXISTS(SELECT 1 FROM mail_messages other WHERE other.path=?) ORDER BY updated_at DESC`, input.AccountID, input.Folder, input.MessageID, input.Path, input.Path)
 		if err != nil {
 			return 0, err
 		}
@@ -154,23 +167,28 @@ func (s *Store) UpsertMailIndex(ctx context.Context, input MailIndexInput) (int6
 					deadRead = true
 				}
 			}
-			if _, err := s.DB.ExecContext(ctx, `UPDATE mail_messages SET path=?,message_id=?,sender=?,recipients=?,cc=?,subject=?,message_date=?,message_date_utc=?,is_read=?,alerted=?,alert_attempts=?,attachment_count=?,updated_at=?,last_seen_scan=?,source_size=? WHERE id=?`, input.Path, input.MessageID, input.Sender, input.Recipients, input.Cc, input.Subject, input.Date, input.DateUTC, deadRead, input.Alerted, input.AlertAttempts, input.Attachments, input.UpdatedAt, input.ScanID, input.SourceSize, moveID); err != nil {
+			if _, err := tx.ExecContext(ctx, `UPDATE mail_messages SET path=?,message_id=?,sender=?,recipients=?,cc=?,subject=?,message_date=?,message_date_utc=?,is_read=?,alerted=?,alert_attempts=?,attachment_count=?,updated_at=?,last_seen_scan=?,source_size=? WHERE id=?`, input.Path, input.MessageID, input.Sender, input.Recipients, input.Cc, input.Subject, input.Date, input.DateUTC, deadRead, input.Alerted, input.AlertAttempts, input.Attachments, input.UpdatedAt, input.ScanID, input.SourceSize, moveID); err != nil {
 				return 0, err
 			}
 			for _, candidate := range stale[1:] {
-				if _, err := s.DB.ExecContext(ctx, `DELETE FROM mail_messages WHERE id=? AND account_id=?`, candidate.id, input.AccountID); err != nil {
+				if _, err := tx.ExecContext(ctx, `DELETE FROM mail_messages WHERE id=? AND account_id=?`, candidate.id, input.AccountID); err != nil {
 					return 0, err
 				}
+			}
+			if err := tx.Commit(); err != nil {
+				return 0, err
 			}
 			return moveID, nil
 		}
 	}
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO mail_messages(account_id,folder,path,message_id,sender,recipients,cc,subject,message_date,message_date_utc,is_read,alerted,alert_attempts,attachment_count,updated_at,last_seen_scan,source_size) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET folder=excluded.folder,message_id=excluded.message_id,sender=excluded.sender,recipients=excluded.recipients,cc=excluded.cc,subject=excluded.subject,message_date=excluded.message_date,message_date_utc=excluded.message_date_utc,is_read=excluded.is_read,attachment_count=excluded.attachment_count,updated_at=excluded.updated_at,last_seen_scan=excluded.last_seen_scan,source_size=excluded.source_size`, input.AccountID, input.Folder, input.Path, input.MessageID, input.Sender, input.Recipients, input.Cc, input.Subject, input.Date, input.DateUTC, input.Read, input.Alerted, input.AlertAttempts, input.Attachments, input.UpdatedAt, input.ScanID, input.SourceSize)
-	if err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO mail_messages(account_id,folder,path,message_id,sender,recipients,cc,subject,message_date,message_date_utc,is_read,alerted,alert_attempts,attachment_count,updated_at,last_seen_scan,source_size) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET folder=excluded.folder,message_id=excluded.message_id,sender=excluded.sender,recipients=excluded.recipients,cc=excluded.cc,subject=excluded.subject,message_date=excluded.message_date,message_date_utc=excluded.message_date_utc,is_read=excluded.is_read,attachment_count=excluded.attachment_count,updated_at=excluded.updated_at,last_seen_scan=excluded.last_seen_scan,source_size=excluded.source_size`, input.AccountID, input.Folder, input.Path, input.MessageID, input.Sender, input.Recipients, input.Cc, input.Subject, input.Date, input.DateUTC, input.Read, input.Alerted, input.AlertAttempts, input.Attachments, input.UpdatedAt, input.ScanID, input.SourceSize); err != nil {
 		return 0, err
 	}
 	var id int64
-	if err := s.DB.QueryRowContext(ctx, `SELECT id FROM mail_messages WHERE path=?`, input.Path).Scan(&id); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM mail_messages WHERE path=?`, input.Path).Scan(&id); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
 	return id, nil
