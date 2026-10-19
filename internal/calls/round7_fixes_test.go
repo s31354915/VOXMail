@@ -27,12 +27,38 @@ func TestPlayInputDeliversEntirePromptAfterConverterExits(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reader.Close()
+	// playDone marks the moment PlayMedia has finished (or failed): only
+	// then is an EOF on the FIFO the real one. Before PlayMedia opens its
+	// writer side, a read on an empty FIFO reports EOF even though audio
+	// is about to flow, so the drain loop must not treat that first EOF
+	// as the end and stop consuming (the pending bytes would then never
+	// drain and playback would spin until the context deadline).
+	playDone := make(chan struct{})
 	readDone := make(chan int, 1)
 	readErr := make(chan error, 1)
 	go func() {
-		data, err := io.ReadAll(reader)
-		readDone <- len(data)
-		readErr <- err
+		total := 0
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := reader.Read(buf)
+			total += n
+			if err == nil || n > 0 {
+				continue
+			}
+			if !errors.Is(err, io.EOF) {
+				readErr <- err
+				return
+			}
+			select {
+			case <-playDone:
+				readDone <- total
+				readErr <- nil
+				return
+			default:
+				// No writer has opened yet: this EOF is not the real one.
+				time.Sleep(5 * time.Millisecond)
+			}
+		}
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -40,6 +66,7 @@ func TestPlayInputDeliversEntirePromptAfterConverterExits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PlayMedia: %v", err)
 	}
+	close(playDone)
 	select {
 	case got := <-readDone:
 		if got != len(payload) {
@@ -53,8 +80,6 @@ func TestPlayInputDeliversEntirePromptAfterConverterExits(t *testing.T) {
 	}
 }
 
-// A converter that fails without producing audio must still surface its
-// exit status instead of a silent prompt.
 func TestPlayInputReportsConverterFailure(t *testing.T) {
 	player, fifo := fakePCMPlayer(t, []byte{1, 2, 3, 4})
 	broken := filepath.Join(filepath.Dir(fifo), "broken-ffmpeg")
