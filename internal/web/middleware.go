@@ -4,6 +4,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/voxmail/voxmail/internal/store"
 )
@@ -49,7 +50,7 @@ func (s *Server) withAdmission(next http.Handler) http.Handler {
 
 func (s *Server) require(w http.ResponseWriter, r *http.Request, write bool) (store.User, bool) {
 	token := sessionToken(r)
-	session, ok := s.Sessions.Get(token)
+	session, renewed, ok := s.Sessions.GetRenew(token)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "authentication required")
 		return store.User{}, false
@@ -62,6 +63,11 @@ func (s *Server) require(w http.ResponseWriter, r *http.Request, write bool) (st
 	if err != nil || !user.Enabled {
 		writeError(w, http.StatusUnauthorized, "authentication required")
 		return store.User{}, false
+	}
+	if renewed {
+		// The session slid forward: refresh the browser cookie so the two
+		// lifetimes move together.
+		http.SetCookie(w, &http.Cookie{Name: "voxmail_session", Value: token, Path: "/", HttpOnly: true, Secure: s.secureCookie(r), SameSite: http.SameSiteStrictMode, MaxAge: int(sessionLifetime / time.Second)})
 	}
 	return user, true
 }

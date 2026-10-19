@@ -60,6 +60,42 @@ func (s *Store) LatestSyncRun(ctx context.Context, accountID string, successfulO
 	return run, nil
 }
 
+// LatestSyncRuns returns, for each account id, its most recent run (or most
+// recent successful run when successfulOnly is set) in one query, so listing
+// several accounts does not issue two queries per account.
+func (s *Store) LatestSyncRuns(ctx context.Context, accountIDs []string, successfulOnly bool) (map[string]SyncRun, error) {
+	out := make(map[string]SyncRun, len(accountIDs))
+	if len(accountIDs) == 0 {
+		return out, nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(accountIDs)), ",")
+	args := make([]any, 0, len(accountIDs))
+	for _, id := range accountIDs {
+		args = append(args, id)
+	}
+	query := `SELECT r.account_id,r.id,r.kind,r.started_at,COALESCE(r.finished_at,''),r.success,r.changed,r.error,r.error_category FROM sync_runs r JOIN (SELECT account_id,MAX(id) mid FROM sync_runs WHERE account_id IN (` + placeholders + `)`
+	if successfulOnly {
+		query += ` AND success=1`
+	}
+	query += ` GROUP BY account_id) m ON r.id=m.mid`
+	rows, err := s.DB.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var run SyncRun
+		var success, changed int
+		if err := rows.Scan(&run.AccountID, &run.ID, &run.Kind, &run.StartedAt, &run.FinishedAt, &success, &changed, &run.Error, &run.ErrorCategory); err != nil {
+			return nil, err
+		}
+		run.Success = success != 0
+		run.Changed = changed != 0
+		out[run.AccountID] = run
+	}
+	return out, rows.Err()
+}
+
 // LatestFullSyncRun returns the most recent successful run that performs a
 // complete remote identity walk. Incremental runs intentionally do not update
 // this clock.

@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -113,7 +114,8 @@ func (s *Server) disable2FA(w http.ResponseWriter, r *http.Request) {
 		writeFieldError(w, "current_password", "current password is incorrect")
 		return
 	}
-	if u.TOTPSecret == "" || !auth.TOTP(s.openTOTPSecret(u.TOTPSecret), req.Code, time.Now().UTC()) {
+	secret, secretErr := s.openTOTPSecret(u.TOTPSecret)
+	if u.TOTPSecret == "" || secretErr != nil || !auth.TOTP(secret, req.Code, time.Now().UTC()) {
 		writeFieldError(w, "code", "authenticator code is incorrect")
 		return
 	}
@@ -125,26 +127,33 @@ func (s *Server) disable2FA(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "disabled"})
 }
 
-func (s *Server) openTOTPSecret(value string) string {
+func (s *Server) openTOTPSecret(value string) (string, error) {
 	if value == "" {
-		return ""
+		return "", nil
 	}
 	if s.Secrets != nil {
-		if plain, err := s.Secrets.Open(value); err == nil {
-			return plain
+		plain, err := s.Secrets.Open(value)
+		if err != nil {
+			// A sealed secret that cannot be decrypted is never mistaken for
+			// a legacy plaintext secret: that would fail every TOTP check and
+			// lock the user out with a misleading message.
+			return "", fmt.Errorf("stored authenticator secret is unavailable")
 		}
+		return plain, nil
 	}
 	// Accept legacy plaintext secrets so an upgrade does not lock users out;
 	// newly enabled secrets are always sealed above.
-	return value
+	return value, nil
 }
 
 // consumeTOTPReplay atomically accepts a strictly newer clock step. The
 // verifier still allows one step of clock skew, but a code for any accepted
 // step can only authenticate once for this user.
-func (s *Server) consumeTOTPReplay(ctx context.Context, userID string, step int64) bool {
+func (s *Server) consumeTOTPReplay(ctx context.Context, userID string, step int64) (bool, error) {
 	ok, err := s.Store.ConsumeTOTPReplay(ctx, userID, step)
-	return err == nil && ok
+	// A store error is reported as such, never folded into a replay
+	// rejection: a transient database hiccup must not read as a wrong code.
+	return ok && err == nil, err
 }
 
 func (s *Server) consumeBackupCode(ctx context.Context, userID, candidate string) bool {

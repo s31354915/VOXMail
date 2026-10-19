@@ -92,11 +92,14 @@ func TestOfflineHTTPContractSuppressesManualProviderOperations(t *testing.T) {
 	if response := voiceRequest(h, "", http.MethodPost, "/api/v1/accounts/test", nil); response.Code != http.StatusUnauthorized {
 		t.Fatal("offline bypassed authentication", response.Code)
 	}
-	for _, path := range []string{"/api/v1", "/readyz"} {
-		response := voiceRequest(h, "", http.MethodGet, path, nil)
-		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"offline_mode":true`) {
-			t.Fatal("mode missing from readiness/API", response.Code, response.Body.String())
-		}
+	if response := voiceRequest(h, "", http.MethodGet, "/readyz", nil); response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"offline_mode":true`) {
+		t.Fatal("mode missing from readiness", response.Code, response.Body.String())
+	}
+	if response := voiceRequest(h, "", http.MethodGet, "/api/v1", nil); response.Code != http.StatusOK || strings.Contains(response.Body.String(), `"offline_mode"`) {
+		t.Fatal("api info leaked offline mode unauthenticated", response.Code, response.Body.String())
+	}
+	if response := voiceRequest(h, "user", http.MethodGet, "/api/v1", nil); response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"offline_mode":true`) {
+		t.Fatal("mode missing from authenticated API", response.Code, response.Body.String())
 	}
 	if response := voiceRequest(h, "user", http.MethodPost, "/api/v1/contacts", map[string]string{"name": "Maintenance contact", "email": "contact@example.test"}); response.Code != http.StatusCreated {
 		t.Fatal("offline rejected local maintenance", response.Code, response.Body.String())

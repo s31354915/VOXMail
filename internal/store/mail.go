@@ -369,6 +369,25 @@ func inboxFolderLegacy(account Account) string {
 	return "Inbox"
 }
 
+// ListFolderRolesForUser returns every folder role the user's accounts define,
+// in one query, so listing several accounts does not issue one query each.
+func (s *Store) ListFolderRolesForUser(ctx context.Context, userID string) ([]FolderRole, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT r.account_id,r.role,r.remote_path,r.local_path FROM folder_roles r JOIN accounts a ON a.id=r.account_id WHERE a.user_id=? ORDER BY r.account_id,r.role`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var roles []FolderRole
+	for rows.Next() {
+		var role FolderRole
+		if err := rows.Scan(&role.AccountID, &role.Role, &role.RemotePath, &role.LocalPath); err != nil {
+			return nil, err
+		}
+		roles = append(roles, role)
+	}
+	return roles, rows.Err()
+}
+
 func (s *Store) ListFolderRoles(ctx context.Context, userID, accountID string) ([]FolderRole, error) {
 	rows, err := s.DB.QueryContext(ctx, `SELECT r.account_id,r.role,r.remote_path,r.local_path FROM folder_roles r JOIN accounts a ON a.id=r.account_id WHERE a.user_id=? AND r.account_id=? ORDER BY r.role`, userID, accountID)
 	if err != nil {

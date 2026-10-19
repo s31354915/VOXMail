@@ -2,7 +2,6 @@ package web
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -131,26 +130,43 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 		serverError(w, err)
 		return
 	}
+	// One batched read per table instead of three queries per account, so
+	// the console's account list does not slow down as accounts grow.
+	ids := make([]string, 0, len(accounts))
+	for _, account := range accounts {
+		ids = append(ids, account.ID)
+	}
+	roles, roleErr := s.Store.ListFolderRolesForUser(r.Context(), u.ID)
+	if roleErr != nil {
+		serverError(w, roleErr)
+		return
+	}
+	rolesByAccount := make(map[string][]store.FolderRole, len(accounts))
+	for _, role := range roles {
+		rolesByAccount[role.AccountID] = append(rolesByAccount[role.AccountID], role)
+	}
+	latest, latestErr := s.Store.LatestSyncRuns(r.Context(), ids, false)
+	if latestErr != nil {
+		serverError(w, latestErr)
+		return
+	}
+	latestSuccess, successErr := s.Store.LatestSyncRuns(r.Context(), ids, true)
+	if successErr != nil {
+		serverError(w, successErr)
+		return
+	}
 	out := make([]accountView, 0, len(accounts))
 	for _, account := range accounts {
 		view := accountJSON(account)
 		view.FolderRoles = make(map[string]string)
-		if roles, err := s.Store.ListFolderRoles(r.Context(), u.ID, account.ID); err == nil {
-			for _, role := range roles {
-				view.FolderRoles[role.Role] = role.RemotePath
-			}
+		for _, role := range rolesByAccount[account.ID] {
+			view.FolderRoles[role.Role] = role.RemotePath
 		}
-		if run, err := s.Store.LatestSyncRun(r.Context(), account.ID, false); err == nil {
+		if run, ok := latest[account.ID]; ok {
 			view.LastSync = s.syncRunJSON(run)
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			serverError(w, err)
-			return
 		}
-		if run, err := s.Store.LatestSyncRun(r.Context(), account.ID, true); err == nil {
+		if run, ok := latestSuccess[account.ID]; ok {
 			view.LastSuccessfulSync = s.syncRunJSON(run)
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			serverError(w, err)
-			return
 		}
 		out = append(out, view)
 	}

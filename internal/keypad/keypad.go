@@ -14,6 +14,10 @@ type MultiTap struct {
 	// Overflowed reports input rejected at the configured boundary. It is
 	// cleared when a backspace makes room or when a new editor is created.
 	Overflowed bool
+	// OverflowPrompted records that the caller already heard the too-long
+	// notice for the current overflow, so the notice is not repeated for
+	// every swallowed key.
+	OverflowPrompted bool
 }
 
 type Mode int
@@ -56,6 +60,7 @@ func (m *MultiTap) Press(key byte) (committed string, done bool) {
 		if m.PendingKey == 0 {
 			m.Text = backspace(m.Text)
 			m.Overflowed = false
+			m.OverflowPrompted = false
 			return "", false
 		}
 		committed = m.appendCurrent()
