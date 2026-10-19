@@ -296,8 +296,10 @@ func openPCMWriter(ctx context.Context, path string) (*os.File, error) {
 	for {
 		file, openErr := os.OpenFile(path, os.O_WRONLY|syscall.O_NONBLOCK, 0600)
 		if openErr == nil {
-			// Keep the descriptor pollable. Switching it to blocking mode
-			// makes a full FIFO write immune to context cancellation.
+			// Keep the descriptor pollable (non-blocking): a full FIFO write
+			// then parks in Go's poller until the reader drains, honoring
+			// deadlines and cancellation, instead of surfacing EAGAIN as a
+			// mid-prompt playback failure.
 
 			return file, nil
 		}
@@ -503,12 +505,21 @@ func (p *PromptPlayer) playInput(ctx context.Context, fifo, input string, drainT
 		return err
 	}
 	defer pipe.Close()
+	rawRead, rawWrite, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("prompt conversion: %w", err)
+	}
+	defer rawRead.Close()
 	// Closing a pollable FIFO wakes both pending writes and process output
 	// copying. Killing ffmpeg alone cannot wake a blocked Go output writer.
-	stopClose := context.AfterFunc(mediaCtx, func() { _ = pipe.Close() })
+	stopClose := context.AfterFunc(mediaCtx, func() {
+		_ = pipe.Close()
+		_ = rawRead.Close()
+	})
 	defer stopClose()
 	info, err := pipe.Stat()
 	if err != nil {
+		_ = rawWrite.Close()
 		return err
 	}
 	var output io.Writer = pipe
@@ -520,17 +531,32 @@ func (p *PromptPlayer) playInput(ctx context.Context, fifo, input string, drainT
 	// clipping after the phone-band downscale, which callers heard as
 	// "not clear" speech.
 	cmd := process.New(mediaCtx, "ffmpeg", binary, 0, "-nostdin", "-i", input, "-vn", "-af", "loudnorm=I=-16:TP=-1.5:LRA=11", "-ar", "8000", "-ac", "1", "-f", "s16le", "pipe:1")
-	cmd.Stdout = writer
-	if err := cmd.Run(); err != nil {
-		if mediaCtx.Err() != nil {
-			return mediaCtx.Err()
-		}
-		// Reaching the playback cap is a normal stop, not a failure: the
-		// listener heard the capped audio and should get the normal tail
-		// drain instead of an error callers report as a failed prompt.
-		if !writer.overflowed {
-			return fmt.Errorf("prompt conversion: %w", err)
-		}
+	// The converted PCM streams through a pipe we own instead of the pipe
+	// exec wraps around an io.Writer. exec abandons whatever is still
+	// buffered in its pipe once the child exits and WaitDelay (500 ms)
+	// lapses, silently discarding the prompt's tail as "WaitDelay expired
+	// before I/O complete"; callers heard that as menus cut off
+	// mid-sentence. With a descriptor we own, exec hands it to the child
+	// directly and the drain below runs to the last byte.
+	cmd.Stdout = rawWrite
+	streamDone := make(chan error, 1)
+	go func() { streamDone <- copyConvertedPCM(mediaCtx, rawRead, writer) }()
+	runErr := cmd.Run()
+	// The child has exited: close our write end so the drain reaches EOF
+	// once every buffered byte has been paced out to the call.
+	_ = rawWrite.Close()
+	streamErr := <-streamDone
+	if mediaCtx.Err() != nil {
+		return mediaCtx.Err()
+	}
+	// Reaching the playback cap is a normal stop, not a failure: the
+	// listener heard the capped audio and should get the normal tail
+	// drain instead of an error callers report as a failed prompt.
+	if runErr != nil && !writer.overflowed {
+		return fmt.Errorf("prompt conversion: %w", runErr)
+	}
+	if streamErr != nil && !writer.overflowed {
+		return fmt.Errorf("prompt conversion: %w", streamErr)
 	}
 	if writer.n == 0 && !writer.overflowed {
 		return fmt.Errorf("decoded audio is empty")
@@ -549,4 +575,26 @@ func (p *PromptPlayer) playInput(ctx context.Context, fifo, input string, drainT
 		return drainPCM(mediaCtx, observer, drainTail)
 	}
 	return nil
+}
+
+// copyConvertedPCM drains the converter's raw output into the destination
+// writer until EOF, a write error, or cancellation. The reads and paced
+// writes happen in this goroutine after the child has exited, so no buffered
+// byte is ever abandoned.
+func copyConvertedPCM(ctx context.Context, src *os.File, dst io.Writer) error {
+	buf := make([]byte, 32*1024)
+	for {
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
+				return writeErr
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return nil
+			}
+			return readErr
+		}
+	}
 }

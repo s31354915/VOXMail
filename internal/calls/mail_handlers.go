@@ -462,7 +462,17 @@ func (s *Service) toggleRead(sess *session, message store.MailSummary) {
 func (s *Service) queueLocalReadState(sess *session, message store.MailSummary, read bool) (string, error) {
 	release := s.Store.LockMailReadState()
 	defer release()
-	localPath, err := setMaildirRead(message.Path, read)
+	path := message.Path
+	if _, statErr := os.Stat(path); statErr != nil {
+		// mbsync renames message files whenever a flag changes, and since
+		// round 6 up to four syncs run at once, so the path captured during
+		// listing can go stale before the mutation. Re-derive the file's
+		// current name before giving up.
+		if current, ok := rederiveMaildirPath(path); ok {
+			path = current
+		}
+	}
+	localPath, err := setMaildirRead(path, read)
 	if err != nil {
 		s.recordMutation(sess, message, "mark_read", message.Folder, message.Folder, "failed", err)
 		return "", err
@@ -478,7 +488,20 @@ func (s *Service) queueLocalReadState(sess *session, message store.MailSummary, 
 	defer cleanupCancel()
 	queued := message
 	queued.Path = localPath
-	if err := s.Store.RecordQueuedRead(cleanupCtx, sess.UserID, queued, read); err != nil {
+	queuedErr := s.Store.RecordQueuedRead(cleanupCtx, sess.UserID, queued, read)
+	if queuedErr != nil {
+		// A sync racing the rename can invalidate the insert's exact
+		// folder, path, UID match. Re-derive the file's current location
+		// and retry once before rolling back the rename.
+		if current, ok := rederiveMaildirPath(localPath); ok && current != localPath {
+			queued.Path = current
+			if retryErr := s.Store.RecordQueuedRead(cleanupCtx, sess.UserID, queued, read); retryErr == nil {
+				localPath = current
+				queuedErr = nil
+			}
+		}
+	}
+	if queuedErr != nil {
 		var rollbackErr error
 		if localPath != message.Path {
 			rollbackErr = os.Rename(localPath, message.Path)
@@ -486,7 +509,7 @@ func (s *Service) queueLocalReadState(sess *session, message store.MailSummary, 
 		if rollbackErr == nil {
 			rollbackErr = s.Store.MarkConfirmedReadAtPath(cleanupCtx, queued, message.Read, message.Path)
 		}
-		return "", errors.Join(err, rollbackErr)
+		return "", errors.Join(queuedErr, rollbackErr)
 	}
 	_ = s.Store.Audit(cleanupCtx, sess.UserID, "mail_mutation", "mark_read:queued")
 	s.mu.Lock()
@@ -498,6 +521,48 @@ func (s *Service) queueLocalReadState(sess *session, message store.MailSummary, 
 	}
 	s.mu.Unlock()
 	return localPath, nil
+}
+
+// rederiveMaildirPath locates the current on-disk name of a Maildir message
+// whose path went stale while the call was running. mbsync renames message
+// files whenever a flag changes, so a path captured during listing can point
+// at a file that no longer exists by mutation time. The search is bounded:
+// the original path, its two flag variants, and the message's own directory
+// scanned for files sharing the same base name.
+func rederiveMaildirPath(path string) (string, bool) {
+	if path == "" {
+		return "", false
+	}
+	if info, statErr := os.Stat(path); statErr == nil && info.Mode().IsRegular() {
+		return path, true
+	}
+	for _, variant := range []string{mailparse.MaildirReadPath(path, true), mailparse.MaildirReadPath(path, false)} {
+		if variant == path {
+			continue
+		}
+		if info, statErr := os.Stat(variant); statErr == nil && info.Mode().IsRegular() {
+			return variant, true
+		}
+	}
+	dir, base := filepath.Split(path)
+	prefix, _, _ := strings.Cut(base, ":2,")
+	if dir == "" || prefix == "" {
+		return "", false
+	}
+	entries, readErr := os.ReadDir(dir)
+	if readErr != nil {
+		return "", false
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if name == base || !entry.Type().IsRegular() {
+			continue
+		}
+		if entryPrefix, _, _ := strings.Cut(name, ":2,"); entryPrefix == prefix {
+			return filepath.Join(dir, name), true
+		}
+	}
+	return "", false
 }
 
 // cachedFolderRole resolves a folder role for one of the session's accounts
