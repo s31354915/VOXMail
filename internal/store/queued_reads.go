@@ -17,7 +17,7 @@ type QueuedReadMutation struct {
 }
 
 func (s *Store) QueuedReadMutations(ctx context.Context, accountID string, watermark int64) ([]QueuedReadMutation, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT q.id,m.id,m.account_id,m.folder,m.path,m.message_id,COALESCE(q.desired_read,m.is_read),COALESCE(NULLIF(q.source_uid,0),m.imap_uid,0),COALESCE(NULLIF(q.source_uid_validity,0),m.uid_validity,0),m.is_read
+	rows, err := s.DB.QueryContext(ctx, `SELECT q.id,m.id,m.account_id,m.folder,m.path,COALESCE(m.message_id,'') AS message_id,COALESCE(q.desired_read,m.is_read),COALESCE(NULLIF(q.source_uid,0),m.imap_uid,0),COALESCE(NULLIF(q.source_uid_validity,0),m.uid_validity,0),m.is_read
  FROM message_mutations q JOIN mail_messages m ON m.id=q.message_id
  WHERE m.account_id=? AND q.operation='mark_read' AND q.status='queued' AND q.from_folder=m.folder AND q.id<=?
  AND q.id=(SELECT MAX(p.id) FROM message_mutations p WHERE p.message_id=m.id AND p.operation='mark_read' AND p.status='queued' AND p.id<=?)
@@ -140,7 +140,7 @@ func (s *Store) RecordQueuedRead(ctx context.Context, userID string, item MailSu
 // has been handed to mbsync, but the provider's own flag view can still lag
 // behind that hand-off; a change this recent must not be erased by the replay.
 func (s *Store) RecentReadMutations(ctx context.Context, accountID string, since string) ([]QueuedReadMutation, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT q.id,m.id,m.account_id,m.folder,m.path,m.message_id,COALESCE(q.desired_read,m.is_read),COALESCE(NULLIF(q.source_uid,0),m.imap_uid,0),COALESCE(NULLIF(q.source_uid_validity,0),m.uid_validity,0),m.is_read
+	rows, err := s.DB.QueryContext(ctx, `SELECT q.id,m.id,m.account_id,m.folder,m.path,COALESCE(m.message_id,'') AS message_id,COALESCE(q.desired_read,m.is_read),COALESCE(NULLIF(q.source_uid,0),m.imap_uid,0),COALESCE(NULLIF(q.source_uid_validity,0),m.uid_validity,0),m.is_read
  FROM message_mutations q JOIN mail_messages m ON m.id=q.message_id
  WHERE m.account_id=? AND q.operation='mark_read' AND q.status IN ('queued','synchronized','success') AND q.created_at>=?
  ORDER BY q.id`, accountID, since)
