@@ -169,7 +169,7 @@ func parsePart(header textproto.MIMEHeader, body io.Reader, budget *parseBudget,
 				return "", nil, fmt.Errorf("multipart Content-Type has no boundary")
 			}
 			// A boundary-less multipart body still holds readable text.
-			text, textErr := readTextBody(header, reader, budget)
+			text, textErr := readTextBody(header, reader, budget, lenient)
 			if textErr != nil {
 				return "", nil, textErr
 			}
@@ -179,7 +179,13 @@ func parsePart(header textproto.MIMEHeader, body io.Reader, budget *parseBudget,
 		var plain, html, nested string
 		var attachments []Attachment
 		for {
-			part, nextErr := mr.NextPart()
+			// NextRawPart, not NextPart: NextPart auto-decodes
+			// quoted-printable/base64 bodies, and decodeBody below decodes
+			// the same part again. That double decode corrupted every
+			// encoded attachment inside a multipart body and surfaced as
+			// "unexpected EOF" from the strict base64 decoder. Decoding
+			// stays with decodeBody for every part depth.
+			part, nextErr := mr.NextRawPart()
 			if nextErr == io.EOF {
 				break
 			}
@@ -223,7 +229,7 @@ func parsePart(header textproto.MIMEHeader, body io.Reader, budget *parseBudget,
 		}
 		return plain, attachments, nil
 	case mediaType == "text/plain", mediaType == "text/html":
-		text, textErr := readTextBody(header, reader, budget)
+		text, textErr := readTextBody(header, reader, budget, lenient)
 		if textErr != nil {
 			return "", nil, textErr
 		}
@@ -307,7 +313,13 @@ func decodeBody(header textproto.MIMEHeader, body io.Reader, lenient bool) io.Re
 		}
 		return base64.NewDecoder(base64.StdEncoding, body)
 	case "quoted-printable":
-		return quotedprintable.NewReader(body)
+		qp := quotedprintable.NewReader(body)
+		if lenient {
+			// A malformed escape sequence or truncated trailing byte must
+			// not fail the whole part in lenient mode.
+			return newSalvageReader(qp)
+		}
+		return qp
 	default:
 		return body
 	}
@@ -316,8 +328,11 @@ func decodeBody(header textproto.MIMEHeader, body io.Reader, lenient bool) io.Re
 // readTextBody decodes and bounds one text part. It backs the direct
 // text/plain and text/html cases and the lenient fallback for a multipart
 // body whose boundary is missing.
-func readTextBody(header textproto.MIMEHeader, reader io.Reader, budget *parseBudget) (string, error) {
+func readTextBody(header textproto.MIMEHeader, reader io.Reader, budget *parseBudget, lenient bool) (string, error) {
 	reader = decodeTextBody(header, reader)
+	if lenient {
+		reader = newSalvageReader(reader)
+	}
 	if budget != nil && !budget.retainText {
 		decoded, readErr := io.Copy(io.Discard, io.LimitReader(reader, maxTextBytes+1))
 		if readErr != nil {

@@ -107,12 +107,12 @@ func (i Indexer) index(ctx context.Context, accountID, root string, purge bool) 
 		if logger == nil {
 			logger = slog.Default()
 		}
-		logger.Warn("mail index skipped malformed message", "account_id", accountID, "path", path, "error", parseErr)
 		_, existingErr := i.Store.FindMailIndex(ctx, accountID, path)
 		if existingErr == nil {
 			// Preserve the previous record for this still-present message. Otherwise
 			// the successful end-of-scan purge would mistake an unparseable file for
 			// a deleted message and remove its last usable metadata.
+			logger.Warn("mail index message failed strict parse; keeping existing record", "account_id", accountID, "path", path, "error", parseErr)
 			return i.Store.MarkMailIndexSeen(ctx, accountID, path, scanID)
 		}
 		if !errors.Is(existingErr, sql.ErrNoRows) {
@@ -126,8 +126,11 @@ func (i Indexer) index(ctx context.Context, accountID, root string, purge bool) 
 			logger.Info("mail index recovered damaged message via lenient parse", "account_id", accountID, "path", path)
 			return i.record(ctx, accountID, scanID, recovered)
 		}
+		// The message is only "skipped" once every recovery option is
+		// exhausted, so the warning names files the index truly lost.
+		logger.Warn("mail index skipped malformed message", "account_id", accountID, "path", path, "error", parseErr)
 		return nil
-		})
+	})
 	if err != nil {
 		return err
 	}

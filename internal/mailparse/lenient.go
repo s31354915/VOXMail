@@ -49,7 +49,20 @@ func parseLenient(r io.Reader, retainData bool) (Message, error) {
 	budget := &parseBudget{retainData: retainData, retainText: retainData}
 	message.OriginalText, message.Attachments, err = parsePart(parsed, bytes.NewReader(body), budget, 0, true)
 	if err != nil {
-		return message, err
+		// Lenient recovery is the last chance for a damaged message, so a
+		// body-level failure (an oversize part, an attachment budget stop,
+		// a decode error that survived the salvage readers) must not drop
+		// it. Keep the parsed headers and, when retaining text, a bounded
+		// slice of the raw body as the readable projection instead of
+		// returning the error.
+		if retainData {
+			salvaged := body
+			if len(salvaged) > maxTextBytes {
+				salvaged = salvaged[:maxTextBytes]
+			}
+			message.OriginalText = string(salvaged)
+		}
+		err = nil
 	}
 	if len(message.Attachments) > maxAttachments {
 		message.Attachments = message.Attachments[:maxAttachments]
@@ -241,4 +254,33 @@ func (l *lenientBase64Reader) decodeQuad() {
 	}
 	// A quad that still fails to decode is dropped rather than fatal.
 	l.carry = l.carry[4:]
+}
+
+// salvageReader turns a mid-stream decode error into a clean end of stream:
+// bytes decoded before the failure stay usable, and a truncated body or
+// malformed escape sequence no longer fails the whole part. This is the
+// lenient-mode counterpart of the strict parser's fail-fast behaviour; the
+// lenient path has no better option than the bytes decoded so far.
+type salvageReader struct {
+	source io.Reader
+	spent  bool
+}
+
+func newSalvageReader(source io.Reader) *salvageReader {
+	return &salvageReader{source: source}
+}
+
+func (s *salvageReader) Read(p []byte) (int, error) {
+	if s.spent {
+		return 0, io.EOF
+	}
+	n, err := s.source.Read(p)
+	if err != nil && err != io.EOF {
+		s.spent = true
+		if n > 0 {
+			return n, nil
+		}
+		return 0, io.EOF
+	}
+	return n, err
 }

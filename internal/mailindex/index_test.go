@@ -249,13 +249,105 @@ func TestIndexContinuesAfterMalformedMessageAndPreservesSeenRows(t *testing.T) {
 	if lastSubject != "after malformed" {
 		t.Fatalf("last message subject=%q", lastSubject)
 	}
-	if output := diagnostics.String(); !strings.Contains(output, "mail index skipped malformed message") || !strings.Contains(output, middle) || !strings.Contains(output, "a-marker") {
+	if output := diagnostics.String(); !strings.Contains(output, "mail index message failed strict parse; keeping existing record") || !strings.Contains(output, middle) || !strings.Contains(output, "a-marker") {
 		t.Fatalf("parse failure diagnostic lacks account/path context: %q", output)
+	}
+	if strings.Contains(diagnostics.String(), "mail index skipped malformed message") {
+		t.Fatalf("a preserved record must not be logged as skipped: %q", diagnostics.String())
 	}
 	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM mail_messages WHERE account_id='a-marker'`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	if count != 3 {
 		t.Fatalf("final indexed count=%d, want first, preserved malformed, and final valid messages", count)
+	}
+}
+
+// A never-indexed file the lenient parser recovers is indexed and logged as
+// recovered, never as skipped.
+func TestIndexRecoveredMessageIsNotLoggedAsSkipped(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.DB.Exec(`INSERT INTO users(id,username,password_hash,pin_hash,role,created_at) VALUES('u-recover','u-recover','p','p','user','now')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO accounts(id,user_id,canonical_name,email,sender_name,imap_host,imap_user,imap_password,smtp_host,smtp_user,smtp_password,folder_map,created_at) VALUES('a-recover','u-recover','a','a@e','a','h','u','p','h','u','p','{}','now')`); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(t.TempDir(), "mail", "Inbox", "new")
+	if err := os.MkdirAll(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	damaged := filepath.Join(root, "01-damaged")
+	// Corrupt base64 fails the strict decoder but yields its decoded prefix
+	// through the lenient reader.
+	if err := os.WriteFile(damaged, []byte("From: a@e\r\nSubject: salvaged\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: base64\r\n\r\nSGVsbG8g###@@@d29ybGQ="), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var diagnostics bytes.Buffer
+	indexer := Indexer{Store: db, Log: slog.New(slog.NewTextHandler(&diagnostics, nil))}
+	if err := indexer.Index(context.Background(), "a-recover", filepath.Dir(filepath.Dir(root))); err != nil {
+		t.Fatal(err)
+	}
+	var subject string
+	if err := db.DB.QueryRow(`SELECT subject FROM mail_messages WHERE path=?`, damaged).Scan(&subject); err != nil {
+		t.Fatalf("recovered message was not indexed: %v", err)
+	}
+	if subject != "salvaged" {
+		t.Fatalf("recovered subject=%q", subject)
+	}
+	output := diagnostics.String()
+	if !strings.Contains(output, "mail index recovered damaged message via lenient parse") {
+		t.Fatalf("recovery was not logged as recovered: %q", output)
+	}
+	if strings.Contains(output, "mail index skipped malformed message") {
+		t.Fatalf("a recovered message must not be logged as skipped: %q", output)
+	}
+}
+
+// A never-indexed file no recovery path can read is the only case that
+// logs the skipped-malformed warning.
+func TestIndexUnrecoverableMessageWarnsSkipped(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.DB.Exec(`INSERT INTO users(id,username,password_hash,pin_hash,role,created_at) VALUES('u-giveup','u-giveup','p','p','user','now')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO accounts(id,user_id,canonical_name,email,sender_name,imap_host,imap_user,imap_password,smtp_host,smtp_user,smtp_password,folder_map,created_at) VALUES('a-giveup','u-giveup','a','a@e','a','h','u','p','h','u','p','{}','now')`); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(t.TempDir(), "mail", "Inbox", "new")
+	if err := os.MkdirAll(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	huge := filepath.Join(root, "01-huge")
+	body := bytes.Repeat([]byte("x"), (25<<20)+64)
+	if err := os.WriteFile(huge, append([]byte("From: a@e\r\nSubject: big\r\n\r\n"), body...), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var diagnostics bytes.Buffer
+	indexer := Indexer{Store: db, Log: slog.New(slog.NewTextHandler(&diagnostics, nil))}
+	if err := indexer.Index(context.Background(), "a-giveup", filepath.Dir(filepath.Dir(root))); err != nil {
+		t.Fatal(err)
+	}
+	output := diagnostics.String()
+	if !strings.Contains(output, "mail index skipped malformed message") || !strings.Contains(output, huge) || !strings.Contains(output, "a-giveup") {
+		t.Fatalf("unrecoverable message was not logged as skipped with context: %q", output)
+	}
+	if strings.Contains(output, "mail index recovered damaged message via lenient parse") {
+		t.Fatalf("oversize message must not be logged as recovered: %q", output)
+	}
+	var count int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM mail_messages WHERE path=?`, huge).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatal("oversize message was indexed despite failed recovery")
 	}
 }
