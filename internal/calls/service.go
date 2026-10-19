@@ -561,16 +561,9 @@ func (s *Service) greet(sess *session) {
 			s.prompt(sess, menuPrompt("pin"))
 			return
 		}
-		// The greeting owns only the welcome and the pin state owns the PIN
-		// instruction. A successful greeting returns before any state prompt
-		// can fire, so the instruction is spoken here once: first-time callers
-		// hear "Welcome to VOXMail. Enter your PIN, then press pound." without
-		// the doubled wording the combined welcome used to produce.
-		s.prompt(sess, menuPrompt("pin"))
 		return
 	}
 	s.prompt(sess, speech.StaticWelcomeText)
-	s.prompt(sess, menuPrompt("pin"))
 }
 
 func (s *Service) prompt(sess *session, text string) error {
@@ -745,7 +738,36 @@ func (s *Service) promptForState(sess *session) string {
 			break
 		}
 	}
+	var contextual string
+	switch state {
+	case "accounts":
+		contextual = "Email. Press 0 for all unread mail. " + accountPrompt(sess.Accounts, sess.AccountPage)
+	case "contacts":
+		contextual = contactPrompt(sess.Contacts, sess.ContactPage)
+	case "folders":
+		contextual = folderPromptFor(account, sess.Folders, sess.FolderRolePaths, sess.FolderPrefix, sess.FolderPage, sess.FolderLabels)
+	case "list":
+		contextual = "There are no messages here. Press pound to go back."
+		if sess.Cursor >= 0 && sess.Cursor < len(sess.Messages) {
+			contextual = listPrompt(sess.Messages[sess.Cursor], sess.Cursor, len(sess.Messages))
+		}
+	case "recipient_menu":
+		contextual = recipientPrompt(sess.Draft)
+	case "field_confirm":
+		contextual = fieldConfirmPrompt(sess.ConfirmState, sess.ConfirmValue)
+	case "review":
+		if sess.PendingCancelConfirm {
+			contextual = "Press 3 again to cancel this email, or pound to keep editing."
+		}
+	case "attachment_edit":
+		if sess.PendingAttachmentRemove {
+			contextual = "Press 2 again to remove the last attachment, or pound to keep it."
+		}
+	}
 	s.mu.Unlock()
+	if contextual != "" {
+		return contextual
+	}
 	if state == "settings" {
 		return s.settingsPrompt(sess)
 	}
@@ -755,60 +777,40 @@ func (s *Service) promptForState(sess *session) string {
 	return menuPrompt(state)
 }
 
+// repeatCurrentPrompt repeats the actual page for dynamic menus, including
+// selected alert folders, rather than substituting generic instructions.
+func (s *Service) repeatCurrentPrompt(sess *session) {
+	s.mu.Lock()
+	state := string(stateLocked(sess))
+	s.mu.Unlock()
+	switch state {
+	case "draft_list":
+		s.promptDraftList(sess)
+	case "move_menu":
+		s.promptMoveMenu(sess)
+	case "attachment_menu":
+		s.attachmentMenu(sess)
+	case "account_alert_folders":
+		s.promptAccountAlertFolders(sess)
+	default:
+		s.prompt(sess, s.promptForState(sess))
+	}
+}
+
 func menuPrompt(state string) string {
 	if prompt, ok := ivr.Prompt(ivr.State(state)); ok {
 		return prompt
 	}
-	switch state {
-	case "main":
-		return "Press 1 for email, 2 for settings, or 3 for information and instructions."
-	case "accounts":
-		return "Press 0 for all unread mail, choose an account, press 9 for more if available, or press pound to go back."
-	case "account_menu":
-		return "Press 1 to listen to mail, 2 to send an email, 3 to refresh, or 4 for account settings when available."
-	case "folder_action":
-		return "Press 1 to listen to messages here, or 2 to open nested folders."
-	case "contacts":
-		return "Choose a contact, press 9 for more if available, or press pound to go back."
-	case "settings":
-		return "Press 1 for voice settings, 2 to toggle call alerts when available, 3 for contacts, or pound to go back."
-	case "list":
-		return "Press 1 to read, 2 for next, 3 for previous, 4 to delete, 5 to reply, 6 to forward, or pound to go back."
-	case "read":
-		return "Press 1 to listen, 2 to mark read or unread, 3 to reply, 4 to reply all, 5 to forward, 6 to delete, 7 to move, 8 for attachments, 9 for more options, 0 for next, or pound to return."
-	case "more_options":
-		return "More options. Press 1 to add the sender to contacts, 2 for the date, 3 for recipients, 4 for the subject, or pound to return."
-	case "contact_name":
-		return "Enter a contact name using the keypad, then press pound."
-	case "contact_confirm":
-		return "Press 1 to save this contact or 2 to cancel."
-	case "review":
-		return "Press 1 to send, 2 to save as draft, 3 to cancel, 4 to edit the message, 5 to add an audio attachment, or pound to go back."
-	case "compose":
-		return "Enter the recipient using multi tap, then press pound."
-	case "recipient_menu":
-		return "Press 1 to add To, 2 to add Cc, 3 to add Bcc, or 4 to continue."
-	case "recipient_input":
-		return "Enter the email address using multi tap, then press pound."
-	case "subject_method":
-		return "For the subject, press 1 to type with the keypad or 2 to speak."
-	case "subject":
-		return "Enter the subject using multi tap, then press pound."
-	case "body_method":
-		return "For the message body, press 1 to type with the keypad or 2 to speak."
-	case "body":
-		return "Enter the message using multi tap, then press pound."
-	case "attachment_menu":
-		return "Choose an attachment, press 0 for more if available, or pound to return."
-	case "attachment_playback":
-		return "Playing the attachment. Press any key to stop."
-	case "move_menu":
-		return "Choose a destination folder, press 0 for more if available, or pound to return."
-	case "forward_options":
-		return "Forward the original message with its attachments? Press 1 for yes or 2 for no."
-	}
 	return "Press pound to go back or star to repeat."
 }
+
 func listPrompt(m store.MailSummary, cursor, total int) string {
-	return fmt.Sprintf("Message %d of %d. From %s. Subject %s. %s", cursor+1, total, speech.SanitizeNonLatin(m.Sender), speech.SanitizeNonLatin(m.Subject), menuPrompt("list"))
+	return fmt.Sprintf("Message %d of %d. From %s. Subject %s. %s", cursor+1, total, spokenHeader(m.Sender, "unknown sender", 240), spokenHeader(m.Subject, "no subject", 300), menuPrompt("list"))
+}
+
+func spokenHeader(value, empty string, limit int) string {
+	if strings.TrimSpace(value) == "" {
+		return empty
+	}
+	return speakable(value, limit)
 }

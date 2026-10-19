@@ -23,7 +23,7 @@ func (s *Service) openAccounts(sess *session) {
 		return
 	}
 	if len(accounts) == 0 {
-		s.prompt(sess, "No mail accounts are configured.")
+		s.prompt(sess, "No mail accounts are configured. Add an account in the web console, or ask your administrator. "+menuPrompt("main"))
 		return
 	}
 	s.mu.Lock()
@@ -46,7 +46,7 @@ func (s *Service) openMessages(sess *session, unreadOnly bool, description strin
 	transitionLocked(sess, "list")
 	s.mu.Unlock()
 	if len(mails) == 0 {
-		s.prompt(sess, "There are no "+description+".")
+		s.prompt(sess, "No messages in "+description+". Press pound to go back.")
 	} else {
 		s.prompt(sess, listPrompt(mails[0], 0, len(mails)))
 	}
@@ -126,7 +126,7 @@ func (s *Service) handleDraftMenu(sess *session, key string) {
 	switch key {
 	case "1":
 		s.startCompose(sess, "")
-		s.prompt(sess, "Enter the recipient using multi tap, then press pound.")
+		s.prompt(sess, menuPrompt("compose"))
 	case "2":
 		s.openDrafts(sess)
 	}
@@ -190,7 +190,7 @@ func (s *Service) handleRecipientEdit(sess *session, key string) {
 	d := sess.Draft
 	s.mu.Unlock()
 	if state == "compose" {
-		s.prompt(sess, "Enter the replacement primary recipient using multi tap, then press pound.")
+		s.prompt(sess, "Replace the main recipient. "+menuPrompt("compose"))
 	} else if state == "recipient_menu" {
 		s.prompt(sess, recipientPrompt(d))
 	} else {
@@ -854,7 +854,7 @@ func (s *Service) listenFolder(sess *session, accountID, folder string) {
 	transitionLocked(sess, "list")
 	s.mu.Unlock()
 	if len(mails) == 0 {
-		s.prompt(sess, "There are no messages in that folder.")
+		s.prompt(sess, "There are no messages in that folder. Press pound to choose another folder.")
 	} else {
 		s.prompt(sess, listPrompt(mails[0], 0, len(mails)))
 	}
@@ -900,7 +900,7 @@ func (s *Service) openContacts(sess *session) {
 		return
 	}
 	if len(contacts) == 0 {
-		s.prompt(sess, "You have no contacts.")
+		s.prompt(sess, "You have no contacts yet. To save a sender, open their message, press 9, then 1. You can also add contacts in the web console. Press pound to go back.")
 		return
 	}
 	s.mu.Lock()
@@ -951,7 +951,7 @@ func (s *Service) handleRecipientMenu(sess *session, key string) {
 		sess.RecipientKind = map[string]string{"1": "to", "2": "cc", "3": "bcc"}[key]
 		sess.Editor = newIVREditor("recipient_input")
 		s.mu.Unlock()
-		s.prompt(sess, "Enter the email address using multi tap, then press pound.")
+		s.prompt(sess, menuPrompt("recipient_input"))
 	case "4":
 		s.mu.Lock()
 		transitionLocked(sess, "subject_method")
@@ -973,7 +973,7 @@ func (s *Service) handleFieldMethod(sess *session, key, field string) {
 			sess.Editor.Text = sess.Draft.Body
 		}
 		s.mu.Unlock()
-		s.prompt(sess, "Type with multi tap, then press pound.")
+		s.prompt(sess, menuPrompt(field))
 		return
 	}
 	if key == "2" {
@@ -988,7 +988,7 @@ func (s *Service) handleFieldMethod(sess *session, key, field string) {
 func (s *Service) handleSettingsMenu(sess *session, key string) {
 	switch key {
 	case "1":
-		s.prompt(sess, "Voice model and speech speed are managed in the web console. Press 2 for call alerts, or 3 for contacts.")
+		s.prompt(sess, "Change your voice and speech speed in the web console. "+s.settingsPrompt(sess))
 	case "2":
 		if !s.alertsAvailable(sess) {
 			s.prompt(sess, "Call alerts are disabled by the administrator.")
@@ -1165,11 +1165,7 @@ func recipientPrompt(d draft) string {
 	if strings.TrimSpace(d.To) != "" {
 		toCount = 1 + len(d.AdditionalTo)
 	}
-	toLabel := "add To"
-	if toCount > 0 {
-		toLabel = "add another To"
-	}
-	return fmt.Sprintf("You have %d To recipient(s), %d Cc, and %d Bcc. Press 1 to %s, 2 to add Cc, 3 to add Bcc, or 4 to continue.", toCount, len(d.Cc), len(d.Bcc), toLabel)
+	return fmt.Sprintf("Recipients: %d main, %d copy, and %d hidden copy. %s", toCount, len(d.Cc), len(d.Bcc), menuPrompt("recipient_menu"))
 }
 
 func copyFolderLabels(labels map[string]string) map[string]string {

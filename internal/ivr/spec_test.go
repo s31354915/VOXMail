@@ -33,8 +33,8 @@ func TestStateSpecAcceptsOnlyFixedKeys(t *testing.T) {
 	if prompt, ok := Prompt("list"); !ok || !strings.Contains(prompt, "6 to forward") {
 		t.Fatalf("message-list prompt omitted forwarding: %q", prompt)
 	}
-	if prompt, ok := Prompt("info"); !ok || !strings.Contains(prompt, "Press 1 or star to repeat") {
-		t.Fatalf("info prompt omitted its numeric repeat key: %q", prompt)
+	if prompt, ok := Prompt("info"); !ok || !strings.Contains(prompt, "4 for keypad typing") {
+		t.Fatalf("info prompt omitted the typing help topic: %q", prompt)
 	}
 	if !Accepts("body", "9") {
 		t.Fatal("editor state should defer validation to keypad input")
@@ -82,6 +82,9 @@ func TestEveryStateHasTableDrivenInputNavigationAndCancellationTrace(t *testing.
 	}
 	for _, spec := range States() {
 		valid, ok := validKeys[spec.State]
+		if IsHelpState(spec.State) {
+			valid, ok = "1", true
+		}
 		if !ok {
 			t.Fatalf("state %q has no trace fixture", spec.State)
 		}

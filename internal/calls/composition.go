@@ -34,18 +34,18 @@ func (s *Service) startComposeTo(sess *session, recipient string) {
 
 func (s *Service) startVoiceRecording(sess *session) {
 	if s.Recorder == nil || sess == nil || sess.RxPath == "" {
-		s.prompt(sess, "Voice composition is not available on this call.")
+		s.prompt(sess, "Voice composition is not available on this call. Press 1 to type your message, or pound to go back.")
 		return
 	}
 	parent := s.eventContext(sess)
 	s.mu.Lock()
 	transitionLocked(sess, "recording")
 	stop := make(chan struct{})
-	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
+	ctx, cancel := context.WithCancel(parent)
 	sess.RecordStop = stop
 	sess.RecordCancel = cancel
 	s.mu.Unlock()
-	s.prompt(sess, "Speak your message now. The recording stops after about 30 seconds. Press 0 when finished, or pound to cancel.")
+	s.prompt(sess, fmt.Sprintf("You have up to %d seconds. Press 0 to finish, or pound to cancel. Start speaking your message after these instructions.", int(s.Recorder.speechWindow()/time.Second)))
 	info, err := os.Stat(sess.RxPath)
 	if err != nil {
 		cancel()
@@ -60,7 +60,9 @@ func (s *Service) startVoiceRecording(sess *session) {
 	offset := info.Size()
 	s.startTask(func() {
 		defer cancel()
-		text, err := s.Recorder.RecordAndTranscribeUntil(ctx, sess.RxPath, offset, stop)
+		recordCtx, finish := context.WithTimeout(ctx, s.Recorder.speechWindow()+process.ConversionTimeout+process.WhisperTimeout)
+		defer finish()
+		text, err := s.Recorder.RecordAndTranscribeUntil(recordCtx, sess.RxPath, offset, stop)
 		s.mu.Lock()
 		sess.RecordStop = nil
 		sess.RecordCancel = nil
@@ -87,20 +89,20 @@ func (s *Service) startVoiceRecording(sess *session) {
 			if errors.Is(err, context.Canceled) {
 				return
 			}
-			s.prompt(sess, "The recording could not be transcribed. Choose keypad or speech entry again.")
+			s.prompt(sess, "The recording could not be transcribed. Press 1 to type, 2 to record again, or pound to go back.")
 			return
 		}
 		if empty {
-			s.prompt(sess, "I did not hear anything in that recording. Choose keypad or speech entry again.")
+			s.prompt(sess, "I did not hear anything in that recording. Press 1 to type, 2 to record again, or pound to go back.")
 			return
 		}
-		s.prompt(sess, menuPrompt("review"))
+		s.prompt(sess, "Your message was transcribed. Press 6 at review to hear it before sending. "+menuPrompt("review"))
 	})
 }
 
 func (s *Service) startSubjectVoice(sess *session) {
 	if s.Recorder == nil || sess == nil || sess.RxPath == "" {
-		s.prompt(sess, "Voice entry is not available on this call.")
+		s.prompt(sess, "Voice entry is not available on this call. Press 1 to type the subject, or pound to go back.")
 		return
 	}
 	info, err := os.Stat(sess.RxPath)
@@ -114,21 +116,33 @@ func (s *Service) startSubjectVoice(sess *session) {
 	parent := s.eventContext(sess)
 	s.mu.Lock()
 	transitionLocked(sess, "recording_subject")
-	offset := info.Size()
 	stop := make(chan struct{})
-	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
+	ctx, cancel := context.WithCancel(parent)
 	sess.RecordStop = stop
 	sess.RecordCancel = cancel
 	s.mu.Unlock()
-	s.prompt(sess, "Speak the subject now. The recording stops after about 30 seconds. Press 0 when finished, or pound to cancel.")
+	s.prompt(sess, fmt.Sprintf("You have up to %d seconds. Press 0 to finish, or pound to cancel. Start speaking the subject after these instructions.", int(s.Recorder.speechWindow()/time.Second)))
+	info, err = os.Stat(sess.RxPath)
+	if err != nil {
+		cancel()
+		s.mu.Lock()
+		sess.RecordStop, sess.RecordCancel = nil, nil
+		transitionLocked(sess, "subject_method")
+		s.mu.Unlock()
+		s.prompt(sess, "The recording could not start. "+menuPrompt("subject_method"))
+		return
+	}
+	offset := info.Size()
 	s.startTask(func() {
 		defer cancel()
-		text, recordErr := s.Recorder.RecordAndTranscribeUntil(ctx, sess.RxPath, offset, stop)
+		recordCtx, finish := context.WithTimeout(ctx, s.Recorder.speechWindow()+process.ConversionTimeout+process.WhisperTimeout)
+		defer finish()
+		text, recordErr := s.Recorder.RecordAndTranscribeUntil(recordCtx, sess.RxPath, offset, stop)
 		s.mu.Lock()
 		sess.RecordStop = nil
 		sess.RecordCancel = nil
 		if string(stateLocked(sess)) == "recording_subject" && !sess.Closed {
-			if recordErr == nil {
+			if recordErr == nil && strings.TrimSpace(text) != "" {
 				sess.Draft.Subject = strings.TrimSpace(text)
 				if sess.EditingDraft {
 					transitionLocked(sess, "review")
@@ -140,7 +154,7 @@ func (s *Service) startSubjectVoice(sess *session) {
 				transitionLocked(sess, "subject_method")
 			}
 		}
-		empty := recordErr == nil && strings.TrimSpace(sess.Draft.Subject) == "" && string(stateLocked(sess)) != "recording_subject"
+		empty := recordErr == nil && strings.TrimSpace(text) == ""
 		closed := sess.Closed
 		s.mu.Unlock()
 		if closed {
@@ -150,17 +164,17 @@ func (s *Service) startSubjectVoice(sess *session) {
 			if errors.Is(recordErr, context.Canceled) {
 				return
 			}
-			s.prompt(sess, "The subject recording could not be transcribed. Choose keypad or speech entry again.")
+			s.prompt(sess, "The subject recording could not be transcribed. Press 1 to type, 2 to record again, or pound to go back.")
 			return
 		}
 		if empty {
-			s.prompt(sess, "I did not hear anything in that recording. Choose keypad or speech entry again.")
+			s.prompt(sess, "I did not hear anything in that recording. Press 1 to type, 2 to record again, or pound to go back.")
 			return
 		}
 		s.mu.Lock()
 		next := string(stateLocked(sess))
 		s.mu.Unlock()
-		s.prompt(sess, menuPrompt(next))
+		s.prompt(sess, "Subject: "+speakable(text, maxIVRSubjectRunes)+". "+menuPrompt(next))
 	})
 }
 
@@ -174,17 +188,29 @@ func (s *Service) startAudioAttachment(sess *session) {
 		s.prompt(sess, "Audio recording is not ready yet.")
 		return
 	}
-	ctx, cancel := context.WithTimeout(s.eventContext(sess), s.Recorder.audioWindow()+process.ConversionTimeout)
+	ctx, cancel := context.WithCancel(s.eventContext(sess))
 	stop := make(chan struct{})
 	s.mu.Lock()
 	transitionLocked(sess, "audio_recording")
 	sess.RecordCancel = cancel
 	sess.RecordStop = stop
-	offset := info.Size()
 	s.mu.Unlock()
-	s.prompt(sess, fmt.Sprintf("Speak now. Press 0 when finished. The recording is limited to %d seconds.", int(s.Recorder.audioWindow()/time.Second)))
+	s.prompt(sess, fmt.Sprintf("You have up to %d seconds for this audio attachment. Press 0 to finish or pound to cancel. Start speaking after these instructions.", int(s.Recorder.audioWindow()/time.Second)))
+	info, err = os.Stat(sess.RxPath)
+	if err != nil {
+		cancel()
+		s.mu.Lock()
+		sess.RecordStop, sess.RecordCancel = nil, nil
+		transitionLocked(sess, "review")
+		s.mu.Unlock()
+		s.prompt(sess, "The recording could not start. "+menuPrompt("review"))
+		return
+	}
+	offset := info.Size()
 	s.startTask(func() {
-		data, recordErr := s.Recorder.RecordAudioUntil(ctx, sess.RxPath, offset, stop)
+		recordCtx, finish := context.WithTimeout(ctx, s.Recorder.audioWindow()+process.ConversionTimeout)
+		defer finish()
+		data, recordErr := s.Recorder.RecordAudioUntil(recordCtx, sess.RxPath, offset, stop)
 		cancel()
 		s.mu.Lock()
 		sess.RecordCancel = nil
@@ -332,7 +358,9 @@ func (s *Service) handleCompose(sess *session, key string) {
 	switch string(stateLocked(sess)) {
 	case "compose":
 		if _, err := mail.ParseAddress(value); err != nil {
-			s.startTask(func() { s.prompt(sess, "That email address is not valid. Enter it again, then press pound.") })
+			s.startTask(func() {
+				s.prompt(sess, "That address could not be accepted. Your entry is still here. Press star to delete the last character. For at, press 1 twice, then star; for dot, press 1 three times, then star. Press pound to check it again.")
+			})
 			return
 		}
 		sess.ConfirmValue = value
@@ -343,7 +371,9 @@ func (s *Service) handleCompose(sess *session, key string) {
 		s.startTask(func() { s.prompt(sess, fieldConfirmPrompt("compose", value)) })
 	case "recipient_input":
 		if _, err := mail.ParseAddress(value); err != nil {
-			s.startTask(func() { s.prompt(sess, "That email address is not valid. Enter it again, then press pound.") })
+			s.startTask(func() {
+				s.prompt(sess, "That address could not be accepted. Your entry is still here. Press star to delete the last character. For at, press 1 twice, then star; for dot, press 1 three times, then star. Press pound to check it again.")
+			})
 			return
 		}
 		sess.ConfirmValue = value
@@ -396,17 +426,18 @@ func newIVREditor(state string) *keypad.MultiTap {
 }
 
 func fieldConfirmPrompt(state, value string) string {
-	if state == "compose" || state == "recipient_input" {
-		var chars strings.Builder
-		for _, r := range value {
-			if chars.Len() > 0 {
-				chars.WriteString(" ")
-			}
-			chars.WriteRune(r)
-		}
-		return fmt.Sprintf("I heard %s. Press 1 to accept or 2 to re-enter.", chars.String())
+	label := map[string]string{"compose": "Email address", "recipient_input": "Email address", "subject": "Subject", "body": "Message", "contact_name": "Contact name"}[state]
+	if label == "" {
+		label = "Entry"
 	}
-	return fmt.Sprintf("I heard %s. Press 1 to accept or 2 to re-enter.", value)
+	spoken := speakable(value, 1200)
+	if state == "compose" || state == "recipient_input" {
+		spoken = speech.SpellCharacters(value)
+	}
+	if strings.TrimSpace(value) == "" {
+		spoken = "blank"
+	}
+	return fmt.Sprintf("%s: %s. Press 1 to accept, 2 to edit, or 3 to start this entry over.", label, spoken)
 }
 
 func (s *Service) handleFieldConfirmation(sess *session, key string) {
@@ -416,18 +447,22 @@ func (s *Service) handleFieldConfirmation(sess *session, key string) {
 		s.mu.Unlock()
 		return
 	}
-	if key == "2" {
+	if key == "2" || key == "3" {
 		transitionLocked(sess, state)
 		sess.Editor = newIVREditor(state)
 		// Re-entering used to start from a blank editor, throwing away the
 		// text the caller had already typed. Seed the editor with the value
 		// they just confirmed against so star-key edits work naturally.
-		if sess.Editor != nil {
+		if sess.Editor != nil && key == "2" {
 			sess.Editor.Text = value
 		}
 		sess.ConfirmValue, sess.ConfirmState, sess.ConfirmRecipientKind = "", "", ""
 		s.mu.Unlock()
-		s.prompt(sess, "Editing your previous entry. "+menuPrompt(state))
+		notice := "Editing your previous entry. Press star to delete the last character. "
+		if key == "3" {
+			notice = "Entry cleared. "
+		}
+		s.prompt(sess, notice+menuPrompt(state))
 		return
 	}
 	if key != "1" {
@@ -503,7 +538,7 @@ func (s *Service) handleMoreOptions(sess *session, key string) {
 		transitionLocked(sess, "contact_name")
 		sess.Editor = newIVREditor("contact_name")
 		s.mu.Unlock()
-		s.prompt(sess, "Enter a name for this sender using the keypad, then press pound.")
+		s.prompt(sess, menuPrompt("contact_name"))
 	case "2":
 		s.prompt(sess, "The message date is "+speakable(message.Date, 80)+". Press pound to return.")
 	case "3":

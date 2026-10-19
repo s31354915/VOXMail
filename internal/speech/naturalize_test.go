@@ -66,10 +66,10 @@ func TestEmailToSpeechBlockTagsBreakSentences(t *testing.T) {
 
 func TestEmailToSpeechDatesAreSpokenNaturally(t *testing.T) {
 	for _, tc := range []struct{ input, want string }{
-		{"Meeting moved to 2026-10-17.", "Meeting moved to October seventeen, two thousand twenty-six."},
-		{"Due 10/17/2026 at noon.", "Due October seventeen, two thousand twenty-six at noon."},
-		{"Order 48291047 shipped.", "Order 4 8 2 9 1 0 4 7 shipped."},
-		{"Version 2.3.4 shipped.", "Version 2.3.4 shipped."},
+		{"Meeting moved to 2026-10-17.", "Meeting moved to October seventeenth, two thousand twenty-six."},
+		{"Due 10/17/2026 at noon.", "Due October seventeenth, two thousand twenty-six at noon."},
+		{"Order 48291047 shipped.", "Order four eight two nine one zero four seven shipped."},
+		{"Version 2.3.4 shipped.", "Version two dot three dot four shipped."},
 	} {
 		if got := EmailToSpeech(tc.input); got != tc.want {
 			t.Errorf("EmailToSpeech(%q) = %q, want %q", tc.input, got, tc.want)
@@ -96,14 +96,14 @@ func TestEmailToSpeechKeepsParagraphBreaks(t *testing.T) {
 
 func TestEmailToSpeechSpeaksNumbersAsWords(t *testing.T) {
 	for _, tc := range []struct{ input, want string }{
-		{"Email 1 of 6125", "Email 1 of six thousand one hundred twenty-five"},
+		{"Email 1 of 6125", "Email one of six thousand one hundred twenty-five"},
 		{"You have 1,000 messages", "You have one thousand messages"},
 		{"version 3.5 released", "version three point five released"},
 		{"meeting at 3:30 pm", "meeting at three thirty p m"},
 		{"10:05 deadline", "ten oh five deadline"},
-		{"dated 2026-10-18", "dated October eighteen, two thousand twenty-six"},
-		{"Order 48291047 shipped.", "Order 4 8 2 9 1 0 4 7 shipped."},
-		{"Version 2.3.4 shipped.", "Version 2.3.4 shipped."},
+		{"dated 2026-10-18", "dated October eighteenth, two thousand twenty-six"},
+		{"Order 48291047 shipped.", "Order four eight two nine one zero four seven shipped."},
+		{"Version 2.3.4 shipped.", "Version two dot three dot four shipped."},
 	} {
 		if got := EmailToSpeech(tc.input); got != tc.want {
 			t.Errorf("EmailToSpeech(%q)=%q, want %q", tc.input, got, tc.want)

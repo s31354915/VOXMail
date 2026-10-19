@@ -75,7 +75,7 @@ func (s *Service) readMessage(sess *session, m store.MailSummary) {
 	parsed, err := mailparse.Parse(file)
 	_ = file.Close()
 	if err != nil {
-		s.prompt(sess, "I could not read that message.")
+		s.prompt(sess, "I could not read that message. Press 0 for the next message, or pound to go back.")
 		return
 	}
 	// The listed path can go stale between the unread list snapshot and this
@@ -104,7 +104,7 @@ func (s *Service) readMessage(sess *session, m store.MailSummary) {
 	if !m.Read {
 		opening = "New unread email from"
 	}
-	header := fmt.Sprintf("%s %s. Subject %s.", opening, speech.SanitizeNonLatin(parsed.From), speech.SanitizeNonLatin(parsed.Subject))
+	header := fmt.Sprintf("%s %s. Subject %s.", opening, spokenHeader(parsed.From, "unknown sender", 240), spokenHeader(parsed.Subject, "no subject", 300))
 	body := strings.TrimSpace(parsed.Text)
 	if body == "" {
 		body = "There is no readable email body."
@@ -122,13 +122,10 @@ func (s *Service) readMessage(sess *session, m store.MailSummary) {
 		playable := 0
 		descriptions := make([]string, 0, 3)
 		for _, attachment := range parsed.Attachments {
-			kind := attachment.ContentType
-			if kind == "" {
-				kind = "unknown file type"
-			}
-			status := "not playable"
+			kind := attachmentDescription(attachment.ContentType)
+			status := "open in your email app"
 			if attachment.Playable {
-				status = "playable"
+				status = "can play here"
 				playable++
 			}
 			// Only the first few attachment names are spoken; a long list is
@@ -156,7 +153,7 @@ func (s *Service) readMessage(sess *session, m store.MailSummary) {
 	}
 	spoken, truncated := truncateForSpeech(body, maxSpokenBodyRunes)
 	if truncated {
-		spoken += " Message truncated."
+		spoken += " This is a long message. Open it in your email app to read the rest."
 	}
 	chunks := splitSpeechChunks(spoken, speechChunkRunes)
 	first := header
@@ -1145,4 +1142,23 @@ func (s *Service) advanceToPlayable(sess *session) store.MailSummary {
 	m := sess.Messages[sess.Cursor]
 	s.mu.Unlock()
 	return m
+}
+
+func attachmentDescription(contentType string) string {
+	switch {
+	case contentType == "application/pdf":
+		return "PDF document"
+	case strings.HasPrefix(contentType, "audio/"):
+		return "audio file"
+	case strings.HasPrefix(contentType, "video/"):
+		return "video"
+	case strings.HasPrefix(contentType, "image/"):
+		return "picture"
+	case strings.HasPrefix(contentType, "text/"):
+		return "text document"
+	case contentType == "message/rfc822":
+		return "attached email"
+	default:
+		return "file"
+	}
 }

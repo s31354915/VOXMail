@@ -98,7 +98,7 @@ func (s *Service) handleDTMF(conn net.Conn, message bridge.Message) error {
 func (s *Service) signedInPrompt(sess *session) string {
 	accounts, err := s.Store.ListAccounts(s.baseContext(), sess.UserID)
 	if err != nil {
-		return "You are signed in. Press 1 for email, 2 for settings, or 3 for information and instructions."
+		return "You are signed in. " + menuPrompt("main")
 	}
 	total := 0
 	unchecked := 0
@@ -115,7 +115,7 @@ func (s *Service) signedInPrompt(sess *session) string {
 		}
 	}
 	if len(parts) == 0 && unchecked == 0 {
-		return "You have no unread email. Press 1 for email, 2 for settings, or 3 for information and instructions."
+		return "You have no unread email. " + menuPrompt("main")
 	}
 	summary := fmt.Sprintf("You have %d unread emails", total)
 	if total == 1 {
@@ -130,7 +130,10 @@ func (s *Service) signedInPrompt(sess *session) string {
 			summary = "Some accounts could not be checked for unread email"
 		}
 	}
-	return fmt.Sprintf("%s, %s. Press 1 for email, 2 for settings, or 3 for information and instructions.", summary, strings.Join(parts, ", "))
+	if len(parts) > 0 {
+		summary += ", " + strings.Join(parts, ", ")
+	}
+	return summary + ". " + menuPrompt("main")
 }
 
 func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Message) error {
@@ -181,11 +184,23 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 			sess.RecordCancel = nil
 		}
 		s.mu.Unlock()
-		s.prompt(sess, s.promptForState(sess))
+		s.repeatCurrentPrompt(sess)
 		return nil
 	}
 	if key == "#" {
 		s.mu.Lock()
+		if stateLocked(sess) == "review" && sess.PendingCancelConfirm {
+			sess.PendingCancelConfirm = false
+			s.mu.Unlock()
+			s.prompt(sess, "Your message is kept. "+menuPrompt("review"))
+			return nil
+		}
+		if ivr.IsHelpState(stateLocked(sess)) {
+			backByContractLocked(sess, "info")
+			s.mu.Unlock()
+			s.repeatCurrentPrompt(sess)
+			return nil
+		}
 		switch string(stateLocked(sess)) {
 		case "accounts", "contacts", "settings", "info":
 			backUsingFlowLocked(sess, "main")
@@ -264,6 +279,7 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 		case "field_confirm":
 			transitionLocked(sess, sess.ConfirmState)
 			sess.Editor = newIVREditor(sess.ConfirmState)
+			sess.Editor.Text = sess.ConfirmValue
 			sess.ConfirmValue = ""
 			sess.ConfirmState = ""
 			sess.ConfirmRecipientKind = ""
@@ -296,7 +312,7 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 			backUsingFlowLocked(sess, fallback)
 		}
 		s.mu.Unlock()
-		s.prompt(sess, s.promptForState(sess))
+		s.repeatCurrentPrompt(sess)
 		return nil
 	}
 	s.mu.Lock()
@@ -305,6 +321,13 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 	s.mu.Unlock()
 	if !ivr.Accepts(typedState, key) {
 		s.prompt(sess, "That key is not available here. "+s.promptForState(sess))
+		return nil
+	}
+	if next, ok := ivr.HelpDestination(typedState, key); ok {
+		s.mu.Lock()
+		transitionLocked(sess, string(next))
+		s.mu.Unlock()
+		s.prompt(sess, menuPrompt(string(next)))
 		return nil
 	}
 	switch state {
@@ -361,10 +384,6 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 		s.handleFieldMethod(sess, key, "body")
 	case "settings":
 		s.handleSettingsMenu(sess, key)
-	case "info":
-		if key == "1" {
-			s.prompt(sess, menuPrompt("info"))
-		}
 	case "list":
 		s.mu.Lock()
 		if len(sess.Messages) == 0 {
@@ -568,6 +587,11 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 			}
 		}
 	case "review":
+		if key != "3" {
+			s.mu.Lock()
+			sess.PendingCancelConfirm = false
+			s.mu.Unlock()
+		}
 		if key == "1" {
 			s.sendDraft(sess)
 		} else if key == "2" {
@@ -581,6 +605,8 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 			s.prompt(sess, menuPrompt("draft_edit"))
 		} else if key == "5" {
 			s.startAudioAttachment(sess)
+		} else if key == "6" {
+			s.prompt(sess, s.draftReviewPrompt(sess))
 		}
 	case "forward_options":
 		if key == "1" || key == "2" {
@@ -591,7 +617,7 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 				sess.Draft.ForwardOriginal = false
 				s.mu.Unlock()
 			}
-			s.prompt(sess, "Forwarding. Enter the recipient using multi tap, then press pound.")
+			s.prompt(sess, "Forwarding. "+menuPrompt("compose"))
 		}
 	case "audio_recording":
 		if key == "0" {

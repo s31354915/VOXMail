@@ -40,6 +40,16 @@ func (r *VoiceRecorder) audioWindow() time.Duration {
 	return r.Window
 }
 
+func (r *VoiceRecorder) speechWindow() time.Duration {
+	if r == nil || r.Window <= 0 {
+		return defaultSpeechWindow
+	}
+	if r.Window > maxSpeechWindow {
+		return maxSpeechWindow
+	}
+	return r.Window
+}
+
 func (r *VoiceRecorder) RecordAndTranscribe(ctx context.Context, rawPath string, offset int64) (string, error) {
 	return r.recordAndTranscribe(ctx, rawPath, offset, nil)
 }
@@ -56,13 +66,7 @@ func (r *VoiceRecorder) recordAndTranscribe(ctx context.Context, rawPath string,
 	if r == nil || rawPath == "" {
 		return "", fmt.Errorf("voice recorder is not configured")
 	}
-	window := r.Window
-	if window <= 0 {
-		window = defaultSpeechWindow
-	}
-	if window > maxSpeechWindow {
-		window = maxSpeechWindow
-	}
+	window := r.speechWindow()
 	timer := time.NewTimer(window)
 	defer timer.Stop()
 	select {

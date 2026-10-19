@@ -44,6 +44,8 @@ type PromptPlayer struct {
 	dynamicMu    sync.Mutex
 	dynamicClean time.Time
 	initMu       sync.Mutex
+	normMu       sync.Mutex
+	normCache    map[loudnessCacheKey]string
 }
 
 // maxStaticVoiceEntries bounds the per-voice static prompt index. Each entry
@@ -497,15 +499,47 @@ func (p *PromptPlayer) playWAVTail(ctx context.Context, fifo, wav string, drainT
 	return p.playInput(ctx, fifo, wav, drainTail)
 }
 
-// shortPromptNormSeconds is the length below which loudnorm's dynamic mode
-// cannot measure reliably: EBU R128 gating builds its estimate from 400 ms
-// blocks with 75% overlap, so a prompt shorter than about three seconds has
-// too few gated blocks and the filter under-measures it, leaving menus and
-// notices quieter than the rest of the call. Short prompts take the measured
-// path instead: measure first, then apply one constant gain.
-const shortPromptNormSeconds = 3.0
-
 const loudnormMeasureTimeout = 30 * time.Second
+
+// Measure what the caller will hear, after mono mixing and telephone-rate
+// resampling. All clips share this target, regardless of duration or source.
+const telephoneAudioFilter = "aformat=channel_layouts=mono,aresample=8000"
+const telephoneLoudnessTarget = -16.0
+const telephonePeakLimiter = "alimiter=limit=0.841395:level=0:latency=1"
+
+type loudnessCacheKey struct {
+	path, binary   string
+	size, modified int64
+}
+
+func (p *PromptPlayer) playbackFilter(ctx context.Context, binary, input string) string {
+	info, err := os.Stat(input)
+	key := loudnessCacheKey{path: input, binary: binary}
+	cacheable := err == nil && info.Mode().IsRegular()
+	if cacheable {
+		key.size, key.modified = info.Size(), info.ModTime().UnixNano()
+		p.normMu.Lock()
+		cached := p.normCache[key]
+		p.normMu.Unlock()
+		if cached != "" {
+			return cached
+		}
+	}
+	gain, ok := measureLoudness(ctx, binary, input)
+	if !ok {
+		return telephoneAudioFilter + ",loudnorm=I=-16:TP=-1.5:LRA=11,aresample=8000," + telephonePeakLimiter
+	}
+	filter := telephoneAudioFilter + "," + gain + "," + telephonePeakLimiter
+	if cacheable {
+		p.normMu.Lock()
+		if p.normCache == nil || len(p.normCache) >= maxDynamicPromptFiles {
+			p.normCache = make(map[loudnessCacheKey]string)
+		}
+		p.normCache[key] = filter
+		p.normMu.Unlock()
+	}
+	return filter
+}
 
 // wavDurationSeconds reads the RIFF header of a wav file and returns the
 // playback duration in seconds, or 0 when the file cannot be parsed. A zero
@@ -579,12 +613,14 @@ type loudnormMeasure struct {
 // loudnorm's linear mode: ffmpeg rejects linear mode whenever the measured
 // loudness range is under 1 LU, and a short single-phrase prompt measures
 // almost flat, which would silently drop the fix back onto the dynamic path.
-// The same targets still govern it: raise the clip to -16 LUFS without
-// pushing its true peak above -1.5 dBTP.
+// Use measured gain for long prompts as well: switching policies at three
+// seconds made the welcome, menu and streamed body chunks sound different.
+// The final limiter catches isolated peaks without keeping the whole clip
+// quiet. In particular, quiet recordings with peaks below -9 dB are valid.
 func measureLoudness(ctx context.Context, binary, input string) (string, bool) {
 	measureCtx, cancel := context.WithTimeout(ctx, loudnormMeasureTimeout)
 	defer cancel()
-	cmd := process.New(measureCtx, "ffmpeg", binary, 0, "-nostdin", "-i", input, "-vn", "-af", "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json", "-f", "null", "-")
+	cmd := process.New(measureCtx, "ffmpeg", binary, 0, "-nostdin", "-i", input, "-t", "600", "-vn", "-af", telephoneAudioFilter+",loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json", "-f", "null", "-")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", false
@@ -593,18 +629,21 @@ func measureLoudness(ctx context.Context, binary, input string) (string, bool) {
 	if measure == nil {
 		return "", false
 	}
-	inputI, ok := parseLoudnormFloat(measure.InputI, -70, -5)
+	// Silence has no finite integrated loudness. Passing it through dynamic
+	// loudnorm can produce non-finite samples on some ffmpeg versions, which
+	// become full-scale DC during PCM conversion. Keep silence silent.
+	if measure.InputI == "-inf" && measure.InputTP == "-inf" {
+		return "anull", true
+	}
+	inputI, ok := parseLoudnormFloat(measure.InputI, -70, 0)
 	if !ok {
 		return "", false
 	}
-	inputTP, ok := parseLoudnormFloat(measure.InputTP, -9, 0)
+	_, ok = parseLoudnormFloat(measure.InputTP, -90, 6)
 	if !ok {
 		return "", false
 	}
-	gain := -16 - inputI
-	if peak := -1.5 - inputTP; gain > peak {
-		gain = peak
-	}
+	gain := telephoneLoudnessTarget - inputI
 	// A degenerate or silent measurement must not swing the prompt wildly;
 	// beyond this band the one-pass dynamic filter is the safer default.
 	if gain < -24 || gain > 36 {
@@ -678,17 +717,7 @@ func (p *PromptPlayer) playInput(ctx context.Context, fifo, input string, drainT
 		output = &pacedPCMWriter{ctx: mediaCtx, w: pipe}
 	}
 	writer := &pcmLimitWriter{w: output, max: 8_000 * 2 * 600}
-	// Loudness normalization keeps quiet emails audible and loud ones from
-	// clipping after the phone-band downscale, which callers heard as
-	// "not clear" speech. Prompts shorter than the measurement window take
-	// measured variant: dynamic mode under-measures them and callers
-	// heard those menus quieter than the rest of the call.
-	filter := "loudnorm=I=-16:TP=-1.5:LRA=11"
-	if duration := wavDurationSeconds(input); duration > 0 && duration < shortPromptNormSeconds {
-		if twoPass, ok := measureLoudness(mediaCtx, binary, input); ok {
-			filter = twoPass
-		}
-	}
+	filter := p.playbackFilter(mediaCtx, binary, input)
 	cmd := process.New(mediaCtx, "ffmpeg", binary, 0, "-nostdin", "-i", input, "-vn", "-af", filter, "-ar", "8000", "-ac", "1", "-f", "s16le", "pipe:1")
 	// The converted PCM streams through a pipe we own instead of the pipe
 	// exec wraps around an io.Writer. exec abandons whatever is still

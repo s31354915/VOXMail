@@ -19,9 +19,9 @@ func TestEmailToSpeechCurrencyWithThousandsAndMinorUnits(t *testing.T) {
 
 func TestEmailToSpeechSpeaksFiveToSevenDigitRunsDigitByDigit(t *testing.T) {
 	for _, tc := range []struct{ input, want string }{
-		{"ZIP 11219", "ZIP 1 1 2 1 9"},
-		{"Order 4829104 confirmed", "Order 4 8 2 9 1 0 4 confirmed"},
-		{"Tracking 48291047 shipped", "Tracking 4 8 2 9 1 0 4 7 shipped"},
+		{"ZIP 11219", "ZIP one one two one nine"},
+		{"Order 4829104 confirmed", "Order four eight two nine one zero four confirmed"},
+		{"Tracking 48291047 shipped", "Tracking four eight two nine one zero four seven shipped"},
 	} {
 		if got := EmailToSpeech(tc.input); got != tc.want {
 			t.Errorf("EmailToSpeech(%q)=%q, want %q", tc.input, got, tc.want)

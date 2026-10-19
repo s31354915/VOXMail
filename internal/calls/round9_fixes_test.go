@@ -25,14 +25,14 @@ func TestRound9GreetSpeaksPinLineWithoutGreetingAsset(t *testing.T) {
 	say := promptRecorder(svc)
 	svc.greet(&session{CallID: "call"})
 	got := say()
-	if len(got) != 2 {
-		t.Fatalf("prompts=%v, want the welcome and then the PIN instruction", got)
+	if len(got) != 1 {
+		t.Fatalf("prompts=%v, want one combined welcome and PIN instruction", got)
 	}
 	if got[0] != speech.StaticWelcomeText {
 		t.Fatalf("first prompt=%q, want %q", got[0], speech.StaticWelcomeText)
 	}
-	if got[1] != "Enter your PIN, then press pound." {
-		t.Fatalf("second prompt=%q, want the PIN instruction", got[1])
+	if !strings.Contains(got[0], "PIN") {
+		t.Fatal("combined greeting omitted PIN instruction")
 	}
 }
 

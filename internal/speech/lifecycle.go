@@ -20,11 +20,10 @@ import (
 
 const (
 	BundledPromptVoice = "en_US-hfc_male-medium"
-	// The greeting owns only the welcome; the pin state speaks the PIN
-	// instruction. Saying the instruction in both places is how callers hear
-	// two recordings back to back with the same words.
-	StaticWelcomeText           = "Welcome to VOXMail."
-	StaticMainText              = "You are signed in. Press 1 for email, 2 for settings, or 3 for information and instructions."
+	// One recording owns the welcome and PIN instruction. Keeping them in
+	// one synthesis avoids a second conversion, drain gap, and volume change.
+	StaticWelcomeText           = "Welcome to VOXMail. Please enter your PIN, then press pound."
+	StaticMainText              = "You are signed in. " + ivr.MainMenuPrompt
 	staticPromptManifestVersion = 7
 )
 
