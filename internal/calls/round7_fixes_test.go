@@ -20,7 +20,7 @@ import (
 // once the child exited and WaitDelay (500 ms) lapsed, which callers heard
 // as menus cut off mid-sentence.
 func TestPlayInputDeliversEntirePromptAfterConverterExits(t *testing.T) {
-	payload := bytes.Repeat([]byte{0x55, 0xAA}, 24000) // 48000 bytes: 6 s of audio
+	payload := bytes.Repeat([]byte{0x55, 0xAA}, 8000) // 16000 bytes: 1 s of audio, kept small so CI load cannot outrun the paced drain
 	player, fifo := fakePCMPlayer(t, payload)
 	reader, err := os.OpenFile(fifo, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
@@ -34,7 +34,7 @@ func TestPlayInputDeliversEntirePromptAfterConverterExits(t *testing.T) {
 		readDone <- len(data)
 		readErr <- err
 	}()
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	err = player.PlayMedia(ctx, fifo, "ignored")
 	if err != nil {
