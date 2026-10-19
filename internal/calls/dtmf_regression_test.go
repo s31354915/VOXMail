@@ -58,7 +58,7 @@ func TestAllUnreadReadMenuAcceptsAdvertisedKeys(t *testing.T) {
 		{"3", "subject_method", "Replying"}, {"4", "subject_method", "Reply all"},
 		{"5", "forward_options", "Forward the original"}, {"6", "confirm_delete", "Delete this message"},
 		{"7", "move_menu", "Move message"}, {"8", "read", "no playable attachments"},
-		{"9", "more_options", "More options"}, {"0", "read", "Subject subject"},
+		{"9", "more_options", "More options"}, {"0", "list", "Message 1 of 1"},
 		{"#", "list", "Press 1 to read"}, {"*", "read", "mark read or unread"},
 	} {
 		t.Run(tc.key, func(t *testing.T) {

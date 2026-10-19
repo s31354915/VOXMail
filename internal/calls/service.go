@@ -551,19 +551,26 @@ func (s *Service) greet(sess *session) {
 		err := s.playPrompt(sess, func(ctx context.Context) error {
 			return s.Media.PlayGreetingWithRuntime(ctx, sess.Runtime, sess.TxPath)
 		})
-		if err == nil || errors.Is(err, context.Canceled) {
+		if err != nil && !errors.Is(err, context.Canceled) {
+			if s.Log != nil {
+				s.Log.Warn("static greeting unavailable; falling back to the pin prompt", "error", err)
+			}
+			// The greeting may have failed after part of it already played, and
+			// the greet guard allows only one welcome per call. Never re-speak
+			// the full welcome: the PIN instruction is the useful part.
+			s.prompt(sess, menuPrompt("pin"))
 			return
 		}
-		if s.Log != nil {
-			s.Log.Warn("static greeting unavailable; falling back to the pin prompt", "error", err)
-		}
-		// The greeting may have failed after part of it already played, and
-		// the greet guard allows only one welcome per call. Never re-speak
-		// the full welcome: the PIN instruction is the useful part.
+		// The greeting owns only the welcome and the pin state owns the PIN
+		// instruction. A successful greeting returns before any state prompt
+		// can fire, so the instruction is spoken here once: first-time callers
+		// hear "Welcome to VOXMail. Enter your PIN, then press pound." without
+		// the doubled wording the combined welcome used to produce.
 		s.prompt(sess, menuPrompt("pin"))
 		return
 	}
 	s.prompt(sess, speech.StaticWelcomeText)
+	s.prompt(sess, menuPrompt("pin"))
 }
 
 func (s *Service) prompt(sess *session, text string) error {

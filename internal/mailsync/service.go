@@ -80,6 +80,7 @@ type SyncStore interface {
 	UpdateMailIdentityByUID(context.Context, string, string, uint32, uint32, []string, bool) error
 	QueuedMutationWatermark(context.Context, string) (int64, error)
 	QueuedReadMutations(context.Context, string, int64) ([]store.QueuedReadMutation, error)
+	RecentReadMutations(context.Context, string, string) ([]store.QueuedReadMutation, error)
 	LatestReadForIdentity(context.Context, string, []string, uint32, uint32) (store.QueuedReadMutation, error)
 	FinishQueuedRead(context.Context, store.QueuedReadMutation, error) error
 	LockMailReadState() func()
@@ -94,6 +95,11 @@ type SyncStore interface {
 }
 
 const syncRetryBackoff = 5 * time.Minute
+
+// readReconcileGrace bounds how long reconciliation keeps protecting a local
+// read change after it was handed to mbsync, even though the provider's own
+// flags may not reflect it yet.
+const readReconcileGrace = 30 * time.Minute
 
 func (s *Service) Run(ctx context.Context) error {
 	if s.Store == nil || s.Root == "" {
@@ -688,6 +694,14 @@ func (s *Service) reconcileRemoteIdentity(ctx context.Context, account store.Acc
 	// the server still reports it unread; mbsync pushes the flag on its next
 	// run and a later reconciliation aligns the remainder.
 	pendingReads := make(map[string]struct{})
+	addPendingRead := func(item store.QueuedReadMutation) {
+		if item.UID != 0 && item.UIDValidity != 0 {
+			pendingReads[fmt.Sprintf("uid:%d:%d", item.UID, item.UIDValidity)] = struct{}{}
+		}
+		if strings.TrimSpace(item.MessageID) != "" {
+			pendingReads["mid:"+item.MessageID] = struct{}{}
+		}
+	}
 	if mutationWatermark > 0 {
 		pending, err := s.Store.QueuedReadMutations(ctx, account.ID, mutationWatermark)
 		if err != nil {
@@ -696,13 +710,24 @@ func (s *Service) reconcileRemoteIdentity(ctx context.Context, account store.Acc
 			}
 		} else {
 			for _, item := range pending {
-				if item.UID != 0 && item.UIDValidity != 0 {
-					pendingReads[fmt.Sprintf("uid:%d:%d", item.UID, item.UIDValidity)] = struct{}{}
-				}
-				if strings.TrimSpace(item.MessageID) != "" {
-					pendingReads["mid:"+item.MessageID] = struct{}{}
-				}
+				addPendingRead(item)
 			}
+		}
+	}
+	// A read change the journal has already handed to mbsync is no longer
+	// queued, yet the provider's flag view can still lag that hand-off when
+	// reconciliation replays remote flags. Protect the local read state for a
+	// grace window after the change was recorded so the replay cannot erase
+	// the user's read before the provider catches up.
+	cutoff := s.currentTime().Add(-readReconcileGrace).UTC().Truncate(time.Second).Format(time.RFC3339)
+	recent, err := s.Store.RecentReadMutations(ctx, account.ID, cutoff)
+	if err != nil {
+		if s.Log != nil {
+			s.Log.Warn("mail reconciliation could not load recent read changes", "account_id", account.ID, "error", err)
+		}
+	} else {
+		for _, item := range recent {
+			addPendingRead(item)
 		}
 	}
 	roles, err := s.Store.ListFolderRoles(ctx, account.UserID, account.ID)
@@ -953,7 +978,14 @@ func (s *Service) reconcileIndexedMessages(ctx context.Context, account store.Ac
 		item := indexedMessage{id: row.ID, path: row.Path, folder: row.Folder, messageID: row.MessageID, uid: row.UID, uidValidity: row.UIDValidity}
 		identity, fromState, unknown, stateErr := mbsyncIdentityForPath(root, item.folder, item.path, stateCache)
 		if stateErr != nil {
-			return stateErr
+			// One unreadable or deleted message must not abort the whole
+			// reconcile: the remaining messages would stay unsynchronized
+			// for as long as that one file keeps failing. Log it and carry
+			// on; the next sync retries the same row.
+			if s.Log != nil {
+				s.Log.Warn("mail reconciliation could not read a message identity", "account_id", account.ID, "path", item.path, "error", stateErr)
+			}
+			continue
 		}
 		if unknown {
 			continue
@@ -980,12 +1012,18 @@ func (s *Service) reconcileIndexedMessages(ctx context.Context, account store.Ac
 	}
 	for _, item := range hydrated {
 		if err := s.Store.UpdateIndexedMailUID(ctx, account.ID, item.id, item.uid, item.uidValidity); err != nil {
-			return err
+			if s.Log != nil {
+				s.Log.Warn("mail reconciliation could not update a message identity", "account_id", account.ID, "path", item.path, "error", err)
+			}
+			continue
 		}
 	}
 	for _, item := range stale {
 		if err := s.cleanupStaleIndexedMessage(ctx, account, root, item); err != nil {
-			return err
+			if s.Log != nil {
+				s.Log.Warn("mail reconciliation could not clean up a stale message", "account_id", account.ID, "path", item.path, "error", err)
+			}
+			continue
 		}
 	}
 	return nil

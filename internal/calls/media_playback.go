@@ -1,16 +1,21 @@
 package calls
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/voxmail/voxmail/internal/maintenance"
 	"github.com/voxmail/voxmail/internal/process"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -492,6 +497,152 @@ func (p *PromptPlayer) playWAVTail(ctx context.Context, fifo, wav string, drainT
 	return p.playInput(ctx, fifo, wav, drainTail)
 }
 
+// shortPromptNormSeconds is the length below which loudnorm's dynamic mode
+// cannot measure reliably: EBU R128 gating builds its estimate from 400 ms
+// blocks with 75% overlap, so a prompt shorter than about three seconds has
+// too few gated blocks and the filter under-measures it, leaving menus and
+// notices quieter than the rest of the call. Short prompts take the measured
+// path instead: measure first, then apply one constant gain.
+const shortPromptNormSeconds = 3.0
+
+const loudnormMeasureTimeout = 30 * time.Second
+
+// wavDurationSeconds reads the RIFF header of a wav file and returns the
+// playback duration in seconds, or 0 when the file cannot be parsed. A zero
+// result must fall back to the streaming one-pass filter rather than guess.
+func wavDurationSeconds(path string) float64 {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer file.Close()
+	header := make([]byte, 12)
+	if _, err := io.ReadFull(file, header); err != nil {
+		return 0
+	}
+	if string(header[0:4]) != "RIFF" || string(header[8:12]) != "WAVE" {
+		return 0
+	}
+	var byteRate uint32
+	for {
+		chunkHeader := make([]byte, 8)
+		if _, err := io.ReadFull(file, chunkHeader); err != nil {
+			return 0
+		}
+		id := string(chunkHeader[0:4])
+		size := binary.LittleEndian.Uint32(chunkHeader[4:8])
+		switch id {
+		case "fmt ":
+			if size < 16 {
+				return 0
+			}
+			fmtChunk := make([]byte, 16)
+			if _, err := io.ReadFull(file, fmtChunk); err != nil {
+				return 0
+			}
+			byteRate = binary.LittleEndian.Uint32(fmtChunk[8:12])
+			if remaining := int64(size) - 16; remaining > 0 {
+				if _, err := file.Seek(remaining+int64(size&1), io.SeekCurrent); err != nil {
+					return 0
+				}
+			}
+		case "data":
+			if byteRate == 0 || size == 0 {
+				return 0
+			}
+			return float64(size) / float64(byteRate)
+		default:
+			// Chunks are word-aligned; an odd size is padded to even.
+			if _, err := file.Seek(int64(size)+int64(size&1), io.SeekCurrent); err != nil {
+				return 0
+			}
+		}
+	}
+}
+
+// loudnormMeasure mirrors the JSON block the loudnorm analysis pass prints to
+// stderr. Values arrive as strings.
+type loudnormMeasure struct {
+	InputI       string `json:"input_i"`
+	InputTP      string `json:"input_tp"`
+	InputLRA     string `json:"input_lra"`
+	InputThresh  string `json:"input_thresh"`
+	TargetOffset string `json:"target_offset"`
+}
+
+// measureLoudness runs the loudnorm analysis pass and returns the filter
+// fragment that applies the result as one constant gain. It reports ok=false
+// for anything it cannot measure or validate, so the caller falls back to the
+// one-pass dynamic filter rather than playing mis-gained audio.
+//
+// The gain is computed from the measurement instead of delegated to
+// loudnorm's linear mode: ffmpeg rejects linear mode whenever the measured
+// loudness range is under 1 LU, and a short single-phrase prompt measures
+// almost flat, which would silently drop the fix back onto the dynamic path.
+// The same targets still govern it: raise the clip to -16 LUFS without
+// pushing its true peak above -1.5 dBTP.
+func measureLoudness(ctx context.Context, binary, input string) (string, bool) {
+	measureCtx, cancel := context.WithTimeout(ctx, loudnormMeasureTimeout)
+	defer cancel()
+	cmd := process.New(measureCtx, "ffmpeg", binary, 0, "-nostdin", "-i", input, "-vn", "-af", "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json", "-f", "null", "-")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", false
+	}
+	measure := parseLoudnormMeasure(output)
+	if measure == nil {
+		return "", false
+	}
+	inputI, ok := parseLoudnormFloat(measure.InputI, -70, -5)
+	if !ok {
+		return "", false
+	}
+	inputTP, ok := parseLoudnormFloat(measure.InputTP, -9, 0)
+	if !ok {
+		return "", false
+	}
+	gain := -16 - inputI
+	if peak := -1.5 - inputTP; gain > peak {
+		gain = peak
+	}
+	// A degenerate or silent measurement must not swing the prompt wildly;
+	// beyond this band the one-pass dynamic filter is the safer default.
+	if gain < -24 || gain > 36 {
+		return "", false
+	}
+	return fmt.Sprintf("volume=%gdB", gain), true
+}
+
+// parseLoudnormMeasure extracts the loudnorm JSON block from ffmpeg's stderr.
+// The filter's print is the last complete JSON object in the output; other
+// tools may emit unrelated braces, so keep scanning until one unmarshals.
+func parseLoudnormMeasure(output []byte) *loudnormMeasure {
+	rest := output
+	for {
+		start := bytes.LastIndex(rest, []byte("{"))
+		if start < 0 {
+			return nil
+		}
+		end := bytes.Index(rest[start:], []byte("}"))
+		if end < 0 {
+			return nil
+		}
+		var measure loudnormMeasure
+		if err := json.Unmarshal(rest[start:start+end+1], &measure); err == nil && measure.InputI != "" {
+			return &measure
+		}
+		rest = rest[:start]
+	}
+}
+
+func parseLoudnormFloat(raw string, min, max float64) (float64, bool) {
+	value, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+	if err != nil || math.IsNaN(value) || value < min || value > max {
+		return 0, false
+	}
+	return value, true
+}
+
 func (p *PromptPlayer) playInput(ctx context.Context, fifo, input string, drainTail time.Duration) error {
 	if p == nil {
 		return fmt.Errorf("prompt player is not configured")
@@ -529,8 +680,16 @@ func (p *PromptPlayer) playInput(ctx context.Context, fifo, input string, drainT
 	writer := &pcmLimitWriter{w: output, max: 8_000 * 2 * 600}
 	// Loudness normalization keeps quiet emails audible and loud ones from
 	// clipping after the phone-band downscale, which callers heard as
-	// "not clear" speech.
-	cmd := process.New(mediaCtx, "ffmpeg", binary, 0, "-nostdin", "-i", input, "-vn", "-af", "loudnorm=I=-16:TP=-1.5:LRA=11", "-ar", "8000", "-ac", "1", "-f", "s16le", "pipe:1")
+	// "not clear" speech. Prompts shorter than the measurement window take
+	// measured variant: dynamic mode under-measures them and callers
+	// heard those menus quieter than the rest of the call.
+	filter := "loudnorm=I=-16:TP=-1.5:LRA=11"
+	if duration := wavDurationSeconds(input); duration > 0 && duration < shortPromptNormSeconds {
+		if twoPass, ok := measureLoudness(mediaCtx, binary, input); ok {
+			filter = twoPass
+		}
+	}
+	cmd := process.New(mediaCtx, "ffmpeg", binary, 0, "-nostdin", "-i", input, "-vn", "-af", filter, "-ar", "8000", "-ac", "1", "-f", "s16le", "pipe:1")
 	// The converted PCM streams through a pipe we own instead of the pipe
 	// exec wraps around an io.Writer. exec abandons whatever is still
 	// buffered in its pipe once the child exits and WaitDelay (500 ms)

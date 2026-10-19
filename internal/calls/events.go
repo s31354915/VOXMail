@@ -158,9 +158,14 @@ func (d *callEventDispatcher) dispatch(message bridge.Message) error {
 			}
 			return nil
 		}
-		err := errors.New("call event queue is full")
-		d.fail(err)
-		return err
+		// A full queue belongs to this one call, not to the shared bridge
+		// connection. Hang up only this call and drop the event instead of
+		// closing the connection under every other call.
+		if d.service.Log != nil {
+			d.service.Log.Warn("call event queue is full; hanging up the call", "call_id", message.CallID, "event_type", message.Type)
+		}
+		d.service.hangup(message.CallID)
+		return nil
 	}
 }
 
@@ -202,7 +207,20 @@ func (d *callEventDispatcher) runWorker(callID string, worker *callEventWorker) 
 				continue
 			}
 			if err := d.handle(worker.ctx, job.message); err != nil {
-				d.fail(err)
+				if errors.Is(err, context.Canceled) {
+					return
+				}
+				// One call's handler failure must not tear down the shared
+				// bridge connection: every other active call rides on it.
+				// Log the failure, hang up only this call, and retire only
+				// this worker. If the hangup itself cannot be written, the
+				// connection is broken for everyone and fail() reports it.
+				if d.service.Log != nil {
+					d.service.Log.Error("call event handler failed; hanging up the call", "call_id", callID, "event_type", job.message.Type, "error", err)
+				}
+				if hangupErr := d.service.hangup(callID); hangupErr != nil && !errors.Is(hangupErr, context.Canceled) {
+					d.fail(hangupErr)
+				}
 				return
 			}
 		}

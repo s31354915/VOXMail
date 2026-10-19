@@ -109,7 +109,10 @@ func (s *Service) readMessage(sess *session, m store.MailSummary) {
 	if body == "" {
 		body = "There is no readable email body."
 	} else if cleaned := speech.SanitizeNonLatin(body); cleaned != body {
-		body = cleaned + " Some of this message is written in a language I cannot read aloud."
+		// Interim handling for scripts the voice engine cannot speak: warn
+		// the caller up front and frame what follows, instead of burying a
+		// wordy notice after the sanitized run.
+		body = "Parts of this message are written in a language I cannot read aloud. Here is what I can read. " + cleaned
 	}
 	s.mu.Lock()
 	sess.CurrentAttachments = append([]mailparse.Attachment(nil), parsed.Attachments...)
