@@ -316,6 +316,12 @@ FROM remote_folders WHERE local_path<>''`); err != nil {
 	}); err != nil {
 		return err
 	}
+	// Collapse duplicate index rows left behind by the path-collision bug
+	// (a flag rename indexed as a new row while the original row kept its
+	// stale path) so the stuck read toggles work again.
+	if err := s.mergeMaildirPathDuplicates(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 

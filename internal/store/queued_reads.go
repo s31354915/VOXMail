@@ -109,14 +109,24 @@ func (s *Store) ReadIdentityCopies(ctx context.Context, accountID string, folder
 
 // MarkConfirmedReadAtPath refuses a concurrent move, reindex or identity change.
 func (s *Store) MarkConfirmedReadAtPath(ctx context.Context, item MailSummary, read bool, path string) error {
-	result, err := s.DB.ExecContext(ctx, `UPDATE mail_messages SET is_read=?,path=? WHERE id=? AND account_id=? AND folder=? AND path=? AND COALESCE(imap_uid,0)=? AND COALESCE(uid_validity,0)=?`, read, path, item.ID, item.AccountID, item.Folder, item.Path, item.UID, item.UIDValidity)
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	// The indexer may have already indexed the renamed file under the target
+	// path; merge that row instead of crashing on UNIQUE(path).
+	if err := s.mergeMailPathCollision(ctx, tx, item.AccountID, item.ID, path); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE mail_messages SET is_read=?,path=? WHERE id=? AND account_id=? AND folder=? AND path=? AND COALESCE(imap_uid,0)=? AND COALESCE(uid_validity,0)=?`, read, path, item.ID, item.AccountID, item.Folder, item.Path, item.UID, item.UIDValidity)
 	if err != nil {
 		return err
 	}
 	if n, _ := result.RowsAffected(); n != 1 {
 		return sql.ErrNoRows
 	}
-	return nil
+	return tx.Commit()
 }
 
 // RecordQueuedRead preserves the user's requested flag and observed identity,
