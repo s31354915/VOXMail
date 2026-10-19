@@ -101,38 +101,33 @@ func (i Indexer) index(ctx context.Context, accountID, root string, purge bool) 
 			return ctx.Err()
 		default:
 		}
-		info, err := os.Stat(message.Path)
-		if err != nil {
-			return nil
-		}
-		messageID, err := i.Store.UpsertMailIndex(ctx, store.MailIndexInput{AccountID: accountID, Folder: message.Folder, Path: message.Path, MessageID: message.MessageID, Sender: message.From, Recipients: message.To, Cc: message.Cc, Subject: message.Subject, Date: message.Date, DateUTC: store.NormalizeMessageDate(message.Date), Read: message.Read, Attachments: len(message.Attachments), UpdatedAt: modTime(info), ScanID: scanID, SourceSize: info.Size(), PathIsLive: func(candidate string) bool { _, statErr := os.Stat(candidate); return statErr == nil }})
-		if err != nil {
-			return err
-		}
-		metadata := make([]store.AttachmentMetadata, 0, len(message.Attachments))
-		for index, attachment := range message.Attachments {
-			metadata = append(metadata, store.AttachmentMetadata{PartPath: fmt.Sprintf("part-%d", index+1), Filename: attachment.Name, ContentType: attachment.ContentType, Size: attachment.Size, ContentID: attachment.ContentID, Disposition: attachment.Disposition, Playable: attachment.Playable})
-		}
-		if err := i.Store.ReplaceAttachmentMetadata(ctx, messageID, metadata); err != nil {
-			return err
-		}
-		return nil
+		return i.record(ctx, accountID, scanID, message)
 	}, func(path string, parseErr error) error {
 		logger := i.Log
 		if logger == nil {
 			logger = slog.Default()
 		}
 		logger.Warn("mail index skipped malformed message", "account_id", accountID, "path", path, "error", parseErr)
-		if _, err := i.Store.FindMailIndex(ctx, accountID, path); errors.Is(err, sql.ErrNoRows) {
-			return nil
-		} else if err != nil {
-			return err
+		_, existingErr := i.Store.FindMailIndex(ctx, accountID, path)
+		if existingErr == nil {
+			// Preserve the previous record for this still-present message. Otherwise
+			// the successful end-of-scan purge would mistake an unparseable file for
+			// a deleted message and remove its last usable metadata.
+			return i.Store.MarkMailIndexSeen(ctx, accountID, path, scanID)
 		}
-		// Preserve the previous record for this still-present message. Otherwise
-		// the successful end-of-scan purge would mistake an unparseable file for
-		// a deleted message and remove its last usable metadata.
-		return i.Store.MarkMailIndexSeen(ctx, accountID, path, scanID)
-	})
+		if !errors.Is(existingErr, sql.ErrNoRows) {
+			return existingErr
+		}
+		// A never-indexed file gets one lenient recovery attempt before the
+		// scan gives up on it: a truncated body, corrupt base64, or bare-LF
+		// file the strict parser rejects may still hold a readable
+		// projection. Files that already carry valid metadata keep it.
+		if recovered, ok := i.lenientMessage(accountID, root, path); ok {
+			logger.Info("mail index recovered damaged message via lenient parse", "account_id", accountID, "path", path)
+			return i.record(ctx, accountID, scanID, recovered)
+		}
+		return nil
+		})
 	if err != nil {
 		return err
 	}
@@ -151,6 +146,52 @@ func (i Indexer) purgeStale(ctx context.Context, accountID, root, scanID string)
 	pattern = strings.ReplaceAll(pattern, `%`, `\%`)
 	pattern = strings.ReplaceAll(pattern, `_`, `\_`) + "%"
 	return i.Store.PurgeUnseenMailIndex(ctx, accountID, scanID, pattern)
+}
+
+// record upserts one parsed message and its attachment metadata. It backs
+// both the normal visit path and the lenient recovery path.
+func (i Indexer) record(ctx context.Context, accountID, scanID string, message mailparse.MaildirMessage) error {
+	info, err := os.Stat(message.Path)
+	if err != nil {
+		return nil
+	}
+	messageID, err := i.Store.UpsertMailIndex(ctx, store.MailIndexInput{AccountID: accountID, Folder: message.Folder, Path: message.Path, MessageID: message.MessageID, Sender: message.From, Recipients: message.To, Cc: message.Cc, Subject: message.Subject, Date: message.Date, DateUTC: store.NormalizeMessageDate(message.Date), Read: message.Read, Attachments: len(message.Attachments), UpdatedAt: info.ModTime().UTC().Format(time.RFC3339Nano), ScanID: scanID, SourceSize: info.Size(), PathIsLive: func(candidate string) bool { _, statErr := os.Stat(candidate); return statErr == nil }})
+	if err != nil {
+		return err
+	}
+	metadata := make([]store.AttachmentMetadata, 0, len(message.Attachments))
+	for index, attachment := range message.Attachments {
+		metadata = append(metadata, store.AttachmentMetadata{PartPath: fmt.Sprintf("part-%d", index+1), Filename: attachment.Name, ContentType: attachment.ContentType, Size: attachment.Size, ContentID: attachment.ContentID, Disposition: attachment.Disposition, Playable: attachment.Playable})
+	}
+	return i.Store.ReplaceAttachmentMetadata(ctx, messageID, metadata)
+}
+
+// lenientMessage re-opens a failed file and parses it with the lenient
+// recovery path, deriving the same folder and read-flag projection the scan
+// would have produced.
+func (i Indexer) lenientMessage(accountID, root, path string) (mailparse.MaildirMessage, bool) {
+	_ = accountID
+	file, err := os.Open(path)
+	if err != nil {
+		return mailparse.MaildirMessage{}, false
+	}
+	defer file.Close()
+	message, err := mailparse.ParseLenientMetadata(file)
+	if err != nil {
+		return mailparse.MaildirMessage{}, false
+	}
+	folderPath := filepath.Dir(filepath.Dir(path))
+	folder, relErr := filepath.Rel(root, folderPath)
+	if relErr != nil || folder == "." || strings.HasPrefix(folder, ".."+string(filepath.Separator)) {
+		return mailparse.MaildirMessage{}, false
+	}
+	folder = filepath.ToSlash(folder)
+	name := filepath.Base(path)
+	read := false
+	if marker := strings.Index(name, ":2,"); marker >= 0 {
+		read = strings.Contains(name[marker+3:], "S")
+	}
+	return mailparse.MaildirMessage{Path: path, Folder: folder, Read: read, Message: message}, true
 }
 
 func newScanID() string {

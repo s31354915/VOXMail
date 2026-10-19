@@ -39,6 +39,11 @@ type Message struct {
 	// the value to use when forwarding or otherwise preserving mail content.
 	Text, OriginalText string
 	Attachments        []Attachment
+	// Recovered marks a message that only the lenient parser could read.
+	// The strict parser rejected the file; the recovered projection may be
+	// partial (a truncated body, salvaged attachments) and callers can log
+	// it for observability.
+	Recovered bool
 }
 
 const (
@@ -100,7 +105,7 @@ func parseMessage(r io.Reader, retainData bool) (Message, error) {
 		Date:      parsed.Header.Get("Date"),
 	}
 	budget := &parseBudget{retainData: retainData, retainText: retainData}
-	message.OriginalText, message.Attachments, err = parsePart(textproto.MIMEHeader(parsed.Header), parsed.Body, budget, 0)
+	message.OriginalText, message.Attachments, err = parsePart(textproto.MIMEHeader(parsed.Header), parsed.Body, budget, 0, false)
 	if err != nil {
 		return Message{}, err
 	}
@@ -114,7 +119,7 @@ func parseMessage(r io.Reader, retainData bool) (Message, error) {
 	return message, nil
 }
 
-func parsePart(header textproto.MIMEHeader, body io.Reader, budget *parseBudget, depth int) (string, []Attachment, error) {
+func parsePart(header textproto.MIMEHeader, body io.Reader, budget *parseBudget, depth int, lenient bool) (string, []Attachment, error) {
 	if depth > maxMultipartDepth {
 		return "", nil, fmt.Errorf("MIME nesting exceeds %d levels", maxMultipartDepth)
 	}
@@ -126,22 +131,28 @@ func parsePart(header textproto.MIMEHeader, body io.Reader, budget *parseBudget,
 	}
 	mediaType, params, err := mime.ParseMediaType(header.Get("Content-Type"))
 	if err != nil {
-		if strings.TrimSpace(header.Get("Content-Type")) != "" {
+		if strings.TrimSpace(header.Get("Content-Type")) != "" && !lenient {
 			return "", nil, fmt.Errorf("parse Content-Type: %w", err)
 		}
+		// In lenient mode a malformed Content-Type is treated as plain
+		// text rather than discarding the message.
 		mediaType = "text/plain"
+		params = nil
 	}
 	mediaType = strings.ToLower(mediaType)
 	disposition, dispositionParams, dispositionErr := mime.ParseMediaType(header.Get("Content-Disposition"))
-	if dispositionErr != nil && strings.TrimSpace(header.Get("Content-Disposition")) != "" {
+	if dispositionErr != nil && strings.TrimSpace(header.Get("Content-Disposition")) != "" && !lenient {
 		return "", nil, fmt.Errorf("parse Content-Disposition: %w", dispositionErr)
+	}
+	if dispositionErr != nil {
+		disposition, dispositionParams = "", map[string]string{}
 	}
 	filename := decodeHeader(dispositionParams["filename"])
 	if filename == "" {
 		filename = decodeHeader(params["name"])
 	}
 
-	reader := decodeBody(header, body)
+	reader := decodeBody(header, body, lenient)
 	// A text part with a filename or attachment disposition is still an
 	// attachment. Classification must happen before body selection, otherwise
 	// text attachments disappear from metadata.
@@ -154,7 +165,15 @@ func parsePart(header textproto.MIMEHeader, body io.Reader, budget *parseBudget,
 	case strings.HasPrefix(mediaType, "multipart/"):
 		boundary := params["boundary"]
 		if boundary == "" {
-			return "", nil, fmt.Errorf("multipart Content-Type has no boundary")
+			if !lenient {
+				return "", nil, fmt.Errorf("multipart Content-Type has no boundary")
+			}
+			// A boundary-less multipart body still holds readable text.
+			text, textErr := readTextBody(header, reader, budget)
+			if textErr != nil {
+				return "", nil, textErr
+			}
+			return text, nil, nil
 		}
 		mr := multipart.NewReader(reader, boundary)
 		var plain, html, nested string
@@ -165,10 +184,19 @@ func parsePart(header textproto.MIMEHeader, body io.Reader, budget *parseBudget,
 				break
 			}
 			if nextErr != nil {
+				if lenient {
+					// A truncated or corrupted multipart body keeps the
+					// parts recovered so far instead of failing the whole
+					// message.
+					break
+				}
 				return "", nil, fmt.Errorf("read multipart part: %w", nextErr)
 			}
-			text, parts, partErr := parsePart(part.Header, part, budget, depth+1)
+			text, parts, partErr := parsePart(part.Header, part, budget, depth+1, lenient)
 			if partErr != nil {
+				if lenient {
+					continue
+				}
 				return "", nil, partErr
 			}
 			attachments = append(attachments, parts...)
@@ -195,25 +223,11 @@ func parsePart(header textproto.MIMEHeader, body io.Reader, budget *parseBudget,
 		}
 		return plain, attachments, nil
 	case mediaType == "text/plain", mediaType == "text/html":
-		reader = decodeTextBody(header, reader)
-		if budget != nil && !budget.retainText {
-			decoded, readErr := io.Copy(io.Discard, io.LimitReader(reader, maxTextBytes+1))
-			if readErr != nil {
-				return "", nil, readErr
-			}
-			if decoded > maxTextBytes {
-				return "", nil, fmt.Errorf("%w: text part exceeds %d bytes", ErrPartTooLarge, maxTextBytes)
-			}
-			return "", nil, nil
+		text, textErr := readTextBody(header, reader, budget)
+		if textErr != nil {
+			return "", nil, textErr
 		}
-		data, readErr := io.ReadAll(io.LimitReader(reader, maxTextBytes+1))
-		if readErr != nil {
-			return "", nil, readErr
-		}
-		if len(data) > maxTextBytes {
-			return "", nil, fmt.Errorf("%w: text part exceeds %d bytes", ErrPartTooLarge, maxTextBytes)
-		}
-		return string(data), nil, nil
+		return text, nil, nil
 	default:
 		return readAttachment(header, reader, mediaType, disposition, filename, budget)
 	}
@@ -285,15 +299,43 @@ func readAttachment(header textproto.MIMEHeader, reader io.Reader, mediaType, di
 	}}, nil
 }
 
-func decodeBody(header textproto.MIMEHeader, body io.Reader) io.Reader {
+func decodeBody(header textproto.MIMEHeader, body io.Reader, lenient bool) io.Reader {
 	switch strings.ToLower(header.Get("Content-Transfer-Encoding")) {
 	case "base64":
+		if lenient {
+			return newLenientBase64Reader(body)
+		}
 		return base64.NewDecoder(base64.StdEncoding, body)
 	case "quoted-printable":
 		return quotedprintable.NewReader(body)
 	default:
 		return body
 	}
+}
+
+// readTextBody decodes and bounds one text part. It backs the direct
+// text/plain and text/html cases and the lenient fallback for a multipart
+// body whose boundary is missing.
+func readTextBody(header textproto.MIMEHeader, reader io.Reader, budget *parseBudget) (string, error) {
+	reader = decodeTextBody(header, reader)
+	if budget != nil && !budget.retainText {
+		decoded, readErr := io.Copy(io.Discard, io.LimitReader(reader, maxTextBytes+1))
+		if readErr != nil {
+			return "", readErr
+		}
+		if decoded > maxTextBytes {
+			return "", fmt.Errorf("%w: text part exceeds %d bytes", ErrPartTooLarge, maxTextBytes)
+		}
+		return "", nil
+	}
+	data, readErr := io.ReadAll(io.LimitReader(reader, maxTextBytes+1))
+	if readErr != nil {
+		return "", readErr
+	}
+	if len(data) > maxTextBytes {
+		return "", fmt.Errorf("%w: text part exceeds %d bytes", ErrPartTooLarge, maxTextBytes)
+	}
+	return string(data), nil
 }
 
 func decodeTextBody(header textproto.MIMEHeader, body io.Reader) io.Reader {
