@@ -395,6 +395,7 @@ type session struct {
 	AttachmentCancel     context.CancelFunc
 	RecordCancel         context.CancelFunc
 	RecordStop           chan struct{}
+	RecordGeneration     uint64
 	AlertDone            chan<- bool
 	AlertOutcome         func(AlertOutcome)
 	LastAlertOutcome     AlertOutcome

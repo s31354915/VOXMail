@@ -2,14 +2,18 @@ package calls
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
-	"github.com/voxmail/voxmail/internal/process"
+	"math"
 	"net/mail"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/voxmail/voxmail/internal/maintenance"
+	"github.com/voxmail/voxmail/internal/process"
 	"github.com/voxmail/voxmail/internal/speech"
 
 	"github.com/voxmail/voxmail/internal/keypad"
@@ -42,10 +46,13 @@ func (s *Service) startVoiceRecording(sess *session) {
 	transitionLocked(sess, "recording")
 	stop := make(chan struct{})
 	ctx, cancel := context.WithCancel(parent)
+	sess.RecordGeneration++
+	generation := sess.RecordGeneration
 	sess.RecordStop = stop
 	sess.RecordCancel = cancel
 	s.mu.Unlock()
-	s.prompt(sess, fmt.Sprintf("You have up to %d seconds. Press 0 to finish, or pound to cancel. Start speaking your message after these instructions.", int(s.Recorder.speechWindow()/time.Second)))
+	s.prompt(sess, fmt.Sprintf("You have up to %d seconds. After the tone, speak your message. Press 0 to finish, or pound to cancel and return to the message choices.", int(s.Recorder.speechWindow()/time.Second)))
+	s.playRecordingTone(sess)
 	info, err := os.Stat(sess.RxPath)
 	if err != nil {
 		cancel()
@@ -62,12 +69,17 @@ func (s *Service) startVoiceRecording(sess *session) {
 		defer cancel()
 		recordCtx, finish := context.WithTimeout(ctx, s.Recorder.speechWindow()+process.ConversionTimeout+process.WhisperTimeout)
 		defer finish()
-		text, err := s.Recorder.RecordAndTranscribeUntil(recordCtx, sess.RxPath, offset, stop)
+		text, err := s.Recorder.RecordAndTranscribeUntilWithStatus(recordCtx, sess.RxPath, offset, stop, func() {
+			_ = s.prompt(sess, "Recording finished. I’m transcribing your message now. This can take a little while. Please stay on the line; press pound to cancel.")
+		})
 		s.mu.Lock()
-		sess.RecordStop = nil
-		sess.RecordCancel = nil
+		active := sess.RecordGeneration == generation && string(stateLocked(sess)) == "recording" && !sess.Closed
+		if sess.RecordGeneration == generation {
+			sess.RecordStop = nil
+			sess.RecordCancel = nil
+		}
 		empty := false
-		if string(stateLocked(sess)) == "recording" && !sess.Closed {
+		if active {
 			if err == nil && strings.TrimSpace(text) != "" {
 				sess.Draft.Body = strings.TrimSpace(text)
 				transitionLocked(sess, "review")
@@ -80,7 +92,7 @@ func (s *Service) startVoiceRecording(sess *session) {
 		}
 		closed := sess.Closed
 		s.mu.Unlock()
-		if closed {
+		if closed || !active {
 			return
 		}
 		if err != nil {
@@ -119,9 +131,12 @@ func (s *Service) startSubjectVoice(sess *session) {
 	stop := make(chan struct{})
 	ctx, cancel := context.WithCancel(parent)
 	sess.RecordStop = stop
+	sess.RecordGeneration++
+	generation := sess.RecordGeneration
 	sess.RecordCancel = cancel
 	s.mu.Unlock()
-	s.prompt(sess, fmt.Sprintf("You have up to %d seconds. Press 0 to finish, or pound to cancel. Start speaking the subject after these instructions.", int(s.Recorder.speechWindow()/time.Second)))
+	s.prompt(sess, fmt.Sprintf("You have up to %d seconds. After the tone, say the email subject. Press 0 to finish, or pound to cancel and return to the subject choices.", int(s.Recorder.speechWindow()/time.Second)))
+	s.playRecordingTone(sess)
 	info, err = os.Stat(sess.RxPath)
 	if err != nil {
 		cancel()
@@ -137,11 +152,16 @@ func (s *Service) startSubjectVoice(sess *session) {
 		defer cancel()
 		recordCtx, finish := context.WithTimeout(ctx, s.Recorder.speechWindow()+process.ConversionTimeout+process.WhisperTimeout)
 		defer finish()
-		text, recordErr := s.Recorder.RecordAndTranscribeUntil(recordCtx, sess.RxPath, offset, stop)
+		text, recordErr := s.Recorder.RecordAndTranscribeUntilWithStatus(recordCtx, sess.RxPath, offset, stop, func() {
+			_ = s.prompt(sess, "Recording finished. I’m transcribing the subject now. Please stay on the line; press pound to cancel.")
+		})
 		s.mu.Lock()
-		sess.RecordStop = nil
-		sess.RecordCancel = nil
-		if string(stateLocked(sess)) == "recording_subject" && !sess.Closed {
+		active := sess.RecordGeneration == generation && string(stateLocked(sess)) == "recording_subject" && !sess.Closed
+		if sess.RecordGeneration == generation {
+			sess.RecordStop = nil
+			sess.RecordCancel = nil
+		}
+		if active {
 			if recordErr == nil && strings.TrimSpace(text) != "" {
 				sess.Draft.Subject = strings.TrimSpace(text)
 				if sess.EditingDraft {
@@ -157,7 +177,7 @@ func (s *Service) startSubjectVoice(sess *session) {
 		empty := recordErr == nil && strings.TrimSpace(text) == ""
 		closed := sess.Closed
 		s.mu.Unlock()
-		if closed {
+		if closed || !active {
 			return
 		}
 		if recordErr != nil {
@@ -178,6 +198,71 @@ func (s *Service) startSubjectVoice(sess *session) {
 	})
 }
 
+// playRecordingTone gives callers a distinct cue for the start of capture.
+// It runs after the spoken instructions and before the receive-file offset is
+// recorded, so neither the tone nor the instructions enter the transcription.
+func (s *Service) playRecordingTone(sess *session) {
+	if s.Media == nil || sess == nil || sess.TxPath == "" {
+		return
+	}
+	dir := s.Media.Dir
+	if dir == "" {
+		dir = filepath.Dir(sess.TxPath)
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		s.prompt(sess, "The start tone is unavailable. Start speaking now.")
+		return
+	}
+	f, release, err := maintenance.CreateTemp(dir, ".recording-tone-*.wav")
+	if err != nil {
+		s.prompt(sess, "The start tone is unavailable. Start speaking now.")
+		return
+	}
+	defer release()
+	defer os.Remove(f.Name())
+	if _, err = f.Write(recordingToneWAV()); err == nil {
+		err = f.Close()
+	} else {
+		_ = f.Close()
+	}
+	if err == nil {
+		err = s.playPrompt(sess, func(ctx context.Context) error {
+			return s.Media.playWAVTail(ctx, sess.TxPath, f.Name(), pcmDrainTail)
+		})
+	}
+	if err != nil && !errors.Is(err, context.Canceled) {
+		if s.Log != nil {
+			s.Log.Warn("recording start tone could not play", "error", err)
+		}
+		s.prompt(sess, "The start tone is unavailable. Start speaking now.")
+	}
+}
+
+func recordingToneWAV() []byte {
+	const sampleRate = 8000
+	const samples = sampleRate / 8 // 125 ms, short enough to keep the call moving.
+	dataBytes := samples * 2
+	wav := make([]byte, 44+dataBytes)
+	copy(wav[0:4], "RIFF")
+	binary.LittleEndian.PutUint32(wav[4:8], uint32(36+dataBytes))
+	copy(wav[8:12], "WAVEfmt ")
+	binary.LittleEndian.PutUint32(wav[16:20], 16)
+	binary.LittleEndian.PutUint16(wav[20:22], 1)
+	binary.LittleEndian.PutUint16(wav[22:24], 1)
+	binary.LittleEndian.PutUint32(wav[24:28], sampleRate)
+	binary.LittleEndian.PutUint32(wav[28:32], sampleRate*2)
+	binary.LittleEndian.PutUint16(wav[32:34], 2)
+	binary.LittleEndian.PutUint16(wav[34:36], 16)
+	copy(wav[36:40], "data")
+	binary.LittleEndian.PutUint32(wav[40:44], uint32(dataBytes))
+	for i := 0; i < samples; i++ {
+		envelope := math.Min(1, math.Min(float64(i)/80, float64(samples-1-i)/80))
+		value := int16(math.Sin(2*math.Pi*880*float64(i)/sampleRate) * 0.22 * envelope * 32767)
+		binary.LittleEndian.PutUint16(wav[44+i*2:46+i*2], uint16(value))
+	}
+	return wav
+}
+
 func (s *Service) startAudioAttachment(sess *session) {
 	if s.Recorder == nil || sess == nil || sess.RxPath == "" {
 		s.prompt(sess, "Audio attachment recording is not available on this call.")
@@ -192,6 +277,8 @@ func (s *Service) startAudioAttachment(sess *session) {
 	stop := make(chan struct{})
 	s.mu.Lock()
 	transitionLocked(sess, "audio_recording")
+	sess.RecordGeneration++
+	generation := sess.RecordGeneration
 	sess.RecordCancel = cancel
 	sess.RecordStop = stop
 	s.mu.Unlock()
@@ -213,10 +300,13 @@ func (s *Service) startAudioAttachment(sess *session) {
 		data, recordErr := s.Recorder.RecordAudioUntil(recordCtx, sess.RxPath, offset, stop)
 		cancel()
 		s.mu.Lock()
-		sess.RecordCancel = nil
-		sess.RecordStop = nil
+		active := sess.RecordGeneration == generation && string(stateLocked(sess)) == "audio_recording" && !sess.Closed
+		if sess.RecordGeneration == generation {
+			sess.RecordCancel = nil
+			sess.RecordStop = nil
+		}
 		empty := false
-		if string(stateLocked(sess)) == "audio_recording" && !sess.Closed {
+		if active {
 			if recordErr == nil && len(data) > 0 {
 				sess.Draft.Attachments = append(sess.Draft.Attachments, mailer.Attachment{Filename: fmt.Sprintf("voxmail-audio-%d.wav", time.Now().Unix()), ContentType: "audio/wav", Data: data})
 				transitionLocked(sess, "review")
@@ -228,7 +318,7 @@ func (s *Service) startAudioAttachment(sess *session) {
 		stillRecording := string(stateLocked(sess)) == "audio_recording"
 		closed := sess.Closed
 		s.mu.Unlock()
-		if closed {
+		if closed || !active {
 			return
 		}
 		if recordErr != nil {

@@ -51,7 +51,7 @@ func (r *VoiceRecorder) speechWindow() time.Duration {
 }
 
 func (r *VoiceRecorder) RecordAndTranscribe(ctx context.Context, rawPath string, offset int64) (string, error) {
-	return r.recordAndTranscribe(ctx, rawPath, offset, nil)
+	return r.recordAndTranscribe(ctx, rawPath, offset, nil, nil)
 }
 
 // RecordAndTranscribeUntil captures until the caller signals stop, the
@@ -59,10 +59,17 @@ func (r *VoiceRecorder) RecordAndTranscribe(ctx context.Context, rawPath string,
 // signal is a normal completion path; context cancellation remains an abort
 // path for call teardown and the # navigation key.
 func (r *VoiceRecorder) RecordAndTranscribeUntil(ctx context.Context, rawPath string, offset int64, stop <-chan struct{}) (string, error) {
-	return r.recordAndTranscribe(ctx, rawPath, offset, stop)
+	return r.recordAndTranscribe(ctx, rawPath, offset, stop, nil)
 }
 
-func (r *VoiceRecorder) recordAndTranscribe(ctx context.Context, rawPath string, offset int64, stop <-chan struct{}) (string, error) {
+// RecordAndTranscribeUntilWithStatus calls afterCapture as soon as the captured
+// audio is complete and before conversion/transcription begins. Audio played
+// by the callback is excluded from the captured segment.
+func (r *VoiceRecorder) RecordAndTranscribeUntilWithStatus(ctx context.Context, rawPath string, offset int64, stop <-chan struct{}, afterCapture func()) (string, error) {
+	return r.recordAndTranscribe(ctx, rawPath, offset, stop, afterCapture)
+}
+
+func (r *VoiceRecorder) recordAndTranscribe(ctx context.Context, rawPath string, offset int64, stop <-chan struct{}, afterCapture func()) (string, error) {
 	if r == nil || rawPath == "" {
 		return "", fmt.Errorf("voice recorder is not configured")
 	}
@@ -101,6 +108,13 @@ func (r *VoiceRecorder) recordAndTranscribe(ctx context.Context, rawPath string,
 	// A writer can be observed between the two bytes of one PCM sample. Start
 	// at the previous byte so the segment never begins with a half sample.
 	offset -= offset % mediaBytesPerSample
+	captureEnd := info.Size()
+	if afterCapture != nil {
+		afterCapture()
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+	}
 	dir := r.Dir
 	if dir == "" {
 		dir = filepath.Dir(rawPath)
@@ -123,7 +137,7 @@ func (r *VoiceRecorder) recordAndTranscribe(ctx context.Context, rawPath string,
 	defer releaseSegment()
 	segmentPath := segment.Name()
 	defer os.Remove(segmentPath)
-	if _, err := io.Copy(segment, io.LimitReader(raw, pcmWindowBytes(window))); err != nil {
+	if _, err := io.Copy(segment, io.LimitReader(raw, captureEnd-offset)); err != nil {
 		segment.Close()
 		return "", err
 	}

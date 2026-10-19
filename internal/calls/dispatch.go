@@ -168,6 +168,7 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 	if key == "*" {
 		s.mu.Lock()
 		state := string(stateLocked(sess))
+		cancelNotice := ""
 		if state == "attachment_playback" {
 			if sess.AttachmentCancel != nil {
 				sess.AttachmentCancel()
@@ -175,15 +176,35 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 			}
 			transitionLocked(sess, "read")
 		}
-		if state == "audio_recording" && sess.RecordStop != nil {
-			close(sess.RecordStop)
-			sess.RecordStop = nil
-		}
-		if (state == "recording" || state == "recording_subject") && sess.RecordCancel != nil {
-			sess.RecordCancel()
+		if state == "audio_recording" {
+			sess.RecordGeneration++
+			if sess.RecordCancel != nil {
+				sess.RecordCancel()
+			}
 			sess.RecordCancel = nil
+			sess.RecordStop = nil
+			backUsingFlowLocked(sess, "review")
+			cancelNotice = "Audio recording canceled. "
+		}
+		if state == "recording" || state == "recording_subject" {
+			sess.RecordGeneration++
+			if sess.RecordCancel != nil {
+				sess.RecordCancel()
+			}
+			sess.RecordCancel = nil
+			sess.RecordStop = nil
+			fallback := "body_method"
+			if state == "recording_subject" {
+				fallback = "subject_method"
+			}
+			backUsingFlowLocked(sess, fallback)
+			cancelNotice = "Recording canceled. "
 		}
 		s.mu.Unlock()
+		if cancelNotice != "" {
+			s.prompt(sess, cancelNotice+s.promptForState(sess))
+			return nil
+		}
 		s.repeatCurrentPrompt(sess)
 		return nil
 	}
@@ -294,12 +315,14 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 		case "contact_confirm":
 			backUsingFlowLocked(sess, "more_options")
 		case "audio_recording":
+			sess.RecordGeneration++
 			if sess.RecordCancel != nil {
 				sess.RecordCancel()
 				sess.RecordCancel = nil
 			}
 			backUsingFlowLocked(sess, "review")
 		case "recording", "recording_subject":
+			sess.RecordGeneration++
 			if sess.RecordCancel != nil {
 				sess.RecordCancel()
 				sess.RecordCancel = nil
