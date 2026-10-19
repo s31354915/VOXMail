@@ -43,7 +43,20 @@ func (s *Service) handleDTMF(conn net.Conn, message bridge.Message) error {
 	userID, pin := sess.UserID, sess.PIN
 	s.mu.Unlock()
 	user, err := s.Store.UserByID(s.baseContext(), userID)
-	if err != nil || !auth.Check(user.PINHash, pin) {
+	if err != nil {
+		// A transient store failure is not a wrong PIN. Spending one of the
+		// caller's three attempts on a database hiccup, or locking the line on
+		// three of them, punishes callers for an outage they did not cause.
+		if s.Log != nil {
+			s.Log.Warn("ivr PIN verification could not load the account", "call_id", message.CallID, "error", err)
+		}
+		s.mu.Lock()
+		sess.PIN = ""
+		s.mu.Unlock()
+		s.prompt(sess, "I couldn't check that just now. Please try again in a moment.")
+		return nil
+	}
+	if !auth.Check(user.PINHash, pin) {
 		var remaining int
 		s.mu.Lock()
 		sess.PIN = ""
@@ -443,8 +456,15 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 			s.mu.Unlock()
 			s.prompt(sess, menuPrompt("more_options"))
 		} else if key == "0" {
+			// "0 for next" continues the list from the next message rather
+			// than reading it outright: the caller hears the next entry and
+			// the list menu, and stays in control of what plays.
 			m = s.advanceToPlayable(sess)
-			s.readMessage(sess, m)
+			s.mu.Lock()
+			transitionLocked(sess, "list")
+			cursor, total := sess.Cursor, len(sess.Messages)
+			s.mu.Unlock()
+			s.prompt(sess, listPrompt(m, cursor, total))
 		}
 	case "attachment_menu":
 		if key == "0" {
