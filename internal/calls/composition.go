@@ -102,6 +102,9 @@ func (s *Service) startVoiceRecording(sess *session) {
 			if errors.Is(err, context.Canceled) {
 				return
 			}
+			if s.Log != nil {
+				s.Log.Warn("recording transcription failed", "call_id", sess.CallID, "error", err)
+			}
 			s.prompt(sess, "The recording could not be transcribed. Press 1 to type, 2 to record again, or pound to go back.")
 			return
 		}
@@ -186,6 +189,9 @@ func (s *Service) startSubjectVoice(sess *session) {
 			if errors.Is(recordErr, context.Canceled) {
 				return
 			}
+			if s.Log != nil {
+				s.Log.Warn("subject recording transcription failed", "call_id", sess.CallID, "error", recordErr)
+			}
 			s.prompt(sess, "The subject recording could not be transcribed. Press 1 to type, 2 to record again, or pound to go back.")
 			return
 		}
@@ -265,7 +271,8 @@ func recordingToneWAV() []byte {
 	wav := make([]byte, 44+dataBytes)
 	copy(wav[0:4], "RIFF")
 	binary.LittleEndian.PutUint32(wav[4:8], uint32(36+dataBytes))
-	copy(wav[8:12], "WAVEfmt ")
+	copy(wav[8:12], "WAVE")
+	copy(wav[12:16], "fmt ")
 	binary.LittleEndian.PutUint32(wav[16:20], 16)
 	binary.LittleEndian.PutUint16(wav[20:22], 1)
 	binary.LittleEndian.PutUint16(wav[22:24], 1)
