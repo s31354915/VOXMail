@@ -93,6 +93,7 @@ func (s *Service) startVoiceRecording(sess *session) {
 		closed := sess.Closed
 		s.mu.Unlock()
 		if closed || !active {
+			s.logDiscardedRecording(sess, closed, err)
 			return
 		}
 		if err != nil {
@@ -178,6 +179,7 @@ func (s *Service) startSubjectVoice(sess *session) {
 		closed := sess.Closed
 		s.mu.Unlock()
 		if closed || !active {
+			s.logDiscardedRecording(sess, closed, recordErr)
 			return
 		}
 		if recordErr != nil {
@@ -196,6 +198,24 @@ func (s *Service) startSubjectVoice(sess *session) {
 		s.mu.Unlock()
 		s.prompt(sess, "Subject: "+speakable(text, maxIVRSubjectRunes)+". "+menuPrompt(next))
 	})
+}
+
+// logDiscardedRecording makes every exit from a voice recording that does not
+// transcribe say why. Before this, a recording abandoned by a state change or
+// a closed call dropped its captured audio without a trace in the logs.
+func (s *Service) logDiscardedRecording(sess *session, closed bool, err error) {
+	if s.Log == nil {
+		return
+	}
+	reason := "superseded by a newer recording"
+	if closed {
+		reason = "call closed"
+	}
+	if err != nil && !errors.Is(err, context.Canceled) {
+		s.Log.Warn("recording result discarded", "call_id", sess.CallID, "reason", reason, "error", err.Error())
+		return
+	}
+	s.Log.Warn("recording result discarded", "call_id", sess.CallID, "reason", reason)
 }
 
 // playRecordingTone gives callers a distinct cue for the start of capture.
@@ -319,6 +339,7 @@ func (s *Service) startAudioAttachment(sess *session) {
 		closed := sess.Closed
 		s.mu.Unlock()
 		if closed || !active {
+			s.logDiscardedRecording(sess, closed, recordErr)
 			return
 		}
 		if recordErr != nil {
