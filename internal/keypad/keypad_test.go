@@ -18,9 +18,53 @@ func TestMultiTap(t *testing.T) {
 func TestBackspace(t *testing.T) {
 	m := New(ModeText)
 	m.Text = "abc"
+	// A single star never deletes: it only arms the double-press.
+	m.Press('*')
+	if m.Text != "abc" {
+		t.Fatalf("single star deleted: got %q, want abc", m.Text)
+	}
 	m.Press('*')
 	if m.Text != "ab" {
 		t.Fatalf("got %q, want ab", m.Text)
+	}
+}
+
+func TestSingleStarWithoutPendingDoesNothing(t *testing.T) {
+	m := New(ModeText)
+	m.Text = "ab"
+	m.Press('*')
+	if m.Text != "ab" || m.PendingKey != 0 {
+		t.Fatalf("single star with nothing pending changed state: text=%q pending=%q", m.Text, string(rune(m.PendingKey)))
+	}
+	m.Press('2')
+	m.Press('*')
+	if m.Text != "aba" {
+		t.Fatalf("star did not commit the pending character: got %q, want aba", m.Text)
+	}
+}
+
+func TestDoubleStarBackspacesEvenAfterCommit(t *testing.T) {
+	m := New(ModeText)
+	for _, key := range []byte("2*") {
+		m.Press(key)
+	}
+	if m.Text != "a" {
+		t.Fatalf("got %q, want a", m.Text)
+	}
+	m.Press('*')
+	if m.Text != "" {
+		t.Fatalf("double star did not backspace: got %q, want empty", m.Text)
+	}
+}
+
+func TestOtherKeysClearStarArm(t *testing.T) {
+	m := New(ModeText)
+	m.Text = "ab"
+	m.Press('*')
+	m.Press('2')
+	m.Press('*')
+	if m.Text != "aba" {
+		t.Fatalf("star after another key must commit, not delete: got %q", m.Text)
 	}
 }
 
@@ -48,6 +92,7 @@ func TestMultiTapLimitRejectsOverflowAndBackspaceRecovers(t *testing.T) {
 	if !m.Overflowed || m.Text != "a" {
 		t.Fatalf("overflow state=%q,%v, want unchanged text with overflow", m.Text, m.Overflowed)
 	}
+	m.Press('*')
 	m.Press('*')
 	if m.Overflowed || m.Text != "" {
 		t.Fatalf("backspace did not recover editor: text=%q overflow=%v", m.Text, m.Overflowed)

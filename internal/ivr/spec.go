@@ -58,6 +58,8 @@ var specs = map[State]StateSpec{
 	"field_confirm":         {State: "field_confirm", Prompt: "Press 1 to accept, 2 to edit, or 3 to start this entry over.", Valid: fixed("1", "2", "3"), Back: "compose", Repeatable: true},
 	"confirm_delete":        {State: "confirm_delete", Prompt: "Delete this message? Press 1 to confirm or 2 to cancel.", Valid: fixed("1", "2"), Back: "list", Repeatable: true},
 	"compose":               {State: "compose", Prompt: "Type the recipient's email address. " + EmailKeypadInstructions, Valid: nil, Back: "main", Repeatable: true},
+	"recipient_pick":        {State: "recipient_pick", Prompt: "Press 1 to type an address, or 2 to choose a contact.", Valid: fixed("1", "2"), Back: "main", Repeatable: true},
+	"contact_pick":          {State: "contact_pick", Prompt: "Choose a contact, press 9 for more if available, or pound to go back.", Valid: digits(1, 9), Back: "recipient_pick", Repeatable: true},
 	"recipient_menu":        {State: "recipient_menu", Prompt: "Press 1 to add a main recipient, 2 to add a copy recipient, 3 to add a hidden copy recipient, or 4 to continue.", Valid: fixed("1", "2", "3", "4"), Back: "compose", Repeatable: true},
 	"recipient_input":       {State: "recipient_input", Prompt: "Type the email address. " + EmailKeypadInstructions, Valid: nil, Back: "recipient_menu", Repeatable: true},
 	"subject_method":        {State: "subject_method", Prompt: "For the subject, press 1 to type with the keypad or 2 to speak.", Valid: fixed("1", "2"), Back: "recipient_menu", Repeatable: true},

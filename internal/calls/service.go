@@ -705,7 +705,7 @@ func (s *Service) promptRuntime(sess *session) *speech.Runtime {
 	menuRuntime := sess.Runtime
 	s.mu.Unlock()
 	switch state {
-	case "list", "read", "attachment_menu", "attachment_playback", "move_menu", "more_options", "compose", "recipient_menu", "recipient_input", "subject_method", "subject", "body_method", "body", "review", "forward_options", "audio_recording", "recording", "recording_subject", "contact_name", "contact_confirm", "draft_menu", "draft_list", "draft_edit", "recipient_edit", "attachment_edit":
+	case "list", "read", "attachment_menu", "attachment_playback", "move_menu", "more_options", "compose", "recipient_pick", "contact_pick", "recipient_menu", "recipient_input", "subject_method", "subject", "body_method", "body", "review", "forward_options", "audio_recording", "recording", "recording_subject", "contact_name", "contact_confirm", "draft_menu", "draft_list", "draft_edit", "recipient_edit", "attachment_edit":
 		if emailRuntime != nil {
 			return emailRuntime
 		}

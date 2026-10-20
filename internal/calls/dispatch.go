@@ -397,6 +397,10 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 		s.handleFolderAction(sess, key)
 	case "contacts":
 		s.handleContactMenu(sess, key)
+	case "recipient_pick":
+		s.handleRecipientPick(sess, key)
+	case "contact_pick":
+		s.handleContactPick(sess, key)
 	case "recipient_menu":
 		s.handleRecipientMenu(sess, key)
 	case "field_confirm":
@@ -411,6 +415,7 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 		s.mu.Lock()
 		if len(sess.Messages) == 0 {
 			s.mu.Unlock()
+			s.prompt(sess, "There are no messages here. Press pound to go back.")
 			return nil
 		}
 		m := sess.Messages[sess.Cursor]
@@ -461,6 +466,7 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 		s.mu.Lock()
 		if len(sess.Messages) == 0 {
 			s.mu.Unlock()
+			s.prompt(sess, "There are no messages here. Press pound to go back.")
 			return nil
 		}
 		if sess.Cursor < 0 || sess.Cursor >= len(sess.Messages) {
@@ -526,6 +532,7 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 				s.attachmentMenu(sess)
 			} else {
 				s.prompt(sess, "There are no more attachments. Press pound to return.")
+				s.attachmentMenu(sess)
 			}
 			return nil
 		}
@@ -560,6 +567,7 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 				s.promptMoveMenu(sess)
 			} else {
 				s.prompt(sess, "There are no more folders. Press pound to return.")
+				s.promptMoveMenu(sess)
 			}
 			return nil
 		}
@@ -571,6 +579,7 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 		if index >= len(sess.MoveFolders) {
 			s.mu.Unlock()
 			s.prompt(sess, "There is no folder for that key. Press pound to return.")
+			s.promptMoveMenu(sess)
 			return nil
 		}
 		destination := sess.MoveFolders[index]
@@ -685,7 +694,7 @@ func (s *Service) handleReviewCancel(sess *session) {
 		s.mu.Lock()
 		transitionLocked(sess, "main")
 		s.mu.Unlock()
-		s.prompt(sess, "Composition cancelled.")
+		s.prompt(sess, "Composition cancelled. "+s.promptForState(sess))
 		return
 	}
 	s.mu.Lock()

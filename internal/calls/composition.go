@@ -18,6 +18,7 @@ import (
 
 	"github.com/voxmail/voxmail/internal/keypad"
 	"github.com/voxmail/voxmail/internal/mailer"
+	"github.com/voxmail/voxmail/internal/store"
 )
 
 func (s *Service) startCompose(sess *session, mode string) {
@@ -381,6 +382,19 @@ func (s *Service) startComposeLocked(sess *session, mode string) {
 	sess.EditingDraft = false
 	sess.RecipientKind = ""
 	if mode == "" {
+		// With saved contacts, offer typing or picking. Without any, keep
+		// the old behavior and go straight into typing. The lock is already
+		// held here, so baseContext() would deadlock; use Background instead.
+		var contacts []store.Contact
+		var listErr error
+		if s.Store != nil {
+			contacts, listErr = s.Store.ListContacts(context.Background(), sess.UserID)
+		}
+		if listErr == nil && len(contacts) > 0 {
+			transitionLocked(sess, "recipient_pick")
+			sess.Editor = nil
+			return
+		}
 		transitionLocked(sess, "compose")
 		sess.Editor = newIVREditor("compose")
 		return
@@ -470,12 +484,16 @@ func (s *Service) handleCompose(sess *session, key string) {
 		// the keypad stopped working.
 		if sess.Editor.Overflowed && !sess.Editor.OverflowPrompted {
 			sess.Editor.OverflowPrompted = true
-			s.startTask(func() { s.prompt(sess, "That entry is too long. Press star to delete a character, then try again.") })
+			s.startTask(func() {
+				s.prompt(sess, "That entry is too long. Press star twice to delete a character, then try again.")
+			})
 		}
 		return
 	}
 	if sess.Editor.Overflowed {
-		s.startTask(func() { s.prompt(sess, "That entry is too long. Press star to delete a character, then try again.") })
+		s.startTask(func() {
+			s.prompt(sess, "That entry is too long. Press star twice to delete a character, then try again.")
+		})
 		return
 	}
 	value := strings.TrimSpace(sess.Editor.Text)
@@ -483,7 +501,7 @@ func (s *Service) handleCompose(sess *session, key string) {
 	case "compose":
 		if _, err := mail.ParseAddress(value); err != nil {
 			s.startTask(func() {
-				s.prompt(sess, "That address could not be accepted. Your entry is still here. Press star to delete the last character. For at, press 1 twice, then star; for dot, press 1 three times, then star. Press pound to check it again.")
+				s.prompt(sess, "That address could not be accepted. Your entry is still here. Press star twice to delete the last character. For at, press 1 twice, then star; for dot, press 1 three times, then star. Press pound to check it again.")
 			})
 			return
 		}
@@ -496,7 +514,7 @@ func (s *Service) handleCompose(sess *session, key string) {
 	case "recipient_input":
 		if _, err := mail.ParseAddress(value); err != nil {
 			s.startTask(func() {
-				s.prompt(sess, "That address could not be accepted. Your entry is still here. Press star to delete the last character. For at, press 1 twice, then star; for dot, press 1 three times, then star. Press pound to check it again.")
+				s.prompt(sess, "That address could not be accepted. Your entry is still here. Press star twice to delete the last character. For at, press 1 twice, then star; for dot, press 1 three times, then star. Press pound to check it again.")
 			})
 			return
 		}
@@ -569,6 +587,7 @@ func (s *Service) handleFieldConfirmation(sess *session, key string) {
 	value, state, recipientKind := sess.ConfirmValue, sess.ConfirmState, sess.ConfirmRecipientKind
 	if value == "" || state == "" {
 		s.mu.Unlock()
+		s.repeatCurrentPrompt(sess)
 		return
 	}
 	if key == "2" || key == "3" {
@@ -582,7 +601,7 @@ func (s *Service) handleFieldConfirmation(sess *session, key string) {
 		}
 		sess.ConfirmValue, sess.ConfirmState, sess.ConfirmRecipientKind = "", "", ""
 		s.mu.Unlock()
-		notice := "Editing your previous entry. Press star to delete the last character. "
+		notice := "Editing your previous entry. Press star twice to delete the last character. "
 		if key == "3" {
 			notice = "Entry cleared. "
 		}
@@ -645,6 +664,7 @@ func (s *Service) handleMoreOptions(sess *session, key string) {
 	s.mu.Lock()
 	if sess.Cursor < 0 || sess.Cursor >= len(sess.Messages) {
 		s.mu.Unlock()
+		s.prompt(sess, "That message is no longer available. Press pound to return.")
 		return
 	}
 	message := sess.Messages[sess.Cursor]
