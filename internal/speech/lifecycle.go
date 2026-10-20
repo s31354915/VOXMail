@@ -347,11 +347,18 @@ type Runtime struct {
 	ready    *capabilityReady
 	ttsReady *capabilityReady
 	sttReady *capabilityReady
-	warmErr  error
-	ttsErr   error
-	sttErr   error
-	cancel   context.CancelFunc
-	worker   piperSynthesizer
+	// sttShared points at the pool's single Whisper warm state for
+	// pool-managed runtimes; standalone runtimes keep nil and warm their
+	// own Whisper. The shared state is warmed once on first pool
+	// activation: the STT model is independent of voice and speed, and the
+	// whisper CLI is invoked per transcription, so there is nothing
+	// resident to unload between calls.
+	sttShared *capabilityReady
+	warmErr   error
+	ttsErr    error
+	sttErr    error
+	cancel    context.CancelFunc
+	worker    piperSynthesizer
 	// workerRelease releases a pool-shared per-model worker when this
 	// runtime leaves the pool. Standalone runtures keep nil and own their
 	// worker outright.
@@ -397,10 +404,38 @@ type RuntimePool struct {
 	runtimes    map[string]*Runtime
 	workers     map[string]*pooledWorker
 	pinned      map[string]*Lease
+	// sttWarm is the pool's single shared Whisper warm state, warmed on
+	// first activation and shared by every runtime regardless of voice or
+	// speed.
+	sttWarm *capabilityReady
 }
 
 func NewRuntimePool(piperBinary, voiceDir, whisperBinary, whisperModel, dir, piperPython string, resident bool) *RuntimePool {
 	return &RuntimePool{PiperBinary: piperBinary, VoiceDir: voiceDir, WhisperBinary: whisperBinary, WhisperModel: whisperModel, Dir: dir, PiperPython: piperPython, Resident: resident, runtimes: make(map[string]*Runtime)}
+}
+
+// sharedWhisperWarmLocked returns the pool's shared Whisper warm state,
+// starting the warm-up on first use. Caller holds p.mu.
+func (p *RuntimePool) sharedWhisperWarmLocked() *capabilityReady {
+	if p.sttWarm != nil {
+		return p.sttWarm
+	}
+	warm := newCapabilityReady()
+	p.sttWarm = warm
+	whisper := Whisper{Binary: p.WhisperBinary, Model: p.WhisperModel}
+	dir := p.Dir
+	go func() {
+		err := whisper.Warm(context.Background(), dir)
+		// A failed warm-up clears the slot so the next activation retries
+		// instead of caching the failure for the pool's lifetime.
+		p.mu.Lock()
+		if p.sttWarm == warm && err != nil {
+			p.sttWarm = nil
+		}
+		p.mu.Unlock()
+		warm.finish(err)
+	}()
+	return warm
 }
 
 func (p *RuntimePool) Activate(voice string, speed int) (*Runtime, *Lease) {
@@ -433,6 +468,7 @@ func (p *RuntimePool) Activate(voice string, speed int) (*Runtime, *Lease) {
 	if created {
 		runtime = NewRuntime(Piper{Binary: p.PiperBinary, Model: model, Extra: SpeedExtra(normalizedSpeed)}, Whisper{Binary: p.WhisperBinary, Model: p.WhisperModel}, filepath.Join(p.Dir, fmt.Sprintf("%x", sha256.Sum256([]byte(key)))))
 		runtime.Speed = normalizedSpeed
+		runtime.sttShared = p.sharedWhisperWarmLocked()
 		runtime.onZero = func() {
 			p.mu.Lock()
 			defer p.mu.Unlock()
@@ -502,7 +538,13 @@ func (r *Runtime) Activate() *Lease {
 	if r.refs == 0 {
 		r.ready = newCapabilityReady()
 		r.ttsReady = newCapabilityReady()
-		r.sttReady = newCapabilityReady()
+		if r.sttShared != nil {
+			// Pooled runtimes wait on the pool's shared Whisper warm-up
+			// instead of running a duplicate per voice-speed key.
+			r.sttReady = r.sttShared
+		} else {
+			r.sttReady = newCapabilityReady()
+		}
 		r.warmErr = nil
 		r.ttsErr = nil
 		r.sttErr = nil
@@ -600,11 +642,29 @@ func (r *Runtime) warm(ctx context.Context, ready *capabilityReady) {
 	}()
 	go func() {
 		defer wg.Done()
-		warmErr := r.Whisper.Warm(ctx, r.Dir)
+		var warmErr error
+		if r.sttShared != nil {
+			// Pooled runtimes share the pool's Whisper warm-up: wait for
+			// it rather than running a duplicate, and never finish the
+			// shared state from here.
+			select {
+			case <-r.sttShared.done:
+				warmErr = r.sttShared.err
+			case <-ctx.Done():
+				warmErr = ctx.Err()
+			}
+		} else {
+			warmErr = r.Whisper.Warm(ctx, r.Dir)
+		}
 		r.mu.Lock()
 		if r.ready == ready {
 			r.sttErr = warmErr
-			r.sttReady.finish(warmErr)
+			// A standalone runtime owns its STT state and must finish it;
+			// a pooled runtime's sttReady is the pool's shared state, which
+			// the pool's own warm-up finishes.
+			if r.sttReady != nil && r.sttReady != r.sttShared {
+				r.sttReady.finish(warmErr)
+			}
 		}
 		r.mu.Unlock()
 	}()
@@ -737,6 +797,7 @@ func (l *Lease) Release() {
 			ready := r.ready
 			ttsReady := r.ttsReady
 			sttReady := r.sttReady
+			sttShared := r.sttShared
 			r.ready = nil
 			r.ttsReady = nil
 			r.sttReady = nil
@@ -749,7 +810,7 @@ func (l *Lease) Release() {
 			if ttsReady != nil {
 				ttsReady.finish(context.Canceled)
 			}
-			if sttReady != nil {
+			if sttReady != nil && sttReady != sttShared {
 				sttReady.finish(context.Canceled)
 			}
 			worker := r.worker

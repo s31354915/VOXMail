@@ -67,9 +67,12 @@ func (s *Service) startVoiceRecording(sess *session) {
 	offset := info.Size()
 	s.startTask(func() {
 		defer cancel()
+		s.mu.Lock()
+		callRuntime := sess.Runtime
+		s.mu.Unlock()
 		recordCtx, finish := context.WithTimeout(ctx, s.Recorder.speechWindow()+process.ConversionTimeout+process.WhisperTimeout)
 		defer finish()
-		text, err := s.Recorder.RecordAndTranscribeUntilWithStatus(recordCtx, sess.RxPath, offset, stop, func() {
+		text, err := s.Recorder.RecordAndTranscribeUntilWithStatus(recordCtx, callRuntime, sess.RxPath, offset, stop, func() {
 			_ = s.prompt(sess, "Recording finished. I’m transcribing your message now. This can take a little while. Please stay on the line; press pound to cancel.")
 		})
 		s.mu.Lock()
@@ -154,9 +157,12 @@ func (s *Service) startSubjectVoice(sess *session) {
 	offset := info.Size()
 	s.startTask(func() {
 		defer cancel()
+		s.mu.Lock()
+		callRuntime := sess.Runtime
+		s.mu.Unlock()
 		recordCtx, finish := context.WithTimeout(ctx, s.Recorder.speechWindow()+process.ConversionTimeout+process.WhisperTimeout)
 		defer finish()
-		text, recordErr := s.Recorder.RecordAndTranscribeUntilWithStatus(recordCtx, sess.RxPath, offset, stop, func() {
+		text, recordErr := s.Recorder.RecordAndTranscribeUntilWithStatus(recordCtx, callRuntime, sess.RxPath, offset, stop, func() {
 			_ = s.prompt(sess, "Recording finished. I’m transcribing the subject now. Please stay on the line; press pound to cancel.")
 		})
 		s.mu.Lock()

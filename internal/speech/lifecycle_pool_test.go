@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // fakePoolVoice writes a tiny fake Piper model and returns its path; the
@@ -163,5 +164,63 @@ func TestResidentWorkerLifecycle(t *testing.T) {
 	pool.mu.Unlock()
 	if ok {
 		t.Fatal("resident worker stayed pooled after the last release")
+	}
+}
+
+// The pool warms Whisper once, shared by every runtime regardless of voice
+// or speed: the STT model is independent of both. A runtime's teardown must
+// not disturb the shared state another runtime is waiting on, and a failed
+// warm-up must not be cached for the pool's lifetime.
+func TestRuntimePoolSharesWhisperWarmAcrossSpeeds(t *testing.T) {
+	root := t.TempDir()
+	model := fakePoolVoice(t, root, "shared-stt.onnx", "shared-model")
+	whisper := filepath.Join(root, "fake-whisper.sh")
+	// Warm-up tolerates an empty transcription, so an exit-0 script that
+	// prints nothing is a successfully warmed engine.
+	if err := os.WriteFile(whisper, []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	whisperModel := filepath.Join(root, "whisper-model.bin")
+	if err := os.WriteFile(whisperModel, []byte("whisper-model-bytes"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	pool := NewRuntimePool(filepath.Join(root, "fake-piper.sh"), root, whisper, whisperModel, filepath.Join(root, "runtime"), "python3", false)
+
+	first, firstLease := pool.Activate(model, 3)
+	if first == nil || firstLease == nil {
+		t.Fatal("first activation failed")
+	}
+	second, secondLease := pool.Activate(model, 4)
+	if second == nil || secondLease == nil {
+		t.Fatal("second activation failed")
+	}
+	defer secondLease.Release()
+	if first == second {
+		t.Fatal("different speeds should build distinct runtimes")
+	}
+	if first.sttShared == nil || first.sttShared != second.sttShared {
+		t.Fatal("pool runtimes must share one Whisper warm state")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := first.WaitWhisper(ctx); err != nil {
+		t.Fatalf("first runtime whisper warm: %v", err)
+	}
+	if err := second.WaitWhisper(ctx); err != nil {
+		t.Fatalf("second runtime whisper warm: %v", err)
+	}
+	// Tearing one runtime down must leave the shared warm state usable.
+	firstLease.Release()
+	if err := second.WaitWhisper(ctx); err != nil {
+		t.Fatalf("shared whisper warm state damaged by peer teardown: %v", err)
+	}
+	if first.sttShared != second.sttShared || first.sttShared.closed == false {
+		t.Fatal("shared warm state should stay open after peer teardown")
+	}
+
+	// Standalone runtimes keep their own warm state.
+	standalone := NewRuntime(Piper{Binary: filepath.Join(root, "fake-piper.sh"), Model: model}, Whisper{}, filepath.Join(root, "standalone"))
+	if standalone.sttShared != nil {
+		t.Fatal("standalone runtime must not inherit pool whisper state")
 	}
 }
