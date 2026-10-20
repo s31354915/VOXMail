@@ -36,7 +36,7 @@ func TestRecorderOwnsTempsThroughoutBlockedConversion(t *testing.T) {
 	close(stop)
 	done := make(chan error, 1)
 	go func() {
-		text, err := (&VoiceRecorder{Binary: converter, Dir: dir, Whisper: speech.Whisper{Binary: whisper, Model: "fixture"}}).RecordAndTranscribeUntil(ctx, raw, 0, stop)
+		text, err := (&VoiceRecorder{Binary: converter, Dir: dir, Whisper: speech.Whisper{Binary: whisper, Model: "fixture"}}).RecordAndTranscribeUntil(ctx, nil, raw, 0, stop)
 		if err == nil && text != "recognized text" {
 			err = errors.New("unexpected transcription")
 		}
@@ -85,7 +85,7 @@ func TestVoiceRecorderCancellationStopsBeforeFilesystemWork(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, err := (&VoiceRecorder{}).RecordAndTranscribe(ctx, filepath.Join(t.TempDir(), "missing.pcm"), 0)
+	_, err := (&VoiceRecorder{}).RecordAndTranscribe(ctx, nil, filepath.Join(t.TempDir(), "missing.pcm"), 0)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("RecordAndTranscribe error=%v, want context.Canceled", err)
 	}
@@ -137,7 +137,7 @@ func TestVoiceRecorderTranscribesStoppedCaptureAndRemovesWAV(t *testing.T) {
 		Dir:     dir,
 		Window:  time.Hour,
 		Whisper: speech.Whisper{Binary: whisper, Model: "test-model"},
-	}).RecordAndTranscribeUntil(context.Background(), rawPath, 0, stop)
+	}).RecordAndTranscribeUntil(context.Background(), nil, rawPath, 0, stop)
 	if err != nil {
 		t.Fatalf("RecordAndTranscribeUntil error=%v", err)
 	}
@@ -260,5 +260,49 @@ func TestAudioConversionRejectsOversizedOutputAndCleansFile(t *testing.T) {
 		if strings.HasPrefix(entry.Name(), ".attachment-") {
 			t.Fatalf("oversized temporary file remains: %s", entry.Name())
 		}
+	}
+}
+
+// Regression test: the recorder must wait on the call's activated speech
+// runtime, not the recorder's own never-activated Runtime. With the runtime
+// pool, the base runtime is never Activated, so its sttReady never exists and
+// WaitWhisper failed with "speech runtime is not active" on every recording.
+func TestVoiceRecorderTranscribesThroughActivatedCallRuntime(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "recordings")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	raw := filepath.Join(root, "capture.pcm")
+	if err := os.WriteFile(raw, make([]byte, 128), 0600); err != nil {
+		t.Fatal(err)
+	}
+	converter := writeMediaTestCommand(t, "#!/bin/sh\nlast=\nfor arg do last=\"$arg\"; done\nprintf RIFF > \"$last\"\n")
+	whisper := writeMediaTestCommand(t, "#!/bin/sh\nprintf 'recognized text\\n'\n")
+	model := filepath.Join(root, "model.bin")
+	if err := os.WriteFile(model, []byte("fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	callRuntime := speech.NewRuntime(speech.Piper{Model: model}, speech.Whisper{Binary: whisper, Model: model}, dir)
+	lease := callRuntime.Activate()
+	defer lease.Release()
+	// The recorder's own runtime is deliberately never activated: its
+	// sttReady stays nil for the whole test.
+	recorder := &VoiceRecorder{
+		Runtime: speech.NewRuntime(speech.Piper{Model: model}, speech.Whisper{Binary: whisper, Model: model}, dir),
+		Binary:  converter,
+		Dir:     dir,
+		Whisper: speech.Whisper{Binary: whisper, Model: model},
+	}
+	stop := make(chan struct{})
+	close(stop)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	text, err := recorder.RecordAndTranscribeUntil(ctx, callRuntime, raw, 0, stop)
+	if err != nil {
+		t.Fatalf("RecordAndTranscribeUntil error=%v", err)
+	}
+	if text != "recognized text" {
+		t.Fatalf("text=%q, want recognized text", text)
 	}
 }

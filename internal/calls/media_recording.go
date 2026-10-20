@@ -50,26 +50,31 @@ func (r *VoiceRecorder) speechWindow() time.Duration {
 	return r.Window
 }
 
-func (r *VoiceRecorder) RecordAndTranscribe(ctx context.Context, rawPath string, offset int64) (string, error) {
-	return r.recordAndTranscribe(ctx, rawPath, offset, nil, nil)
+// RecordAndTranscribe captures and transcribes a segment. runtime is the
+// call's activated speech runtime; STT readiness (and Whisper) are read from
+// it, falling back to the recorder's own Runtime only when the caller has
+// none. Passing an unactivated runtime fails with "speech runtime is not
+// active" by design.
+func (r *VoiceRecorder) RecordAndTranscribe(ctx context.Context, runtime *speech.Runtime, rawPath string, offset int64) (string, error) {
+	return r.recordAndTranscribe(ctx, runtime, rawPath, offset, nil, nil)
 }
 
 // RecordAndTranscribeUntil captures until the caller signals stop, the
 // configured maximum window expires, or the context is cancelled. A stop
 // signal is a normal completion path; context cancellation remains an abort
 // path for call teardown and the # navigation key.
-func (r *VoiceRecorder) RecordAndTranscribeUntil(ctx context.Context, rawPath string, offset int64, stop <-chan struct{}) (string, error) {
-	return r.recordAndTranscribe(ctx, rawPath, offset, stop, nil)
+func (r *VoiceRecorder) RecordAndTranscribeUntil(ctx context.Context, runtime *speech.Runtime, rawPath string, offset int64, stop <-chan struct{}) (string, error) {
+	return r.recordAndTranscribe(ctx, runtime, rawPath, offset, stop, nil)
 }
 
 // RecordAndTranscribeUntilWithStatus calls afterCapture as soon as the captured
 // audio is complete and before conversion/transcription begins. Audio played
 // by the callback is excluded from the captured segment.
-func (r *VoiceRecorder) RecordAndTranscribeUntilWithStatus(ctx context.Context, rawPath string, offset int64, stop <-chan struct{}, afterCapture func()) (string, error) {
-	return r.recordAndTranscribe(ctx, rawPath, offset, stop, afterCapture)
+func (r *VoiceRecorder) RecordAndTranscribeUntilWithStatus(ctx context.Context, runtime *speech.Runtime, rawPath string, offset int64, stop <-chan struct{}, afterCapture func()) (string, error) {
+	return r.recordAndTranscribe(ctx, runtime, rawPath, offset, stop, afterCapture)
 }
 
-func (r *VoiceRecorder) recordAndTranscribe(ctx context.Context, rawPath string, offset int64, stop <-chan struct{}, afterCapture func()) (string, error) {
+func (r *VoiceRecorder) recordAndTranscribe(ctx context.Context, runtime *speech.Runtime, rawPath string, offset int64, stop <-chan struct{}, afterCapture func()) (string, error) {
 	if r == nil || rawPath == "" {
 		return "", fmt.Errorf("voice recorder is not configured")
 	}
@@ -160,12 +165,20 @@ func (r *VoiceRecorder) recordAndTranscribe(ctx context.Context, rawPath string,
 	if output, err := convert.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("recording conversion: %w: %s", err, strings.TrimSpace(string(output)))
 	}
+	// The call's activated runtime owns STT readiness. The recorder's own
+	// Runtime is only a fallback for callers without a per-call runtime (and
+	// for tests); with the runtime pool it is never activated, so waiting on
+	// it would fail with "speech runtime is not active" on every recording.
+	sttRuntime := runtime
+	if sttRuntime == nil {
+		sttRuntime = r.Runtime
+	}
 	whisper := r.Whisper
-	if r.Runtime != nil {
-		if err := r.Runtime.WaitWhisper(ctx); err != nil {
+	if sttRuntime != nil {
+		if err := sttRuntime.WaitWhisper(ctx); err != nil {
 			return "", err
 		}
-		whisper = r.Runtime.Whisper
+		whisper = sttRuntime.Whisper
 	}
 	return whisper.TranscribeAndRemove(ctx, wavPath)
 }
