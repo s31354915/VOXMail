@@ -469,6 +469,14 @@ tracks successfully transferred bytes in either direction. Active transfers can
 continue for any duration; this is not an overall initial-import deadline.
 Tunnel inactivity is recorded as a timeout in the sync outcome.
 
+Every mbsync invocation also carries an overall execution cap: five minutes for
+routine incremental runs and thirty minutes for initial imports,
+reconciliations, and manual syncs. The cap bounds the sync runner regardless of
+tunnel activity, so a stalled run is killed and its sync-run row is closed as
+failed instead of staying open. The tunnel joins its copy loops under a short
+grace period and force-terminates a copy that cannot be unblocked; TCP
+keepalives (15 s idle, 30 s interval) surface dead provider connections.
+
 After a failed or canceled sync, VOXMail indexes complete files already in
 Maildir `cur` and `new`, including when cancellation happens after downloading
 or during indexing. Incomplete files in `tmp` are ignored. Recovery uses a fresh
@@ -493,6 +501,14 @@ does not make every operation one-way. Authenticated web/phone actions such as
 read-state changes, moves, and Trash operations intentionally mutate the
 remote mailbox, and the next sync reconciles those remote changes into the
 local cache. Folder aliases are written as explicit local Maildir paths.
+
+Local destinations must be unique across remote folders: two remote folders
+cannot map to the same local name. The check runs when an account is saved and
+again when folders bind before each sync, and it reports the same conflicting
+folder on every run, so a deployed mapping that sends two remotes to `Trash`
+fails validation deterministically. Renaming a message into Trash strips any
+stale `,U=<uid>` component left from an earlier location, so the move cannot
+fabricate a UID the server never assigned.
 
 The synchronization worker treats provider hosts as untrusted user input in a
 multi-user deployment. Before mbsync starts, it resolves the IMAP hostname,
@@ -600,9 +616,11 @@ partial text. Playback streams PCM through its existing ten-minute byte cap.
 
 Piper synthesis and Whisper recognition each allow at most two minutes;
 FFmpeg recording conversion allows 30 seconds and playback allows ten minutes.
-A shorter caller deadline wins. mbsync intentionally has no default elapsed-time
-limit, so large initial imports can complete; an explicitly configured runner
-timeout and application/account/request cancellation still stop it.
+A shorter caller deadline wins. mbsync carries its own default elapsed-time
+cap: five minutes for incremental runs and thirty minutes for initial imports,
+reconciliations, and manual syncs, sized so large initial imports still
+complete. An explicitly configured runner timeout and
+application/account/request cancellation stop it sooner.
 
 On Linux, each child owns a process group. Cancellation kills that group, and
 the runner bounds inherited-pipe joins to 500 ms and terminates leftover helpers

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/voxmail/voxmail/internal/folderpolicy"
@@ -62,7 +63,22 @@ func validateFolderDestinationsTx(ctx context.Context, tx *sql.Tx, accountID str
 	for remote, local := range available {
 		occupied = append(occupied, binding{remote, local})
 	}
-	for remote, local := range available {
+	// Iterate deterministically so a colliding configuration reports the same
+	// conflicting folder on every run instead of whichever map iteration hit
+	// first.
+	keys := make([]string, 0, len(available))
+	for remote := range available {
+		keys = append(keys, remote)
+	}
+	sort.Strings(keys)
+	sort.Slice(occupied, func(i, j int) bool {
+		if occupied[i].remote != occupied[j].remote {
+			return occupied[i].remote < occupied[j].remote
+		}
+		return occupied[i].local < occupied[j].local
+	})
+	for _, remote := range keys {
+		local := available[remote]
 		key, destination := folderpolicy.RemoteKey(remote), strings.ToLower(filepathCleanFolder(local))
 		for _, existing := range occupied {
 			if folderpolicy.RemoteKey(existing.remote) != key && strings.ToLower(filepathCleanFolder(existing.local)) == destination {

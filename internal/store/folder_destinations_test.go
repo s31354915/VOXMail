@@ -115,3 +115,37 @@ func TestSyncDiscoveryCannotReuseAnOldAliasAsNewRemoteState(t *testing.T) {
 		t.Fatalf("owner's independent alias did not resolve collision: %v", err)
 	}
 }
+
+func TestFolderDestinationCollisionReportsSameFolderEveryRun(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "destinations.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.CreateUser(ctx, User{ID: "owner", Username: "owner", PasswordHash: "p", PINHash: "p", Role: "user", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	// A folder_map that maps two distinct remotes onto one local folder is
+	// invalid; the validator must name the same conflict on every sync run
+	// instead of whichever map iteration happened to hit first.
+	_, err = db.DB.Exec(`INSERT INTO accounts(id,user_id,canonical_name,email,sender_name,imap_host,imap_user,imap_password,smtp_host,smtp_user,smtp_password,folder_map,created_at)
+VALUES('a','owner','Mail','a@e.test','A','h','u','p','h','u','p','{"INBOX":"Inbox","Trash":"Trash","[Gmail]/Trash":"Trash"}','now')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var first string
+	for i := 0; i < 64; i++ {
+		err := db.BindSyncFolders(ctx, "owner", "a", 1)
+		if err == nil {
+			t.Fatal("colliding folder_map must fail destination validation")
+		}
+		if i == 0 {
+			first = err.Error()
+			continue
+		}
+		if err.Error() != first {
+			t.Fatalf("collision error changed between runs:\nfirst:  %s\nlater:  %s", first, err.Error())
+		}
+	}
+}

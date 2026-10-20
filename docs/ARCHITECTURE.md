@@ -101,7 +101,7 @@ The bundled fallback WAVs are regenerated with that same pronunciation policy.
 At startup VOXMail compares prompt text, model name, model and configuration
 sidecar digests, and Piper synthesis options (including speech speed). A
 matching manifest returns without touching Piper, so ordinary idle startup
-does not warm speech resources. If the configured model exists but differs,
+does not regenerate speech resources. If the configured model exists but differs,
 all fixed recordings are generated in a private staging directory and replaced only
 after all succeed; the manifest is written last. If the replacement model is
 unavailable, the shipped recordings remain usable and a warning is logged.
@@ -112,7 +112,13 @@ runtime, so a web voice setting is not silently ignored.
 
 ## Call-scoped model lifecycle
 
-No Piper worker or Whisper warmup starts merely because the service is running.
+One voice engine stays resident: the configured default voice is kept warm from
+startup, so its prompts never wait on a cold model load, and the web console
+can pin additional installed voices keep-warm. Other voices load on demand when
+a call selects them and unload when the last call using them ends. The resident
+engine applies speech rate per request, so one loaded model serves any menu
+speed.
+
 After a caller passes admission and the call is answered:
 
 1. VOXMail acquires a runtime keyed by voice model and menu speed.
@@ -123,12 +129,21 @@ After a caller passes admission and the call is answered:
 5. The fixed post-PIN menu can play from static audio; dynamic prompts wait on
    the ready signal and then use the resident Piper worker.
 6. Concurrent calls with the same key share the warm runtime.
-7. When the final lease releases, the Piper process closes, the warmup context
-   is cancelled, and call-scoped temporary files are removed.
+7. When the final lease releases, the Piper process closes unless the voice is
+   the resident default or pinned keep-warm, the warmup context is cancelled,
+   and call-scoped temporary files are removed.
 
-Whisper's CLI is invoked for transcription after the warm check. Caller
-recordings are bounded, private, and deleted after transcription, including
-failure paths.
+Whisper's CLI is invoked for transcription after the warm check. Its warm state
+is shared across the voice pool and independent of voice and speed: it is
+warmed once on the first pool activation, and each transcription runs as a
+fresh CLI invocation. The release image pins whisper-cli v1.9.5 through
+`WHISPER_REF`, which provides `--no-speech-thold` and `--suppress-nst`.
+Transcription is invoked with `-l en`, `--no-timestamps`, `--no-fallback`,
+`--no-speech-thold 0.80`, `--suppress-nst`, `--no-prints`, a fixed English
+voicemail prompt, and the recording WAV as the final argument, keeping
+timecode tokens out of spoken output and non-speech tokens out of transcripts.
+Caller recordings are bounded, private, and deleted after transcription,
+including failure paths.
 
 ## Outbound alert calls
 
