@@ -18,6 +18,10 @@ type MultiTap struct {
 	// notice for the current overflow, so the notice is not repeated for
 	// every swallowed key.
 	OverflowPrompted bool
+	// StarArmed records that the previous key was star, so a second star
+	// backspaces. A single star never deletes: it commits a pending
+	// character, and with nothing pending it does nothing.
+	StarArmed bool
 }
 
 type Mode int
@@ -53,20 +57,27 @@ func NewWithLimit(mode Mode, maxRunes int) *MultiTap {
 }
 
 // Press consumes one DTMF key. It returns committed text, if any, and whether
-// the field is complete. A single star commits; two stars backspace.
+// the field is complete. A single star commits a pending character and never
+// deletes; two stars in a row backspace one character.
 func (m *MultiTap) Press(key byte) (committed string, done bool) {
 	switch key {
 	case '*':
-		if m.PendingKey == 0 {
+		if m.StarArmed {
+			m.StarArmed = false
 			m.Text = backspace(m.Text)
 			m.Overflowed = false
 			m.OverflowPrompted = false
 			return "", false
 		}
-		committed = m.appendCurrent()
-		m.PendingKey, m.Presses = 0, 0
+		var committed string
+		if m.PendingKey != 0 {
+			committed = m.appendCurrent()
+			m.PendingKey, m.Presses = 0, 0
+		}
+		m.StarArmed = true
 		return committed, false
 	case '#':
+		m.StarArmed = false
 		if m.PendingKey != 0 {
 			committed = m.appendCurrent()
 			m.PendingKey, m.Presses = 0, 0
@@ -79,6 +90,7 @@ func (m *MultiTap) Press(key byte) (committed string, done bool) {
 	if _, ok := groups[key]; !ok {
 		return "", false
 	}
+	m.StarArmed = false
 	if m.PendingKey != key {
 		if m.PendingKey != 0 {
 			if m.appendCurrent() == "" && m.Overflowed {

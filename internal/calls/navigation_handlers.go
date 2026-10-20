@@ -54,7 +54,7 @@ func (s *Service) openMessages(sess *session, unreadOnly bool, description strin
 
 func (s *Service) handleAccountMenu(sess *session, key string) {
 	if key < "1" || key > "9" {
-		s.prompt(sess, "That key is not available here. Press pound to go back.")
+		s.prompt(sess, "That key is not available here. Press pound to go back. "+s.promptForState(sess))
 		return
 	}
 	s.mu.Lock()
@@ -67,7 +67,7 @@ func (s *Service) handleAccountMenu(sess *session, key string) {
 			s.prompt(sess, "Email. Press 0 for all unread mail. "+accountPrompt(accounts, page))
 		} else {
 			s.mu.Unlock()
-			s.prompt(sess, "There are no more accounts. Press pound to go back.")
+			s.prompt(sess, "There are no more accounts. Press pound to go back. "+s.promptForState(sess))
 		}
 		return
 	}
@@ -75,7 +75,7 @@ func (s *Service) handleAccountMenu(sess *session, key string) {
 	index := page*8 + int(key[0]-'1')
 	if index >= len(sess.Accounts) {
 		s.mu.Unlock()
-		s.prompt(sess, "There is no account for that key. Press pound to go back.")
+		s.prompt(sess, "There is no account for that key. Press pound to go back. "+s.promptForState(sess))
 		return
 	}
 	account := sess.Accounts[index]
@@ -239,7 +239,7 @@ func (s *Service) handleAttachmentEdit(sess *session, key string) {
 		sess.PendingAttachmentRemove = false
 		count = len(sess.Draft.Attachments)
 		s.mu.Unlock()
-		s.prompt(sess, fmt.Sprintf("The last attachment was removed. %d attachments remain. Press 1 to add one, or pound to return.", count))
+		s.prompt(sess, fmt.Sprintf("The last attachment was removed. %d attachments remain. Press 1 to add one, or pound to return. ", count)+menuPrompt("attachment_edit"))
 	}
 }
 
@@ -309,14 +309,24 @@ func (s *Service) handleDraftList(sess *session, key string) {
 		return
 	}
 	if key < "1" || key > "8" {
+		s.mu.Lock()
+		hasDrafts := len(sess.Drafts) > 0
+		s.mu.Unlock()
 		s.prompt(sess, "That key is not available here. Press pound to go back.")
+		if hasDrafts {
+			s.promptDraftList(sess)
+		}
 		return
 	}
 	s.mu.Lock()
 	index := sess.DraftPage*8 + int(key[0]-'1')
 	if index < 0 || index >= len(sess.Drafts) {
+		hasDrafts := len(sess.Drafts) > 0
 		s.mu.Unlock()
 		s.prompt(sess, "There is no saved draft for that key. Press pound to go back.")
+		if hasDrafts {
+			s.promptDraftList(sess)
+		}
 		return
 	}
 	draftRecord := sess.Drafts[index]
@@ -534,11 +544,13 @@ func (s *Service) handleAccountAlertFolders(sess *session, key string) {
 			s.promptAccountAlertFolders(sess)
 		} else {
 			s.prompt(sess, "There are no more folders. Press pound when finished.")
+			s.promptAccountAlertFolders(sess)
 		}
 		return
 	}
 	if key < "1" || key > "8" {
 		s.prompt(sess, "That key is not available here. Press pound when finished.")
+		s.promptAccountAlertFolders(sess)
 		return
 	}
 	s.mu.Lock()
@@ -546,6 +558,7 @@ func (s *Service) handleAccountAlertFolders(sess *session, key string) {
 	if index < 0 || index >= len(sess.AlertFolders) {
 		s.mu.Unlock()
 		s.prompt(sess, "There is no folder for that key. Press pound when finished.")
+		s.promptAccountAlertFolders(sess)
 		return
 	}
 	folder := sess.AlertFolders[index]
@@ -649,7 +662,7 @@ func (s *Service) refreshAccount(sess *session, accountID string) {
 		if currentState == "account_menu" && refreshed.ID != "" {
 			s.prompt(sess, "The account refresh finished. "+s.accountMenuPrompt(sess, refreshed))
 		} else {
-			s.prompt(sess, "The account refresh finished.")
+			s.prompt(sess, "The account refresh finished. "+s.promptForState(sess))
 		}
 	})
 }
@@ -763,7 +776,7 @@ func (s *Service) handleFolderMenu(sess *session, key string) {
 			s.mu.Unlock()
 			s.prompt(sess, folderPromptFor(account, folders, rolePaths, prefix, page, labels))
 		} else {
-			s.prompt(sess, "There are no more folders. Press pound to go back.")
+			s.prompt(sess, "There are no more folders. Press pound to go back. "+s.promptForState(sess))
 		}
 		return
 	}
@@ -781,7 +794,7 @@ func (s *Service) handleFolderMenu(sess *session, key string) {
 		return
 	}
 	if key < "1" || key > "8" {
-		s.prompt(sess, "That key is not available here. Press pound to go back.")
+		s.prompt(sess, "That key is not available here. Press pound to go back. "+s.promptForState(sess))
 		return
 	}
 	index := page*8 + int(key[0]-'1')
@@ -796,7 +809,7 @@ func (s *Service) handleFolderMenu(sess *session, key string) {
 		}
 	}
 	if index < 0 || index >= len(children) {
-		s.prompt(sess, "There is no folder for that key. Press pound to go back.")
+		s.prompt(sess, "There is no folder for that key. Press pound to go back. "+s.promptForState(sess))
 		return
 	}
 	s.mu.Lock()
@@ -824,6 +837,7 @@ func (s *Service) handleFolderAction(sess *session, key string) {
 	}
 	s.mu.Unlock()
 	if folder == "" {
+		s.prompt(sess, "No folder is selected. Press pound to go back.")
 		return
 	}
 	switch key {
@@ -913,7 +927,7 @@ func (s *Service) openContacts(sess *session) {
 
 func (s *Service) handleContactMenu(sess *session, key string) {
 	if key < "1" || key > "9" {
-		s.prompt(sess, "That key is not available here. Press pound to go back.")
+		s.prompt(sess, "That key is not available here. Press pound to go back. "+s.promptForState(sess))
 		return
 	}
 	s.mu.Lock()
@@ -926,7 +940,7 @@ func (s *Service) handleContactMenu(sess *session, key string) {
 			s.prompt(sess, contactPrompt(contacts, page))
 		} else {
 			s.mu.Unlock()
-			s.prompt(sess, "There are no more contacts. Press pound to go back.")
+			s.prompt(sess, "There are no more contacts. Press pound to go back. "+s.promptForState(sess))
 		}
 		return
 	}
@@ -934,7 +948,7 @@ func (s *Service) handleContactMenu(sess *session, key string) {
 	index := page*8 + int(key[0]-'1')
 	if index >= len(sess.Contacts) {
 		s.mu.Unlock()
-		s.prompt(sess, "There is no contact for that key. Press pound to go back.")
+		s.prompt(sess, "There is no contact for that key. Press pound to go back. "+s.promptForState(sess))
 		return
 	}
 	contact := sess.Contacts[index]

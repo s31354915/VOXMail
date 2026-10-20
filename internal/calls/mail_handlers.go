@@ -377,6 +377,7 @@ func (s *Service) moveCurrent(sess *session, destination string) {
 	s.mu.Lock()
 	if sess.Cursor < 0 || sess.Cursor >= len(sess.Messages) {
 		s.mu.Unlock()
+		s.prompt(sess, "That message is no longer available. Press pound to return.")
 		return
 	}
 	message := sess.Messages[sess.Cursor]
@@ -434,7 +435,7 @@ func (s *Service) moveCurrent(sess *session, destination string) {
 	sess.Messages[sess.Cursor].Path = target
 	transitionLocked(sess, "read")
 	s.mu.Unlock()
-	s.prompt(sess, "Message moved.")
+	s.prompt(sess, "Message moved. "+s.promptForState(sess))
 }
 
 func (s *Service) toggleRead(sess *session, message store.MailSummary) {
@@ -448,9 +449,9 @@ func (s *Service) toggleRead(sess *session, message store.MailSummary) {
 		s.updateSessionMessagePath(sess, message.ID, localPath)
 	}
 	if read {
-		s.prompt(sess, "The message is marked read.")
+		s.prompt(sess, "The message is marked read. "+s.promptForState(sess))
 	} else {
-		s.prompt(sess, "The message is marked unread.")
+		s.prompt(sess, "The message is marked unread. "+s.promptForState(sess))
 	}
 }
 
@@ -603,6 +604,7 @@ func (s *Service) deleteCurrent(sess *session) {
 	s.mu.Lock()
 	if len(sess.Messages) == 0 {
 		s.mu.Unlock()
+		s.prompt(sess, "There are no messages here. Press pound to go back.")
 		return
 	}
 	m := sess.Messages[sess.Cursor]
@@ -711,7 +713,7 @@ func (s *Service) deleteCurrent(sess *session) {
 	transitionLocked(sess, "list")
 	s.mu.Unlock()
 	if err == nil {
-		s.prompt(sess, "Moved to trash.")
+		s.prompt(sess, "Moved to trash. "+s.promptForState(sess))
 	} else {
 		s.prompt(sess, "I could not delete that message.")
 	}
@@ -881,7 +883,7 @@ func (s *Service) sendDraft(sess *session) {
 	s.mu.Lock()
 	transitionLocked(sess, "main")
 	s.mu.Unlock()
-	s.prompt(sess, "Message sent.")
+	s.prompt(sess, "Message sent. "+s.promptForState(sess))
 }
 
 func (s *Service) saveDraft(sess *session) {
@@ -1012,11 +1014,11 @@ func (s *Service) saveDraft(sess *session) {
 	transitionLocked(sess, "main")
 	s.mu.Unlock()
 	if remoteSaved {
-		s.prompt(sess, "Draft saved to the remote Drafts folder.")
+		s.prompt(sess, "Draft saved to the remote Drafts folder. "+s.promptForState(sess))
 	} else if remoteAppendSkipped {
-		s.prompt(sess, "Draft saved locally. Its remote Drafts copy is an initial snapshot; later edits remain local.")
+		s.prompt(sess, "Draft saved locally. Its remote Drafts copy is an initial snapshot; later edits remain local. "+s.promptForState(sess))
 	} else {
-		s.prompt(sess, "Draft saved locally. Map a Drafts folder and check the account connection to upload it remotely.")
+		s.prompt(sess, "Draft saved locally. Map a Drafts folder and check the account connection to upload it remotely. "+s.promptForState(sess))
 	}
 }
 
