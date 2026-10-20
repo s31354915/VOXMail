@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"github.com/voxmail/voxmail/internal/maintenance"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -337,6 +338,9 @@ type Runtime struct {
 	Dir         string
 	Speed       int
 	Fingerprint string
+	// Log, when nil, falls back to the default slog logger for the
+	// lifecycle diagnostics below.
+	Log *slog.Logger
 
 	mu       sync.Mutex
 	refs     int
@@ -662,7 +666,19 @@ func (r *Runtime) WaitTTS(ctx context.Context) error {
 
 // WaitWhisper waits only for Whisper readiness.
 func (r *Runtime) WaitWhisper(ctx context.Context) error {
-	return r.waitCapability(ctx, func(runtime *Runtime) *capabilityReady { return runtime.sttReady })
+	err := r.waitCapability(ctx, func(runtime *Runtime) *capabilityReady { return runtime.sttReady })
+	if err != nil {
+		r.log().Warn("whisper is unavailable", "error", err)
+	}
+	return err
+}
+
+// log returns the runtime's logger, or the default when none is set.
+func (r *Runtime) log() *slog.Logger {
+	if r.Log != nil {
+		return r.Log
+	}
+	return slog.Default()
 }
 
 func (r *Runtime) waitCapability(ctx context.Context, selectReady func(*Runtime) *capabilityReady) error {
@@ -741,6 +757,7 @@ func (l *Lease) Release() {
 			release := r.workerRelease
 			r.worker = nil
 			r.mu.Unlock()
+			r.log().Warn("speech runtime references dropped to zero; tearing down engines", "fingerprint", r.Fingerprint)
 			// A pool-shared worker is released through the pool's registry,
 			// which keeps the process alive while any runtime still uses it;
 			// closing it here would kill a model another call is using.
