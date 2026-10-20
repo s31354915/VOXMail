@@ -22,7 +22,16 @@ const connectTimeout = 30 * time.Second
 // Bound silence, not the total duration of a large initial download.
 const idleTimeout = 5 * time.Minute
 
+// pumpGrace bounds the join loop after teardown begins. Closing a descriptor
+// does not reliably interrupt a blocked read on every pipe/socketpair shape
+// (observed as mbsync's stdin staying blocked while the socket side was
+// already gone), so the watchdog must never depend on the pumps exiting.
+// When the grace expires the caller force-terminates the process; exit closes
+// every descriptor and mbsync's poll on the socketpair finally sees EOF.
+var pumpGrace = 2 * time.Second
+
 var errIdleTimeout = errors.New("IMAP tunnel inactivity timeout")
+var errForceTerminate = errors.New("IMAP tunnel teardown: pumps could not be interrupted, forcing exit")
 
 func main() {
 	if len(os.Args) != 2 {
@@ -37,6 +46,14 @@ func main() {
 		os.Exit(1)
 	}
 	defer conn.Close()
+	// Keepalive probes detect a silently dropped middlebox path while the
+	// process itself looks healthy; without them the socket only fails on
+	// the next write, which mbsync may not perform for a long time.
+	if tc, ok := conn.(*net.TCPConn); ok {
+		if err := tc.SetKeepAliveConfig(net.KeepAliveConfig{Enable: true, Idle: 15 * time.Second, Interval: 30 * time.Second}); err != nil {
+			fmt.Fprintf(os.Stderr, "keepalive: %v\n", err)
+		}
+	}
 	if err := proxy(conn, os.Stdin, os.Stdout); err != nil {
 		fmt.Fprintf(os.Stderr, "proxy: %v\n", err)
 		os.Exit(1)
@@ -67,6 +84,9 @@ wait:
 		case <-timer.C:
 			remaining := tracked.remaining(idle)
 			if remaining <= 0 {
+				// A past deadline unblocks a blocked socket read even when
+				// Close alone cannot.
+				_ = tracked.SetReadDeadline(time.Now())
 				first = errIdleTimeout
 				break wait
 			}
@@ -78,11 +98,20 @@ wait:
 	_ = conn.Close()
 	_ = input.Close()
 	_ = output.Close()
+	graceTimer := time.NewTimer(pumpGrace)
+	defer graceTimer.Stop()
 	for completed < 2 {
-		err := <-results
-		completed++
-		if first == nil || isClosedNetworkError(first) {
-			first = err
+		select {
+		case err := <-results:
+			completed++
+			if first == nil || isClosedNetworkError(first) {
+				first = err
+			}
+		case <-graceTimer.C:
+			// One pump survived teardown and Close could not interrupt it.
+			// Waiting longer reproduces the indefinite deadlock; returning
+			// the sentinel lets main exit non-zero and release everything.
+			return errForceTerminate
 		}
 	}
 	if isClosedNetworkError(first) {

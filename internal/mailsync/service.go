@@ -32,6 +32,30 @@ var ErrSyncCapacity = errors.New("manual synchronization capacity is full")
 
 const maxManualSyncJobs = 8
 
+// Defaults for the mbsync hard caps. Five minutes bounds an incremental pass;
+// initial, reconciliation, and manual runs may legitimately need far longer,
+// but every kind is still bounded so a stuck child cannot block forever.
+const (
+	defaultSyncTimeout        = 5 * time.Minute
+	defaultInitialSyncTimeout = 30 * time.Minute
+)
+
+// runTimeout returns the hard execution cap for one mbsync invocation of the
+// given kind. A run that exceeds it is killed and recorded as failed rather
+// than left open indefinitely.
+func (s *Service) runTimeout(kind string) time.Duration {
+	if kind == "initial" || kind == "reconciliation" || kind == "manual" {
+		if s.InitialSyncTimeout > 0 {
+			return s.InitialSyncTimeout
+		}
+		return defaultInitialSyncTimeout
+	}
+	if s.SyncTimeout > 0 {
+		return s.SyncTimeout
+	}
+	return defaultSyncTimeout
+}
+
 type Service struct {
 	manualWG    sync.WaitGroup
 	manualSlots chan struct{}
@@ -44,6 +68,12 @@ type Service struct {
 	Log            *slog.Logger
 	Index          *mailindex.Indexer
 	Secrets        *secret.Box
+	// SyncTimeout hard-caps one incremental mbsync invocation so a hung
+	// tunnel or child can never block future runs. Initial, reconciliation,
+	// and manual runs legitimately walk whole mailboxes, so they use
+	// InitialSyncTimeout instead. Zero falls back to the package defaults.
+	SyncTimeout        time.Duration
+	InitialSyncTimeout time.Duration
 	// EndpointResolver is required in production before mbsync is launched. It
 	// must return the exact numeric address that was policy-checked and dialed;
 	// the generated mbsync tunnel then uses that address without re-resolving
@@ -565,7 +595,12 @@ func (s *Service) syncAccountStarted(ctx context.Context, account store.Account,
 	if err != nil {
 		return fmt.Errorf("snapshot queued mail mutations: %w", err)
 	}
-	result, err := s.Runner.SyncChannels(ctx, configPath, channels...)
+	// Hard-cap the child process: a tunnel that never returns EOF previously
+	// wedged the whole run, keeping sync_runs open and starving the outbound
+	// alert pipeline of a completed sync.
+	runCtx, runCancel := context.WithTimeout(ctx, s.runTimeout(kind))
+	defer runCancel()
+	result, err := s.Runner.SyncChannels(runCtx, configPath, channels...)
 	if err != nil {
 		return err
 	}

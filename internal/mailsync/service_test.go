@@ -11,6 +11,7 @@ import (
 
 	remoteimap "github.com/voxmail/voxmail/internal/imap"
 	"github.com/voxmail/voxmail/internal/mailindex"
+	"github.com/voxmail/voxmail/internal/operation"
 	"github.com/voxmail/voxmail/internal/secret"
 	"github.com/voxmail/voxmail/internal/store"
 )
@@ -599,6 +600,71 @@ func TestSyncRefusesStaleFolderConfigurationBeforeLaunchingRunner(t *testing.T) 
 	}
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatalf("fresh runner did not launch: %v", err)
+	}
+}
+
+// A mbsync child that never exits used to wedge the run goroutine: the
+// deferred FinishSyncRun only runs when syncAccountStarted returns, so the
+// sync_runs row stayed open indefinitely and the outbound alert pipeline,
+// which needs a completed run, starved. The hard cap must kill the child and
+// still finish the row as a failed run.
+func TestSyncHardTimeoutKillsStuckRunnerAndFinishesRun(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "timeout.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.CreateUser(ctx, store.User{ID: "timeout-user", Username: "timeout-user", PasswordHash: "p", PINHash: "p", Role: "user", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	box, err := secret.New("sync-test-key-with-more-than-32-characters-123456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := store.Account{ID: "timeout-account", UserID: "timeout-user", CanonicalName: "Mail", Email: "timeout@example.test", SenderName: "Owner", IMAPHost: "imap.example", IMAPUser: "owner", IMAPPassword: "p", SMTPHost: "smtp.example", SMTPUser: "owner", SMTPPassword: "p", FolderMap: `{}`}
+	if err := db.SaveAccount(ctx, box, account); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := db.ListAccounts(ctx, "timeout-user")
+	if err != nil || len(snapshot) != 1 {
+		t.Fatalf("snapshot: %+v %v", snapshot, err)
+	}
+	binary := filepath.Join(t.TempDir(), "mbsync")
+	script := "#!/bin/sh\nsleep 600\n"
+	if err := os.WriteFile(binary, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	service := &Service{
+		Store: db, Root: t.TempDir(),
+		Runner:             Runner{Binary: binary},
+		EndpointResolver:   func(context.Context, string, int) (string, error) { return "8.8.8.8:993", nil },
+		InitialSyncTimeout: 250 * time.Millisecond,
+	}
+	start := time.Now()
+	err = service.syncAccount(ctx, snapshot[0], "initial")
+	if err == nil {
+		t.Fatal("stuck runner did not fail the run")
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("hard cap did not bound the run: %v", elapsed)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want deadline exceeded", err)
+	}
+	run, runErr := db.LatestSyncRun(ctx, "timeout-account", false)
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	if run.Success || run.Error == "" || run.FinishedAt == "" {
+		t.Fatalf("stalled run not finished as failed: %+v", run)
+	}
+	if run.ErrorCategory != string(operation.Timeout) {
+		t.Fatalf("error category = %q, want timeout", run.ErrorCategory)
+	}
+	// The account must be free for the next run immediately.
+	if err := service.syncAccount(ctx, snapshot[0], "initial"); err == nil {
+		t.Fatal("second run should also hit the hard cap, not report success")
 	}
 }
 

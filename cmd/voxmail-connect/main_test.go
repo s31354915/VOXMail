@@ -160,6 +160,45 @@ func fmtDirection(outbound bool) string {
 	return "server-to-client"
 }
 
+// A pump that ignores Close reproduces the reported deadlock shape: the join
+// loop used to wait forever on the stdin pump after the idle watchdog tore
+// everything down, so the process never exited and mbsync never saw EOF.
+type stuckReadCloser struct{}
+
+func (stuckReadCloser) Read(p []byte) (int, error) {
+	<-make(chan struct{})
+	return 0, io.EOF
+}
+
+func (stuckReadCloser) Close() error { return nil }
+
+func TestProxyForceTerminatesWhenStdinPumpCannotBeUnblocked(t *testing.T) {
+	original := pumpGrace
+	pumpGrace = 150 * time.Millisecond
+	t.Cleanup(func() { pumpGrace = original })
+	local, peer := net.Pipe()
+	defer peer.Close()
+	done := make(chan error, 1)
+	go func() {
+		done <- proxyWithTimeout(local, stuckReadCloser{}, bufferCloser{new(bytes.Buffer)}, 50*time.Millisecond)
+	}()
+	if err := awaitProxy(t, done); !errors.Is(err, errForceTerminate) {
+		t.Fatalf("error = %v, want errForceTerminate", err)
+	}
+}
+
+func TestProxyForceTerminateIsNeverReturnedWhenPumpsFinish(t *testing.T) {
+	local, peer := net.Pipe()
+	defer peer.Close()
+	input, writer := io.Pipe()
+	defer writer.Close()
+	done := make(chan error, 1)
+	go func() { done <- proxyWithTimeout(local, input, bufferCloser{new(bytes.Buffer)}, 50*time.Millisecond) }()
+	if err := awaitProxy(t, done); !errors.Is(err, errIdleTimeout) {
+		t.Fatalf("error = %v, want errIdleTimeout", err)
+	}
+}
+
 func TestProxyTCPHalfCloseUnblocksStdin(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
