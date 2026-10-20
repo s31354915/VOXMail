@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/voxmail/voxmail/internal/mailparse"
@@ -127,8 +128,12 @@ func (i Indexer) index(ctx context.Context, accountID, root string, purge bool) 
 			return i.record(ctx, accountID, scanID, recovered)
 		}
 		// The message is only "skipped" once every recovery option is
-		// exhausted, so the warning names files the index truly lost.
-		logger.Warn("mail index skipped malformed message", "account_id", accountID, "path", path, "error", parseErr)
+		// exhausted, so the warning names files the index truly lost. A
+		// damaged file re-logs this on every scan cycle, so warn once per
+		// path until the dedup map recycles.
+		if noteIndexSkip(accountID, path) {
+			logger.Warn("mail index skipped malformed message", "account_id", accountID, "path", path, "error", parseErr)
+		}
 		return nil
 	})
 	if err != nil {
@@ -214,4 +219,26 @@ func underRoot(path, root string) bool {
 		return true
 	}
 	return filepath.Clean(path) == root
+}
+
+var (
+	indexSkipWarnMu   sync.Mutex
+	indexSkipWarnSeen = map[string]struct{}{}
+)
+
+// noteIndexSkip returns true the first time a given malformed file is
+// reported for an account, so a permanently damaged file warns once instead
+// of once per scan cycle. The map recycles when it grows large.
+func noteIndexSkip(accountID, path string) bool {
+	indexSkipWarnMu.Lock()
+	defer indexSkipWarnMu.Unlock()
+	key := accountID + "\x00" + path
+	if _, ok := indexSkipWarnSeen[key]; ok {
+		return false
+	}
+	if len(indexSkipWarnSeen) >= 4096 {
+		indexSkipWarnSeen = map[string]struct{}{}
+	}
+	indexSkipWarnSeen[key] = struct{}{}
+	return true
 }

@@ -351,3 +351,15 @@ func TestIndexUnrecoverableMessageWarnsSkipped(t *testing.T) {
 		t.Fatal("oversize message was indexed despite failed recovery")
 	}
 }
+
+func TestNoteIndexSkipWarnsOncePerPath(t *testing.T) {
+	if !noteIndexSkip("acct", "/mail/cur/damaged:2,S") {
+		t.Fatal("first report for a path should warn")
+	}
+	if noteIndexSkip("acct", "/mail/cur/damaged:2,S") {
+		t.Fatal("repeat report for the same path should stay silent")
+	}
+	if !noteIndexSkip("other", "/mail/cur/damaged:2,S") {
+		t.Fatal("a different account should warn again")
+	}
+}

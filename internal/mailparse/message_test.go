@@ -146,3 +146,64 @@ func TestScanPreservesNestedFolderPath(t *testing.T) {
 		t.Fatalf("unexpected nested folder result: %+v", messages)
 	}
 }
+
+func TestParseLenientKeepsTruncatedAttachment(t *testing.T) {
+	// A truncated base64 attachment (partially written message file, no
+	// closing MIME boundary) previously made the strict parse fail with
+	// "decode MIME attachment: unexpected EOF" and made the lenient
+	// recovery drop the part entirely. The recovery must keep the decoded
+	// prefix so the mail still indexes with its attachment.
+	raw := "From: Ada <ada@example.com>\r\n" +
+		"Content-Type: multipart/mixed; boundary=xyz\r\n\r\n" +
+		"--xyz\r\n" +
+		"Content-Type: text/plain\r\n\r\n" +
+		"body text\r\n" +
+		"--xyz\r\n" +
+		"Content-Type: application/pdf\r\n" +
+		"Content-Disposition: attachment; filename=doc.pdf\r\n" +
+		"Content-Transfer-Encoding: base64\r\n\r\n" +
+		"aGVsbG8gd29ybG"
+	m, err := ParseLenient(strings.NewReader(raw))
+	if err != nil {
+		t.Fatalf("lenient recovery should read a truncated attachment: %v", err)
+	}
+	if !strings.Contains(m.Text, "body text") {
+		t.Fatalf("body text lost: %q", m.Text)
+	}
+	if len(m.Attachments) != 1 {
+		t.Fatalf("expected the partial attachment to survive, got %+v", m.Attachments)
+	}
+	if got := string(m.Attachments[0].Data); got != "hello wor" {
+		t.Fatalf("unexpected partial attachment data %q", got)
+	}
+}
+
+func TestParseLenientKeepsCorruptedAttachment(t *testing.T) {
+	// When the closing boundary IS present but the base64 payload is
+	// corrupted (or cut mid-quantum before it), the strict parser fails on
+	// "illegal base64 data" and the lenient recovery pass must still read
+	// the message, keeping the decoded prefix instead of dropping the mail.
+	raw := "From: Ada <ada@example.com>\r\n" +
+		"Content-Type: multipart/mixed; boundary=xyz\r\n\r\n" +
+		"--xyz\r\n" +
+		"Content-Type: text/plain\r\n\r\n" +
+		"body text\r\n" +
+		"--xyz\r\n" +
+		"Content-Type: application/pdf\r\n" +
+		"Content-Disposition: attachment; filename=doc.pdf\r\n" +
+		"Content-Transfer-Encoding: base64\r\n\r\n" +
+		"aGVsbG8gd29ybG--xyz--\r\n"
+	if _, err := Parse(strings.NewReader(raw)); err == nil {
+		t.Fatal("strict parse should still report the corrupted attachment")
+	}
+	m, err := ParseLenient(strings.NewReader(raw))
+	if err != nil {
+		t.Fatalf("lenient parse should recover a corrupted attachment: %v", err)
+	}
+	if !strings.Contains(m.Text, "body text") {
+		t.Fatalf("body text lost: %q", m.Text)
+	}
+	if len(m.Attachments) != 1 {
+		t.Fatalf("expected the partial attachment to survive, got %+v", m.Attachments)
+	}
+}

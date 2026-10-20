@@ -158,7 +158,7 @@ func parsePart(header textproto.MIMEHeader, body io.Reader, budget *parseBudget,
 	// text attachments disappear from metadata.
 	isAttachment := filename != "" || strings.EqualFold(disposition, "attachment")
 	if isAttachment || (!strings.HasPrefix(mediaType, "text/") && !strings.HasPrefix(mediaType, "multipart/")) {
-		return readAttachment(header, reader, mediaType, disposition, filename, budget)
+		return readAttachment(header, reader, mediaType, disposition, filename, budget, lenient)
 	}
 
 	switch {
@@ -235,11 +235,11 @@ func parsePart(header textproto.MIMEHeader, body io.Reader, budget *parseBudget,
 		}
 		return text, nil, nil
 	default:
-		return readAttachment(header, reader, mediaType, disposition, filename, budget)
+		return readAttachment(header, reader, mediaType, disposition, filename, budget, lenient)
 	}
 }
 
-func readAttachment(header textproto.MIMEHeader, reader io.Reader, mediaType, disposition, filename string, budget *parseBudget) (string, []Attachment, error) {
+func readAttachment(header textproto.MIMEHeader, reader io.Reader, mediaType, disposition, filename string, budget *parseBudget, lenient bool) (string, []Attachment, error) {
 	if budget != nil {
 		if budget.count >= maxAttachments {
 			return "", nil, fmt.Errorf("%w: more than %d attachments", ErrAttachmentLimit, maxAttachments)
@@ -279,7 +279,21 @@ func readAttachment(header textproto.MIMEHeader, reader io.Reader, mediaType, di
 		size = int64(len(data))
 	}
 	if err != nil {
-		return "", nil, fmt.Errorf("decode MIME attachment: %w", err)
+		var corrupt base64.CorruptInputError
+		switch {
+		case errors.Is(err, io.ErrUnexpectedEOF):
+			// io.ErrUnexpectedEOF means a truncated base64/quoted-printable
+			// payload: a corrupt or partially written attachment. Keep the
+			// decoded prefix (the reader already returned what it decoded)
+			// instead of failing the whole message, so the rest of the mail
+			// still indexes.
+		case lenient && errors.As(err, &corrupt):
+			// The lenient recovery pass keeps a corrupted attachment's
+			// decoded prefix too; the strict pass still reports the
+			// corruption so the file stays flagged for repair.
+		default:
+			return "", nil, fmt.Errorf("decode MIME attachment: %w", err)
+		}
 	}
 	truncated := size > limit
 	if truncated {

@@ -8,6 +8,7 @@ import (
 	"net/mail"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -20,6 +21,11 @@ import (
 	"github.com/voxmail/voxmail/internal/speech"
 	"github.com/voxmail/voxmail/internal/store"
 )
+
+// trashUIDComponent matches the mbsync maildir UID tag (",U=<digits>") that
+// names the source mailbox's UID, which is meaningless inside another
+// mailbox's Maildir.
+var trashUIDComponent = regexp.MustCompile(",U=[0-9]+")
 
 func (s *Service) savePendingContact(sess *session) {
 	s.mu.Lock()
@@ -675,14 +681,26 @@ func (s *Service) deleteCurrent(sess *session) {
 		s.prompt(sess, "I could not delete that message.")
 		return
 	}
-	target := filepath.Join(trash, filepath.Base(source))
+	// mbsync tags maildir filenames with ",U=<uid>" from the mailbox the
+	// message came from. A local Trash mirror shares neither UIDVALIDITY nor
+	// the assigned-UID high-water mark of that source mailbox, so carrying
+	// the component over makes mbsync reject the file ("UID n is beyond
+	// highest assigned UID m") and fail the whole sync. Drop it and let
+	// mbsync assign a fresh Trash-side UID.
+	base := trashUIDComponent.ReplaceAllString(filepath.Base(source), "")
+	target := filepath.Join(trash, base)
 	if !strings.Contains(target, ":2,") {
 		target += ":2,S"
 	}
 	err := os.Rename(source, target)
 	if err == nil {
-		if indexErr := s.Store.DeleteMailIndex(s.baseContext(), sess.UserID, m.ID); indexErr != nil {
-			err = indexErr
+		// Journal the delete before the index row disappears:
+		// RecordMessageMutation joins mail_messages, so removing the row
+		// first made every successful phone delete log
+		// "could not record mail mutation: message was not found for user".
+		s.recordMutation(sess, m, "delete", m.Folder, trashName, "success", nil)
+		if indexErr := s.Store.DeleteMailIndex(s.baseContext(), sess.UserID, m.ID); indexErr != nil && s.Log != nil {
+			s.Log.Warn("could not remove deleted message from index", "message_id", m.ID, "error", indexErr)
 		}
 	}
 	if err != nil {
@@ -691,8 +709,6 @@ func (s *Service) deleteCurrent(sess *session) {
 		}
 		_ = s.rollbackRemoteMove(sess, m, trashName, m.Folder)
 		s.recordMutation(sess, m, "delete", m.Folder, trashName, "partial", err)
-	} else {
-		s.recordMutation(sess, m, "delete", m.Folder, trashName, "success", nil)
 	}
 	s.mu.Lock()
 	if err == nil {
