@@ -20,7 +20,7 @@ func TestWhisperWarmFeedsSixteenKilohertzWAV(t *testing.T) {
 	}
 	fakeWhisper := filepath.Join(dir, "whisper")
 	captured := filepath.Join(dir, "captured.wav")
-	script := "#!/bin/sh\ncp \"$4\" " + captured + "\n"
+	script := "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"-f\" ]; then cp \"$a\" " + captured + "; fi\n  prev=\"$a\"\ndone\n"
 	if err := os.WriteFile(fakeWhisper, []byte(script), 0700); err != nil {
 		t.Fatal(err)
 	}

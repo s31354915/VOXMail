@@ -56,9 +56,11 @@ RUN --mount=type=cache,id=bare-baresip-source-${BARESIP_REF}-${TARGETARCH},targe
     printf 'requested=%s\ncommit=%s\narchitecture=%s\n' "${BARESIP_REF}" "$(git -C /src/baresip rev-parse HEAD)" "${TARGETARCH}" > /out/provenance/baresip.txt
 
 FROM debian:bookworm@sha256:2c037a04925515fdd6ea85ea14a682d0e79931f5e9f5d07b6dbfc6ba12f9e858 AS whisper-build
-# v1.7.1 tag resolved on 2026-09-24; callers may override with another
+# v1.9.5 tag resolved on 2026-10-20; callers may override with another
 # immutable commit or a reviewed tag when intentionally updating whisper.cpp.
-ARG WHISPER_REF=ebca09a3d1033417b0c630bbbe607b0f185b1488
+# v1.9.5 is required for the transcription flags in engines.go: the cli
+# binary gained --no-speech-thold and --suppress-nst after v1.7.1.
+ARG WHISPER_REF=d1be6fde11ac6e0407606b4e42fe72d34add8037
 ARG TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git cmake make gcc g++ pkg-config && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
@@ -72,9 +74,9 @@ RUN --mount=type=cache,id=whisper-source-${WHISPER_REF}-${TARGETARCH},target=/sr
     git -C /src/whisper.cpp checkout --detach FETCH_HEAD; \
     git -C /src/whisper.cpp clean -ffd; \
     cmake -S /src/whisper.cpp -B /build/whisper -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_EXAMPLES=ON -DGGML_NATIVE=OFF; \
-    cmake --build /build/whisper --config Release -j"$(nproc)" --target main; \
+    cmake --build /build/whisper --config Release -j"$(nproc)" --target whisper-cli; \
     mkdir -p /out /out/provenance; \
-    cp /build/whisper/bin/main /out/whisper-cli; \
+    cp /build/whisper/bin/whisper-cli /out/whisper-cli; \
     if ldd /out/whisper-cli 2>&1 | grep -q 'not found'; then \
         echo 'whisper-cli has unresolved build-time dependencies' >&2; exit 1; \
     fi; \

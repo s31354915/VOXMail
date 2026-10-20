@@ -57,6 +57,17 @@ func (w Whisper) TranscribeAndRemove(ctx context.Context, wav string) (text stri
 	return w.Transcribe(ctx, wav)
 }
 
+const (
+	// whisperPrompt biases decoding toward English so auto-detection cannot
+	// drift to a random language on telephone hiss. Short, so it consumes
+	// only a few of the half-context prompt tokens whisper-cli allows.
+	whisperPrompt = "English voicemail transcription."
+	// whisperNoSpeechThreshold raises whisper's no-speech threshold above the
+	// 0.60 default: voicemail speech is close-mic'd and loud, so line hiss
+	// during pauses should decode as silence rather than hallucinated text.
+	whisperNoSpeechThreshold = "0.80"
+)
+
 func (w Whisper) Transcribe(ctx context.Context, wav string) (_ string, retErr error) {
 	stage, category := "settings", operation.Configuration
 	defer func() { retErr = operation.Wrap("whisper", stage, category, retErr) }()
@@ -69,7 +80,24 @@ func (w Whisper) Transcribe(ctx context.Context, wav string) (_ string, retErr e
 	if w.Model == "" {
 		return "", fmt.Errorf("whisper model is required")
 	}
-	args := []string{"-m", w.Model, "-f", wav, "--no-prints"}
+	// Telephone audio misbehaves in whisper's defaults: auto-detected
+	// language drifts to Welsh or Yiddish on line hiss, timestamps leak into
+	// stdout for Piper to read aloud, and quiet audio loops the same phrase
+	// until the context fills. Pin English, strip timestamps, disable
+	// temperature fallback, tighten the no-speech threshold, and suppress
+	// non-speech tokens. The wav stays the last argument: the test stubs read
+	// it to know which file to fabricate.
+	args := []string{
+		"-m", w.Model,
+		"-l", "en",
+		"--no-timestamps",
+		"--no-fallback",
+		"--no-speech-thold", whisperNoSpeechThreshold,
+		"--suppress-nst",
+		"--prompt", whisperPrompt,
+		"--no-prints",
+		"-f", wav,
+	}
 	stage, category = "transcribe", operation.Failed
 	command := process.New(ctx, "whisper", w.Binary, process.WhisperTimeout, args...)
 	stdout := process.NewBuffer(process.MaxOutput)
