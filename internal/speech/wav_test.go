@@ -188,7 +188,7 @@ func TestPiperWorkerUsesPinnedPlainTextCLIAndCloseCancels(t *testing.T) {
 	}
 	output := filepath.Join(t.TempDir(), "published.wav")
 	done := make(chan error, 1)
-	go func() { done <- worker.synthesize(context.Background(), "hello", output) }()
+	go func() { done <- worker.synthesize(context.Background(), "hello", output, 3) }()
 	time.Sleep(80 * time.Millisecond)
 	worker.close()
 	select {

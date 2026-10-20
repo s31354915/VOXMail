@@ -23,6 +23,8 @@ type Config struct {
 	STTModel             string
 	PiperBinary          string
 	PiperModel           string
+	PiperPython          string
+	PiperResident        bool
 	VoiceDir             string
 	RecordingsDir        string
 	GreetingPath         string
@@ -55,18 +57,24 @@ func Load() (Config, error) {
 		}
 	}
 	c := Config{
-		HTTPAddr:             env("VOXMAIL_HTTP_ADDR", "127.0.0.1:8080"),
-		OfflineMode:          offlineMode,
-		Verbose:              verbose,
-		DataDir:              dataDir,
-		DBPath:               env("VOXMAIL_DB_PATH", filepath.Join(dataDir, "sqlite", "voxmail.db")),
-		EncryptionKey:        os.Getenv("VOXMAIL_ENCRYPTION_KEY"),
-		ControlSocket:        env("VOXMAIL_CONTROL_SOCKET", filepath.Join(dataDir, "run", "baresip.sock")),
-		MaxCalls:             envInt("VOXMAIL_MAX_CALLS", 10),
-		STTBinary:            env("VOXMAIL_STT_BINARY", "whisper-cli"),
-		STTModel:             env("VOXMAIL_STT_MODEL", filepath.Join(dataDir, "whisper", "ggml-base.en.bin")),
-		PiperBinary:          env("VOXMAIL_PIPER_BINARY", "piper"),
-		PiperModel:           env("VOXMAIL_PIPER_MODEL", filepath.Join(dataDir, "voices", "en_US-hfc_male-medium.onnx")),
+		HTTPAddr:      env("VOXMAIL_HTTP_ADDR", "127.0.0.1:8080"),
+		OfflineMode:   offlineMode,
+		Verbose:       verbose,
+		DataDir:       dataDir,
+		DBPath:        env("VOXMAIL_DB_PATH", filepath.Join(dataDir, "sqlite", "voxmail.db")),
+		EncryptionKey: os.Getenv("VOXMAIL_ENCRYPTION_KEY"),
+		ControlSocket: env("VOXMAIL_CONTROL_SOCKET", filepath.Join(dataDir, "run", "baresip.sock")),
+		MaxCalls:      envInt("VOXMAIL_MAX_CALLS", 10),
+		STTBinary:     env("VOXMAIL_STT_BINARY", "whisper-cli"),
+		STTModel:      env("VOXMAIL_STT_MODEL", filepath.Join(dataDir, "whisper", "ggml-base.en.bin")),
+		PiperBinary:   env("VOXMAIL_PIPER_BINARY", "piper"),
+		PiperModel:    env("VOXMAIL_PIPER_MODEL", filepath.Join(dataDir, "voices", "en_US-hfc_male-medium.onnx")),
+		// PiperPython runs the resident Piper worker; PiperResident turns
+		// that engine off for debugging (VOXMAIL_PIPER_RESIDENT=0). An
+		// unparsable value keeps the engine on rather than blocking startup
+		// over a debugging flag.
+		PiperPython:          env("VOXMAIL_PIPER_PYTHON", "python3"),
+		PiperResident:        envBoolDefault("VOXMAIL_PIPER_RESIDENT", true),
 		VoiceDir:             env("VOXMAIL_VOICE_DIR", filepath.Join(dataDir, "voices")),
 		RecordingsDir:        env("VOXMAIL_RECORDINGS_DIR", filepath.Join(dataDir, "recordings")),
 		GreetingPath:         env("VOXMAIL_GREETING_PATH", filepath.Join(dataDir, "prompts", "welcome.wav")),
@@ -92,6 +100,20 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("VOXMAIL_ENCRYPTION_KEY must be at least 32 bytes")
 	}
 	return c, nil
+}
+
+// envBoolDefault parses a boolean environment variable, falling back to the
+// default when the variable is unset or unparsable.
+func envBoolDefault(key string, fallback bool) bool {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.ParseBool(raw)
+	if err != nil {
+		return fallback
+	}
+	return value
 }
 
 func envBool(key string) (bool, error) {

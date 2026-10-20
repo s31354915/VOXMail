@@ -369,3 +369,84 @@ func (s *Server) previewVoice(w http.ResponseWriter, r *http.Request) {
 	}
 	s.startPreview(w, u.ID, body.Voice, body.Speed)
 }
+
+// voiceWarmStatus reports which resident models are currently loaded and
+// which installed voices the administrator pinned as always-warm.
+func (s *Server) voiceWarmStatus(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	if s.SpeechPool == nil {
+		writeError(w, http.StatusServiceUnavailable, "the resident speech engine is disabled")
+		return
+	}
+	pins, err := s.Store.KeepWarmVoices(r.Context())
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			serverError(w, err)
+			return
+		}
+		pins = make(map[string]bool)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"resident":  s.SpeechPool.ResidentVoices(),
+		"keep_warm": pins,
+	})
+}
+
+// setVoiceKeepWarm pins or unpins an installed voice so its model stays
+// loaded across calls. Only installed voices qualify; the request never
+// triggers a download.
+func (s *Server) setVoiceKeepWarm(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	if s.SpeechPool == nil {
+		writeError(w, http.StatusServiceUnavailable, "the resident speech engine is disabled")
+		return
+	}
+	voice := strings.TrimSuffix(strings.TrimSpace(r.PathValue("voice")), ".onnx")
+	if voice == "" {
+		writeError(w, http.StatusBadRequest, "voice is required")
+		return
+	}
+	if s.VoiceDir == "" {
+		writeError(w, http.StatusServiceUnavailable, "voice directory is not configured")
+		return
+	}
+	installed := false
+	for _, name := range speech.InstalledVoiceNames(s.VoiceDir) {
+		if name == voice {
+			installed = true
+			break
+		}
+	}
+	if !installed {
+		writeError(w, http.StatusNotFound, "voice is not installed")
+		return
+	}
+	var body struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	if body.Enabled == nil {
+		writeError(w, http.StatusBadRequest, "enabled is required")
+		return
+	}
+	enabled := *body.Enabled
+	if err := s.Store.SetVoiceKeepWarm(r.Context(), voice, enabled); err != nil {
+		serverError(w, err)
+		return
+	}
+	applied := false
+	if enabled {
+		// Menu speed keeps the pin consistent with the default activation;
+		// the resident engine applies per-call speech rates itself.
+		applied = s.SpeechPool.KeepWarm(voice, 3) != nil
+	} else {
+		applied = s.SpeechPool.ReleaseKeepWarm(voice)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"voice": voice, "keep_warm": enabled, "applied": applied})
+}

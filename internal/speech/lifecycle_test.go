@@ -89,7 +89,7 @@ func TestPrepareStaticPromptsRefreshesWhenModelChanges(t *testing.T) {
 }
 
 func TestRuntimePoolEvictsUnusedRuntime(t *testing.T) {
-	p := NewRuntimePool("piper", t.TempDir(), "whisper", "model", t.TempDir())
+	p := NewRuntimePool("piper", t.TempDir(), "whisper", "model", t.TempDir(), "python3", false)
 	runtime, lease := p.Activate("voice", 3)
 	if runtime == nil || lease == nil {
 		t.Fatal("runtime was not activated")
@@ -137,7 +137,7 @@ func TestRuntimePoolUsesActiveModelDigestInRuntimeIdentity(t *testing.T) {
 	}
 
 	firstModel := writePair("one", "model-one")
-	p := NewRuntimePool("missing-piper-for-identity-test", voiceDir, "missing-whisper", "missing-model", t.TempDir())
+	p := NewRuntimePool("missing-piper-for-identity-test", voiceDir, "missing-whisper", "missing-model", t.TempDir(), "python3", false)
 	first, firstLease := p.Activate(name, 3)
 	if first == nil || firstLease == nil {
 		t.Fatal("first runtime was not activated")

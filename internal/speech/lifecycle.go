@@ -347,8 +347,16 @@ type Runtime struct {
 	ttsErr   error
 	sttErr   error
 	cancel   context.CancelFunc
-	worker   *piperWorker
-	onZero   func()
+	worker   piperSynthesizer
+	// workerRelease releases a pool-shared per-model worker when this
+	// runtime leaves the pool. Standalone runtures keep nil and own their
+	// worker outright.
+	workerRelease func()
+	// residentEnabled and residentPython govern the worker a standalone
+	// runtime creates when no pool pre-assigned one.
+	residentEnabled bool
+	residentPython  string
+	onZero          func()
 }
 
 type Lease struct {
@@ -358,7 +366,17 @@ type Lease struct {
 
 func NewRuntime(piper Piper, whisper Whisper, dir string) *Runtime {
 	fingerprint, _ := ModelFingerprint(piper.Model)
-	return &Runtime{Piper: piper, Whisper: whisper, Dir: dir, Speed: 3, Fingerprint: fingerprint}
+	return &Runtime{Piper: piper, Whisper: whisper, Dir: dir, Speed: 3, Fingerprint: fingerprint, residentEnabled: true, residentPython: "python3"}
+}
+
+// pooledWorker is one TTS engine shared by every speech runtime built on
+// the same voice model. With the resident engine, the model loads once per
+// voice instead of once per voice-speed combination or per prompt.
+type pooledWorker struct {
+	synth    piperSynthesizer
+	voice    string
+	resident bool
+	refs     int
 }
 
 type RuntimePool struct {
@@ -367,12 +385,18 @@ type RuntimePool struct {
 	WhisperBinary string
 	WhisperModel  string
 	Dir           string
-	mu            sync.Mutex
-	runtimes      map[string]*Runtime
+	// PiperPython is the interpreter that runs the resident Piper worker;
+	// Resident enables that engine (one-shot CLI otherwise).
+	PiperPython string
+	Resident    bool
+	mu          sync.Mutex
+	runtimes    map[string]*Runtime
+	workers     map[string]*pooledWorker
+	pinned      map[string]*Lease
 }
 
-func NewRuntimePool(piperBinary, voiceDir, whisperBinary, whisperModel, dir string) *RuntimePool {
-	return &RuntimePool{PiperBinary: piperBinary, VoiceDir: voiceDir, WhisperBinary: whisperBinary, WhisperModel: whisperModel, Dir: dir, runtimes: make(map[string]*Runtime)}
+func NewRuntimePool(piperBinary, voiceDir, whisperBinary, whisperModel, dir, piperPython string, resident bool) *RuntimePool {
+	return &RuntimePool{PiperBinary: piperBinary, VoiceDir: voiceDir, WhisperBinary: whisperBinary, WhisperModel: whisperModel, Dir: dir, PiperPython: piperPython, Resident: resident, runtimes: make(map[string]*Runtime)}
 }
 
 func (p *RuntimePool) Activate(voice string, speed int) (*Runtime, *Lease) {
@@ -401,7 +425,8 @@ func (p *RuntimePool) Activate(voice string, speed int) (*Runtime, *Lease) {
 	key := fmt.Sprintf("%s|%s|%d", strings.TrimSpace(originalModel), modelDigest, normalizedSpeed)
 	p.mu.Lock()
 	runtime := p.runtimes[key]
-	if runtime == nil {
+	created := runtime == nil
+	if created {
 		runtime = NewRuntime(Piper{Binary: p.PiperBinary, Model: model, Extra: SpeedExtra(normalizedSpeed)}, Whisper{Binary: p.WhisperBinary, Model: p.WhisperModel}, filepath.Join(p.Dir, fmt.Sprintf("%x", sha256.Sum256([]byte(key)))))
 		runtime.Speed = normalizedSpeed
 		runtime.onZero = func() {
@@ -412,11 +437,30 @@ func (p *RuntimePool) Activate(voice string, speed int) (*Runtime, *Lease) {
 			runtime.mu.Unlock()
 			if !active && p.runtimes[key] == runtime {
 				delete(p.runtimes, key)
+				if release := runtime.workerRelease; release != nil {
+					runtime.workerRelease = nil
+					release()
+				}
 			}
 		}
 		p.runtimes[key] = runtime
 	}
 	p.mu.Unlock()
+	if created {
+		// The per-model TTS engine is shared across every speed of the same
+		// voice: the resident engine applies the speech rate per request, so
+		// one loaded model serves the whole voice. workerFor takes the pool
+		// lock, so it runs outside the locked block above.
+		if worker, release := p.workerFor(model, modelDigest, poolVoiceKey(originalModel)); worker != nil {
+			runtime.mu.Lock()
+			runtime.worker = worker
+			runtime.workerRelease = release
+			runtime.mu.Unlock()
+		} else {
+			runtime.residentEnabled = p.Resident
+			runtime.residentPython = p.PiperPython
+		}
+	}
 	return runtime, runtime.Activate()
 }
 
@@ -473,7 +517,7 @@ func (r *Runtime) warm(ctx context.Context, ready *capabilityReady) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		w, err := startPiperWorker(ctx, r.Piper)
+		w, owned, err := r.acquireWorker(ctx)
 		if err != nil {
 			r.mu.Lock()
 			if r.ready == ready {
@@ -483,14 +527,22 @@ func (r *Runtime) warm(ctx context.Context, ready *capabilityReady) {
 			r.mu.Unlock()
 			return
 		}
+		// A pool-shared worker outlives this runtime and must never be
+		// closed from warm-up; only a worker warm-up created itself is
+		// disposable.
+		discard := func() {
+			if owned {
+				w.close()
+			}
+		}
 		r.mu.Lock()
-		installed := r.ready == ready && r.worker == nil
-		if installed {
+		installed := r.ready == ready && (r.worker == nil || r.worker == w)
+		if installed && r.worker == nil {
 			r.worker = w
 		}
 		r.mu.Unlock()
 		if !installed {
-			w.close()
+			discard()
 			return
 		}
 		warmDir := r.Dir
@@ -498,10 +550,12 @@ func (r *Runtime) warm(ctx context.Context, ready *capabilityReady) {
 			warmDir = os.TempDir()
 		}
 		if err := os.MkdirAll(warmDir, 0700); err != nil {
-			w.close()
+			discard()
 			r.mu.Lock()
 			if r.ready == ready && r.worker == w {
-				r.worker = nil
+				if owned {
+					r.worker = nil
+				}
 				r.ttsErr = err
 				r.ttsReady.finish(err)
 			}
@@ -510,10 +564,12 @@ func (r *Runtime) warm(ctx context.Context, ready *capabilityReady) {
 		}
 		file, releaseFile, err := maintenance.CreateTemp(warmDir, ".piper-warm-*.wav")
 		if err != nil {
-			w.close()
+			discard()
 			r.mu.Lock()
 			if r.ready == ready && r.worker == w {
-				r.worker = nil
+				if owned {
+					r.worker = nil
+				}
 				r.ttsErr = err
 				r.ttsReady.finish(err)
 			}
@@ -523,14 +579,14 @@ func (r *Runtime) warm(ctx context.Context, ready *capabilityReady) {
 		defer releaseFile()
 		path := file.Name()
 		_ = file.Close()
-		warmErr := w.synthesize(ctx, "VOXMail ready.", path)
+		warmErr := w.synthesize(ctx, "VOXMail ready.", path, r.Speed)
 		_ = os.Remove(path)
 		if warmErr != nil {
-			w.close()
+			discard()
 		}
 		r.mu.Lock()
 		if r.ready == ready {
-			if warmErr != nil && r.worker == w {
+			if warmErr != nil && owned && r.worker == w {
 				r.worker = nil
 			}
 			r.ttsErr = warmErr
@@ -568,6 +624,31 @@ func combineCapabilityErrors(ttsErr, sttErr error) error {
 		return fmt.Errorf("speech TTS warm-up failed: %w", ttsErr)
 	}
 	return fmt.Errorf("speech Whisper warm-up failed: %w", sttErr)
+}
+
+// acquireWorker returns the TTS worker this warm-up should use. A pool-
+// managed runtime reuses the pool's shared per-model worker, which outlives
+// individual runtimes and must never be closed here (owned=false). A
+// standalone runtime prefers the resident engine and falls back to the
+// one-shot CLI when the resident environment is unavailable.
+func (r *Runtime) acquireWorker(ctx context.Context) (piperSynthesizer, bool, error) {
+	r.mu.Lock()
+	if r.worker != nil {
+		worker := r.worker
+		r.mu.Unlock()
+		return worker, false, nil
+	}
+	r.mu.Unlock()
+	if r.residentEnabled {
+		if worker := newResidentWorker(r.residentPython, r.Piper); worker != nil {
+			return worker, true, nil
+		}
+	}
+	worker, err := startPiperWorker(ctx, r.Piper)
+	if err != nil {
+		return nil, false, err
+	}
+	return worker, true, nil
 }
 
 func (r *Runtime) Wait(ctx context.Context) error {
@@ -612,13 +693,14 @@ func (r *Runtime) Synthesize(ctx context.Context, text, output string) error {
 	if err := r.WaitTTS(ctx); err != nil {
 		return err
 	}
+	speed := r.Speed
 	r.mu.Lock()
 	worker := r.worker
 	r.mu.Unlock()
 	if worker == nil {
 		return fmt.Errorf("piper worker is not active")
 	}
-	return worker.synthesize(ctx, text, output)
+	return worker.synthesize(ctx, text, output, speed)
 }
 
 func (l *Lease) Release() {
@@ -656,9 +738,13 @@ func (l *Lease) Release() {
 			}
 			worker := r.worker
 			onZero := r.onZero
+			release := r.workerRelease
 			r.worker = nil
 			r.mu.Unlock()
-			if worker != nil {
+			// A pool-shared worker is released through the pool's registry,
+			// which keeps the process alive while any runtime still uses it;
+			// closing it here would kill a model another call is using.
+			if release == nil && worker != nil {
 				worker.close()
 			}
 			if onZero != nil {
@@ -786,4 +872,143 @@ func writeSilentWAV(file *os.File, sampleRate int) error {
 	}
 	_, err := file.Write(make([]byte, dataSize))
 	return err
+}
+
+// workerFor returns the per-model TTS engine for a runtime, creating it on
+// first use and refcounting it while any runtime on that model exists. The
+// engine outlives individual runtimes so overlapping calls at different
+// speech rates share one loaded model.
+func (p *RuntimePool) workerFor(model, digest, voice string) (piperSynthesizer, func()) {
+	key := digest
+	if key == "" || key == "unavailable" {
+		key = model
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.workers == nil {
+		p.workers = make(map[string]*pooledWorker)
+	}
+	if entry, ok := p.workers[key]; ok {
+		entry.refs++
+		return entry.synth, p.releaseWorkerLocked(key)
+	}
+	piper := Piper{Binary: p.PiperBinary, Model: model}
+	var synth piperSynthesizer
+	resident := false
+	if p.Resident {
+		if worker := newResidentWorker(p.PiperPython, piper); worker != nil {
+			synth = worker
+			resident = true
+		}
+	}
+	if synth == nil {
+		worker, err := startPiperWorker(context.Background(), piper)
+		if err != nil {
+			return nil, nil
+		}
+		synth = worker
+	}
+	entry := &pooledWorker{synth: synth, voice: voice, resident: resident, refs: 1}
+	p.workers[key] = entry
+	return synth, p.releaseWorkerLocked(key)
+}
+
+// releaseWorkerLocked returns a closure that drops one runtime's reference
+// on the shared engine and closes it when the last reference goes away. The
+// caller must hold the pool lock: workerFor runs it while building an
+// entry, and the runtime's onZero callback holds the pool lock when it
+// fires.
+func (p *RuntimePool) releaseWorkerLocked(key string) func() {
+	return func() {
+		entry, ok := p.workers[key]
+		if !ok {
+			return
+		}
+		if entry.refs > 0 {
+			entry.refs--
+		}
+		if entry.refs > 0 {
+			return
+		}
+		delete(p.workers, key)
+		if entry.synth != nil {
+			entry.synth.close()
+		}
+	}
+}
+
+// KeepWarm pins a voice's model in memory: its resident engine stays loaded
+// across calls until ReleaseKeepWarm unpins it or the process exits. The
+// default voice is pinned at startup.
+func (p *RuntimePool) KeepWarm(voice string, speed int) *Runtime {
+	if p == nil {
+		return nil
+	}
+	runtime, lease := p.Activate(voice, speed)
+	if runtime == nil || lease == nil {
+		return runtime
+	}
+	key := poolVoiceKey(voice)
+	p.mu.Lock()
+	if p.pinned == nil {
+		p.pinned = make(map[string]*Lease)
+	}
+	if existing, ok := p.pinned[key]; ok {
+		p.mu.Unlock()
+		if existing != lease {
+			lease.Release()
+		}
+		return runtime
+	}
+	p.pinned[key] = lease
+	p.mu.Unlock()
+	return runtime
+}
+
+// ReleaseKeepWarm unpins a voice's model. The engine unloads when the last
+// call using it ends.
+func (p *RuntimePool) ReleaseKeepWarm(voice string) bool {
+	if p == nil {
+		return false
+	}
+	key := poolVoiceKey(voice)
+	p.mu.Lock()
+	var lease *Lease
+	if p.pinned != nil {
+		lease = p.pinned[key]
+		delete(p.pinned, key)
+	}
+	p.mu.Unlock()
+	if lease != nil {
+		lease.Release()
+	}
+	return lease != nil
+}
+
+// ResidentVoices lists the voices whose models are currently loaded in a
+// resident engine, for the web console's warmth display.
+func (p *RuntimePool) ResidentVoices() []string {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	names := make([]string, 0, len(p.workers))
+	for _, entry := range p.workers {
+		if entry.refs > 0 && entry.resident && entry.synth != nil && entry.synth.alive() {
+			names = append(names, entry.voice)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// poolVoiceKey normalizes a voice reference to the display name used by the
+// keep-warm registry and the resident-voice list.
+func poolVoiceKey(voice string) string {
+	name := strings.TrimSpace(voice)
+	if name == "" {
+		return BundledPromptVoice
+	}
+	return strings.TrimSuffix(filepath.Base(name), filepath.Ext(name))
 }

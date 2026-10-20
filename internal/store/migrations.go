@@ -322,6 +322,13 @@ FROM remote_folders WHERE local_path<>''`); err != nil {
 	if err := s.mergeMaildirPathDuplicates(ctx); err != nil {
 		return err
 	}
+	// Per-voice always-warm pins survive restarts so pinned models reload
+	// on startup without waiting for a call.
+	if err := s.applyMigration(ctx, 28, `CREATE TABLE IF NOT EXISTS voice_keep_warm (
+ voice TEXT PRIMARY KEY, keep_warm INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL
+)`); err != nil {
+		return err
+	}
 	return nil
 }
 
