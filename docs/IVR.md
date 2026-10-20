@@ -20,7 +20,9 @@ After selecting an account, `1` opens synchronized folders, `2` opens the
 compose/draft flow, `3` refreshes the account view, and `4` opens account alert
 settings.
 
-`#` backs out one menu level. `*` repeats the current menu. The top-level menu
+`#` backs out one menu level. `*` repeats the current menu. A notice, such as an
+invalid key or the end of a list, is spoken together with the repeated menu, so
+the caller hears the choices again after the notice. The top-level menu
 always has three choices; account count does not alter its prerecorded audio.
 Account, folder, contact, attachment, and draft prompts enumerate current data
 dynamically.
@@ -63,9 +65,9 @@ attachments, `9` opens more options, and `0` advances to the next message.
 
 Press a key repeatedly to cycle its characters. Press a different key to
 commit the previous character and start the next one. Press `*` while a
-character is pending to commit it. Press `#` to commit the pending character
-and finish the field. Press `*` with no character pending to delete the
-previous character.
+character is pending to commit it. A single `*` never deletes; pressing `*`
+twice in a row deletes the previous character. Press `#` to commit the pending
+character and finish the field.
 
 | Key | Characters |
 | --- | --- |
@@ -91,6 +93,15 @@ rejected until `*` deletes one; the partially entered value is never silently
 expanded beyond its bound. Inactivity closes the call, and credential
 revocation makes an already-held call terminal even if a queued DTMF event
 arrives afterward.
+
+## Compose, reply, and forward
+
+## Contact picker
+
+When the account has at least one saved contact, new composition first offers
+`1` to type an address or `2` to choose a contact. The contact list prompts
+"Choose a contact, press 9 for more if available, or pound to go back."
+Without saved contacts, composition goes straight to typing the address.
 
 ## Compose, reply, and forward
 
