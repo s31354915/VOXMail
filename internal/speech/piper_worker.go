@@ -45,7 +45,7 @@ func startPiperWorker(ctx context.Context, p Piper) (*piperWorker, error) {
 	return &piperWorker{p: p}, nil
 }
 
-func (w *piperWorker) synthesize(ctx context.Context, text, output string) error {
+func (w *piperWorker) synthesize(ctx context.Context, text, output string, speed int) error {
 	if w == nil {
 		return fmt.Errorf("piper worker is nil")
 	}
@@ -75,12 +75,29 @@ func (w *piperWorker) synthesize(ctx context.Context, text, output string) error
 		w.cancel = nil
 		w.mu.Unlock()
 	}()
-	return synthesizePiper(workerCtx, w.p, text, output)
+	// A shared engine applies the call's speech rate per request; a runtime
+	// that baked Extra flags keeps them and skips the override.
+	p := w.p
+	if speed >= 1 && speed <= 5 && !hasLengthScaleExtra(p.Extra) {
+		p.Extra = append(SpeedExtra(speed), p.Extra...)
+	}
+	return synthesizePiper(workerCtx, p, text, output)
 }
 
-func (w *piperWorker) close() {
+// alive reports whether this worker has a usable engine; a one-shot worker
+// is alive until it is closed.
+func (w *piperWorker) alive() bool {
 	if w == nil {
-		return
+		return false
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return !w.closed
+}
+
+func (w *piperWorker) close() error {
+	if w == nil {
+		return nil
 	}
 	w.mu.Lock()
 	if !w.closed {
@@ -90,4 +107,5 @@ func (w *piperWorker) close() {
 		}
 	}
 	w.mu.Unlock()
+	return nil
 }

@@ -1985,6 +1985,8 @@
       (x) => '<option value="' + esc(x.voice) + '">' + (x.installed ? "installed" : "available to administrators") + "</option>"
     ).join("");
     $("#install-voice").classList.toggle("hidden", !window.isAdmin);
+    if (window.isAdmin) await loadVoiceWarm(rows);
+    else $("#voice-warm-controls").classList.add("hidden");
     const field = $("#settings-form").elements.tts_voice;
     field.placeholder = window.isAdmin ? "Piper voice name or HTTPS .onnx URL" : "Installed voice name";
     field.title = window.isAdmin ? "Install any Piper voice by name or paste its HTTPS model URL. The matching .onnx.json file is downloaded with it." : "Choose an installed voice.";
@@ -2007,6 +2009,45 @@
       (x) => "<li>" + esc(x.number) + " " + (x.active ? '<span class="pill">active</span>' : '<button class="link" data-activate-alert="' + x.id + '">Make active</button>') + ' <button class="link" data-delete-alert="' + x.id + '">Remove</button></li>'
     ).join("") + "</ul>" : "<p>No alert numbers configured.</p>";
     applyMutationPending("#alert-numbers");
+  }
+  async function loadVoiceWarm(rows) {
+    let warm = { resident: [], keep_warm: {} };
+    try {
+      warm = await api("/api/v1/voices/warm");
+    } catch (x) {
+      if (x && x.message && /resident speech engine/i.test(x.message)) {
+        $("#voice-warm-status").textContent = "The resident speech engine is disabled (VOXMAIL_PIPER_RESIDENT=0).";
+      } else {
+        $("#voice-warm-status").textContent = "Voice warmth status could not be read: " + (x.message || x);
+      }
+      return;
+    }
+    const pins = warm.keep_warm || {};
+    const installed = (rows || []).filter((x) => x.installed).map((x) => x.voice);
+    $("#voice-warm-list").innerHTML = installed.length ? installed.map(
+      (name) => '<label class="row"><input type="checkbox" data-keep-warm="' + esc(name) + '"' + (pins[name] ? " checked" : "") + "> " + esc(name) + (warm.resident && warm.resident.includes(name) ? ' <span class="pill">loaded</span>' : "") + "</label>"
+    ).join("") : '<p class="muted">No voices installed.</p>';
+    $("#voice-warm-status").textContent = "";
+    $("#voice-warm-controls").classList.remove("hidden");
+  }
+  async function saveVoiceWarm(name, enabled, box) {
+    const previous = !enabled;
+    box.disabled = true;
+    try {
+      await api(
+        "/api/v1/voices/warm/" + encodeURIComponent(name),
+        { method: "PUT", body: JSON.stringify({ enabled }) }
+      );
+      await loadVoiceWarm();
+      status(
+        enabled ? "Voice pinned as always-warm." : "Voice unpinned; it unloads after the last call using it."
+      );
+    } catch (x) {
+      box.checked = previous;
+      status("Voice warmth change failed: " + (x.message || x));
+    } finally {
+      box.disabled = false;
+    }
   }
   function setVoiceInstallPending(pending) {
     state.voiceInstallBusy = pending;
@@ -2119,6 +2160,12 @@
     }
   }
   function initializeVoices() {
+    document.addEventListener("change", async (e) => {
+      const box = e.target;
+      if (box instanceof HTMLInputElement && box.dataset.keepWarm !== void 0) {
+        await saveVoiceWarm(box.dataset.keepWarm, box.checked, box);
+      }
+    });
     $("#settings-form").onsubmit = async (e) => {
       e.preventDefault();
       const f = e.target;

@@ -132,6 +132,14 @@ type VoicePreviewer interface {
 	PreviewVoice(context.Context, string, int) ([]byte, error)
 }
 
+// VoiceWarm controls the per-model TTS engine pool: administrator keep-warm
+// pinning and the live display of which resident models are loaded.
+type VoiceWarm interface {
+	KeepWarm(voice string, speed int) *speech.Runtime
+	ReleaseKeepWarm(voice string) bool
+	ResidentVoices() []string
+}
+
 // CallSessionInvalidator revokes live phone calls after a credential change.
 // It is optional so the web console remains testable without a running call
 // bridge.
@@ -176,6 +184,7 @@ type Server struct {
 	VoiceInstaller    VoiceInstaller
 	OfflineMode       bool
 	Preview           VoicePreviewer
+	SpeechPool        VoiceWarm
 	Calls             CallSessionInvalidator
 	Sync              AccountSyncer
 	DataRoot          string
@@ -345,6 +354,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/voices/jobs/active", s.activeVoiceInstallJob)
 	mux.HandleFunc("POST /api/v1/voices/jobs/{id}/cancel", s.cancelVoiceInstall)
 	mux.HandleFunc("GET /api/v1/voices/jobs/{id}", s.voiceInstallStatus)
+	mux.HandleFunc("GET /api/v1/voices/warm", s.voiceWarmStatus)
+	mux.HandleFunc("PUT /api/v1/voices/warm/{voice}", s.setVoiceKeepWarm)
 	mux.HandleFunc("POST /api/v1/voices/preview", s.previewVoice)
 	mux.HandleFunc("GET /api/v1/voices/previews/{id}", s.previewJobStatus)
 	mux.HandleFunc("GET /api/v1/voices/previews/{id}/audio", s.previewJobAudio)

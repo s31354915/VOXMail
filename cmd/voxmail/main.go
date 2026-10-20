@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"sync"
 	"syscall"
@@ -302,8 +303,26 @@ func main() {
 	)
 	speechPool := speech.NewRuntimePool(
 		cfg.PiperBinary, cfg.VoiceDir, cfg.STTBinary, cfg.STTModel,
-		filepath.Join(cfg.DataDir, "run", "speech"),
+		filepath.Join(cfg.DataDir, "run", "speech"), cfg.PiperPython, cfg.PiperResident,
 	)
+	if cfg.PiperResident {
+		// The configured default voice stays warm for the life of the
+		// process, and any voice the administrator pinned is re-pinned on
+		// startup so pinned models reload without waiting for a call.
+		speechPool.KeepWarm(piperModel, 3)
+		if pins, pinErr := db.KeepWarmVoices(context.Background()); pinErr == nil {
+			pinnedVoices := make([]string, 0, len(pins))
+			for voice, enabled := range pins {
+				if enabled {
+					pinnedVoices = append(pinnedVoices, voice)
+				}
+			}
+			sort.Strings(pinnedVoices)
+			for _, voice := range pinnedVoices {
+				speechPool.KeepWarm(voice, 3)
+			}
+		}
+	}
 	promptPlayer := &calls.PromptPlayer{
 		Piper:        speech.Piper{Binary: cfg.PiperBinary, Model: piperModel},
 		Runtime:      speechRuntime,
@@ -369,7 +388,7 @@ func main() {
 	voiceInstaller := speech.AdministratorVoiceInstaller{Validate: func(ctx context.Context, model string) error {
 		return (speech.Piper{Binary: cfg.PiperBinary, Model: model}).Warm(ctx, filepath.Join(cfg.DataDir, "run", "speech"))
 	}}
-	webApp := &web.Server{VoiceInstaller: voiceInstaller, Store: db, Secrets: secrets, Log: log, SIP: sipBridge, Alerts: alertService, Voice: voiceService, Preview: voiceService, Calls: bridgeService, DataRoot: cfg.DataDir, VoiceDir: cfg.VoiceDir, OfflineMode: cfg.OfflineMode, TrustedProxyCIDRs: cfg.TrustedProxyCIDRs, RuntimeStatus: runtimeStatus, Ready: func(ctx context.Context) error {
+	webApp := &web.Server{VoiceInstaller: voiceInstaller, Store: db, Secrets: secrets, Log: log, SIP: sipBridge, Alerts: alertService, Voice: voiceService, Preview: voiceService, Calls: bridgeService, DataRoot: cfg.DataDir, VoiceDir: cfg.VoiceDir, SpeechPool: speechPool, OfflineMode: cfg.OfflineMode, TrustedProxyCIDRs: cfg.TrustedProxyCIDRs, RuntimeStatus: runtimeStatus, Ready: func(ctx context.Context) error {
 		if cfg.OfflineMode {
 			return nil
 		}

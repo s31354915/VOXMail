@@ -71,3 +71,13 @@ func (c *Command) CombinedOutput() ([]byte, error) {
 }
 
 func (c *Command) StderrText() string { return c.capture.String() }
+
+// Configure prepares a long-lived child command the same way New does: its
+// own process group so shutdown can kill the whole tree, and the standard
+// wait delay. Callers that manage Start/Wait themselves use this instead of
+// New.
+func Configure(cmd *exec.Cmd) { configure(cmd) }
+
+// Terminate kills a command's whole process group. Safe on an exited or
+// never-started command.
+func Terminate(cmd *exec.Cmd) { terminate(cmd) }

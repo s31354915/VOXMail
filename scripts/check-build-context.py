@@ -33,7 +33,8 @@ CONSOLE_SOURCES = [
 ]
 REQUIRED_CONTEXT = CONSOLE_SOURCES + [
     "go.mod", "go.sum", "cmd/voxmail/main.go", "internal/web/static/index.html",
-    "baresip/shim/voxmail.c", "assets/welcome.wav", "assets/main-menu.wav",
+    "baresip/shim/voxmail.c", "internal/speech/piper_resident.py",
+    "assets/welcome.wav", "assets/main-menu.wav",
     "assets/static-prompts.json", "scripts/entrypoint.sh", "scripts/runtime-smoke.sh",
     "scripts/real-model-smoke.sh", "scripts/sip-peer-smoke.sh", "tests/sippeer/smoke.py",
     ".env.example", "context-only.marker", "requirements/python.lock",
@@ -44,7 +45,7 @@ def copy_source(root, context):
     # Explicit source extensions prevent this acceptance fixture from reading
     # actual runtime data, credentials, browser installations or review notes.
     for directory, extensions in {
-        "cmd": {".go"}, "internal": {".go", ".html", ".json", ".wav"},
+        "cmd": {".go"}, "internal": {".go", ".html", ".json", ".py", ".wav"},
         "baresip/shim": {".c", ".h", ".txt"}, "assets": {".wav", ".json"},
         "scripts": {".sh", ".py"}, "tests/sippeer": {".py"},
         "requirements": {".in", ".lock"},

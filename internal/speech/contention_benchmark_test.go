@@ -77,7 +77,7 @@ func BenchmarkCallPreviewSpeechContention(b *testing.B) {
 				if err := os.WriteFile(model+".json", []byte(`{"audio":{"sample_rate":8000}}`), 0600); err != nil {
 					b.Fatal(err)
 				}
-				pool := NewRuntimePool(wrapper, root, filepath.Join(root, "missing-whisper"), "unused", filepath.Join(root, "runtime"))
+				pool := NewRuntimePool(wrapper, root, filepath.Join(root, "missing-whisper"), "unused", filepath.Join(root, "runtime"), "python3", false)
 				runtimes := make([]*Runtime, mode.calls)
 				leases := make([]*Lease, mode.calls)
 				defer func() {
