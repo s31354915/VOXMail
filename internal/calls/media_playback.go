@@ -682,11 +682,70 @@ func parseLoudnormFloat(raw string, min, max float64) (float64, bool) {
 	return value, true
 }
 
+// promptConversionError carries the ffmpeg diagnostics failed prompt
+// conversions used to swallow: the input path, the exact filter chain, how
+// much audio already reached the call, and the child's stderr tail.
+type promptConversionError struct {
+	err    error
+	input  string
+	filter string
+	plain  bool
+	played int64
+	stderr string
+}
+
+// promptConversionStderrTail bounds the stderr echoed into the error; the
+// full capture stays available to verbose diagnostics.
+const promptConversionStderrTail = 2048
+
+func newPromptConversionError(input, filter string, plain bool, played int64, stderr string, err error) *promptConversionError {
+	trimmed := strings.TrimSpace(stderr)
+	if len(trimmed) > promptConversionStderrTail {
+		trimmed = "... " + trimmed[len(trimmed)-promptConversionStderrTail:]
+	}
+	if filter == "" {
+		filter = telephoneAudioFilter
+	}
+	return &promptConversionError{err: err, input: input, filter: filter, plain: plain, played: played, stderr: trimmed}
+}
+
+func (e *promptConversionError) Error() string {
+	stderr := e.stderr
+	if stderr == "" {
+		stderr = "empty"
+	}
+	return fmt.Sprintf("prompt conversion: %v (input %s, filter %q, played %d bytes, ffmpeg stderr: %s)", e.err, e.input, e.filter, e.played, stderr)
+}
+
+func (e *promptConversionError) Unwrap() error { return e.err }
+
 func (p *PromptPlayer) playInput(ctx context.Context, fifo, input string, drainTail time.Duration) error {
 	if p == nil {
 		return fmt.Errorf("prompt player is not configured")
 	}
 	binary := p.playbackBinary(fifo)
+	filter := p.playbackFilter(ctx, binary, input)
+	err := p.playFilteredInput(ctx, binary, fifo, input, drainTail, filter, false)
+	var convErr *promptConversionError
+	if err == nil || !errors.As(err, &convErr) || convErr.plain || convErr.played > 0 || ctx.Err() != nil {
+		return err
+	}
+	// The caller heard nothing and loudness processing was in the chain.
+	// Retry once with the plain telephone filter so a bad measurement or
+	// loudnorm chain cannot silence a whole prompt. Both attempts stay in
+	// the returned error, which also shows whether the same input
+	// converts without the loudness filters.
+	plainErr := p.playFilteredInput(ctx, binary, fifo, input, drainTail, telephoneAudioFilter, true)
+	if plainErr == nil {
+		return nil
+	}
+	return fmt.Errorf("%w; retry with the loudness filter bypassed: %w", err, plainErr)
+}
+
+// playFilteredInput runs one ffmpeg conversion of input to raw call PCM
+// through the given filter chain. plain marks the loudness-free fallback so
+// a retry of the retry can never happen.
+func (p *PromptPlayer) playFilteredInput(ctx context.Context, binary, fifo, input string, drainTail time.Duration, filter string, plain bool) error {
 	const maxPlaybackDuration = process.PlaybackTimeout
 	mediaCtx, cancel := context.WithTimeout(ctx, maxPlaybackDuration)
 	defer cancel()
@@ -726,7 +785,8 @@ func (p *PromptPlayer) playInput(ctx context.Context, fifo, input string, drainT
 		output = pcm
 	}
 	writer := &pcmLimitWriter{w: output, max: 8_000 * 2 * 600}
-	filter := p.playbackFilter(mediaCtx, binary, input)
+	// The filter chain is computed by playInput so a failed conversion can
+	// report exactly what it used and retry without loudness processing.
 	cmd := process.New(mediaCtx, "ffmpeg", binary, 0, "-nostdin", "-i", input, "-vn", "-af", filter, "-ar", "8000", "-ac", "1", "-f", "s16le", "pipe:1")
 	// The converted PCM streams through a pipe we own instead of the pipe
 	// exec wraps around an io.Writer. exec abandons whatever is still
@@ -750,13 +810,13 @@ func (p *PromptPlayer) playInput(ctx context.Context, fifo, input string, drainT
 	// listener heard the capped audio and should get the normal tail
 	// drain instead of an error callers report as a failed prompt.
 	if runErr != nil && !writer.overflowed {
-		return fmt.Errorf("prompt conversion: %w", runErr)
+		return newPromptConversionError(input, filter, plain, writer.n, cmd.StderrText(), runErr)
 	}
 	if streamErr != nil && !writer.overflowed {
-		return fmt.Errorf("prompt conversion: %w", streamErr)
+		return newPromptConversionError(input, filter, plain, writer.n, cmd.StderrText(), streamErr)
 	}
 	if writer.n == 0 && !writer.overflowed {
-		return fmt.Errorf("decoded audio is empty")
+		return newPromptConversionError(input, filter, plain, 0, cmd.StderrText(), errors.New("decoded audio is empty"))
 	}
 	if info.Mode()&os.ModeNamedPipe != 0 {
 		// A read-only observer lets the writer close (and flush the native
