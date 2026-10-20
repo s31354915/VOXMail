@@ -149,10 +149,26 @@ type promptWarmState struct {
 // warmStaticPrompts prepares the static greeting and main-menu prompts in
 // the background and publishes the result to the prompt player. A failure
 // keeps the player on dynamic synthesis and the previous manifest's assets.
+// staticPromptWarmBudget bounds one static-prompt generation attempt. A
+// cold start can spend minutes on the first Piper model load before
+// synthesis reaches its usual per-prompt pace, and CPU contention with
+// Whisper warm-up and Baresip slows it further; a short window killed the
+// generation mid-flight and left every call on slow on-demand synthesis.
+const staticPromptWarmBudget = 30 * time.Minute
+
 func warmStaticPrompts(ctx context.Context, cfg config.Config, log *slog.Logger, piperModel, promptDir, mainMenuPath, manifestPath string, state *promptWarmState, player *calls.PromptPlayer, fingerprint string) {
-	promptContext, promptCancel := context.WithTimeout(ctx, 5*time.Minute)
+	promptContext, promptCancel := context.WithTimeout(ctx, staticPromptWarmBudget)
 	defer promptCancel()
-	manifest, promptErr := speech.PrepareStaticPrompts(promptContext, speech.Piper{Binary: cfg.PiperBinary, Model: piperModel}, cfg.GreetingPath, mainMenuPath, manifestPath)
+	piper := speech.Piper{Binary: cfg.PiperBinary, Model: piperModel}
+	manifest, promptErr := speech.PrepareStaticPrompts(promptContext, piper, cfg.GreetingPath, mainMenuPath, manifestPath)
+	if promptErr != nil && ctx.Err() == nil {
+		// One transient cold-start stall must not cost a whole day of
+		// calls; retry once, then fall back to dynamic synthesis below.
+		log.Warn("static prompt generation failed; retrying once", "error", promptErr)
+		retryContext, retryCancel := context.WithTimeout(ctx, staticPromptWarmBudget)
+		defer retryCancel()
+		manifest, promptErr = speech.PrepareStaticPrompts(retryContext, piper, cfg.GreetingPath, mainMenuPath, manifestPath)
+	}
 	state.mu.Lock()
 	state.manifest = manifest
 	state.err = promptErr

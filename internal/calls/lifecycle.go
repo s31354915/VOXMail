@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -19,6 +20,11 @@ func (s *Service) Run(ctx context.Context) error {
 	s.mu.Unlock()
 	connected := false
 	for {
+		// Baresip creates its control socket only after its SIP stack
+		// finishes initializing, which on a cold start takes tens of
+		// seconds; dialing immediately races that bind and logs a failed
+		// connection every second until it lands.
+		s.waitForBridgeSocket(ctx)
 		if err := s.runConnection(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			if s.Log != nil {
 				message := "baresip bridge connection failed"
@@ -35,6 +41,43 @@ func (s *Service) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(time.Second):
+		}
+	}
+}
+
+// bridgeSocketWait bounds how long Run waits for the baresip control
+// socket to appear before dialing. The wait is bounded so a socket that
+// never appears still falls into the normal per-second retry loop unchanged.
+const bridgeSocketWait = 90 * time.Second
+
+// waitForBridgeSocket waits for the baresip control socket to appear before
+// the next dial attempt. A socket that already exists, an empty path, or any
+// stat result other than "missing" returns immediately; a missing socket
+// polls at 500 ms until it appears, the deadline passes, or the context ends.
+func (s *Service) waitForBridgeSocket(ctx context.Context) {
+	if s.Socket == "" {
+		return
+	}
+	if _, err := os.Stat(s.Socket); !errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	if s.Log != nil {
+		s.Log.Info("waiting for baresip control socket to appear", "path", s.Socket)
+	}
+	deadline := time.Now().Add(bridgeSocketWait)
+	for {
+		timer := time.NewTimer(500 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		if _, err := os.Stat(s.Socket); !errors.Is(err, os.ErrNotExist) {
+			return
+		}
+		if time.Now().After(deadline) {
+			return
 		}
 	}
 }

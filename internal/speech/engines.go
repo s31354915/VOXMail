@@ -2,6 +2,7 @@ package speech
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/voxmail/voxmail/internal/maintenance"
 	"github.com/voxmail/voxmail/internal/operation"
@@ -21,6 +22,8 @@ type Piper struct {
 func (p Piper) Synthesize(ctx context.Context, text, output string) error {
 	return synthesizePiper(ctx, p, text, output)
 }
+
+var errWhisperEmptyTranscription = errors.New("whisper returned empty transcription")
 
 func (p Piper) Warm(ctx context.Context, dir string) error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -79,7 +82,7 @@ func (w Whisper) Transcribe(ctx context.Context, wav string) (_ string, retErr e
 	}
 	text := strings.TrimSpace(stdout.String())
 	if text == "" {
-		return "", operation.Wrap("whisper", "output", operation.Protocol, fmt.Errorf("whisper returned empty transcription"))
+		return "", operation.Wrap("whisper", "output", operation.Protocol, errWhisperEmptyTranscription)
 	}
 	return text, nil
 }

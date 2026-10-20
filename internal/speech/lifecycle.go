@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/voxmail/voxmail/internal/maintenance"
 	"io"
@@ -698,7 +699,9 @@ func (w Whisper) Warm(ctx context.Context, dir string) error {
 	defer releaseFile()
 	path := file.Name()
 	defer os.Remove(path)
-	if err := writeSilentWAV(file, 8000); err != nil {
+	// whisper-cli rejects any other rate ("WAV file must be 16 kHz"), so
+	// the warm-up fixture has to match the model's expected input format.
+	if err := writeSilentWAV(file, 16000); err != nil {
 		file.Close()
 		return err
 	}
@@ -710,7 +713,7 @@ func (w Whisper) Warm(ctx context.Context, dir string) error {
 	// failures must abort the lease so the call never discovers a broken STT
 	// engine halfway through composition.
 	_, err = w.Transcribe(ctx, path)
-	if err != nil && err.Error() != "whisper returned empty transcription" {
+	if err != nil && !errors.Is(err, errWhisperEmptyTranscription) {
 		return err
 	}
 	return nil

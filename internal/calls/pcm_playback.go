@@ -30,9 +30,10 @@ const (
 // contention stalls (Piper, Whisper, and ffmpeg sharing one box) so the FIFO
 // runs dry far less often and speech does not stutter.
 type pacedPCMWriter struct {
-	ctx  context.Context
-	w    io.Writer
-	next time.Time
+	ctx    context.Context
+	w      io.Writer
+	reopen func(context.Context) (io.WriteCloser, error)
+	next   time.Time
 }
 
 func (w *pacedPCMWriter) Write(p []byte) (int, error) {
@@ -68,15 +69,35 @@ func (w *pacedPCMWriter) Write(p []byte) (int, error) {
 	return sent, nil
 }
 
+// pcmReopenAttempts caps how many times a broken FIFO end is re-opened
+// within one prompt. Each attempt waits for a reader to come back (the open
+// path bounds that wait), so a call that is truly gone still fails within
+// seconds instead of hanging on an unbounded reopen loop.
+const pcmReopenAttempts = 3
+
 // writeResilient retries a chunk that hit EAGAIN. Pollable FIFO writes park
 // until the reader drains, but a descriptor that is not pollable can surface
 // EAGAIN mid-prompt; treat it as "not writable yet" rather than aborting the
-// sentence the caller is in the middle of hearing.
+// sentence the caller is in the middle of hearing. A broken pipe means the
+// native reader dropped the FIFO (baresip resetting its audio stream across
+// a call transition): close the dead end, wait for a reader to come back,
+// and resume the same bytes instead of failing the prompt outright.
 func (w *pacedPCMWriter) writeResilient(p []byte) (int, error) {
-	for {
+	for attempts := 0; ; attempts++ {
 		n, err := w.w.Write(p)
 		if err == nil || n > 0 {
 			return n, err
+		}
+		if errors.Is(err, unix.EPIPE) && w.reopen != nil && attempts < pcmReopenAttempts {
+			if closer, ok := w.w.(io.Closer); ok {
+				_ = closer.Close()
+			}
+			fresh, reopenErr := w.reopen(w.ctx)
+			if reopenErr != nil {
+				return 0, err
+			}
+			w.w = fresh
+			continue
 		}
 		if !errors.Is(err, unix.EAGAIN) && !errors.Is(err, unix.EWOULDBLOCK) {
 			return n, err
@@ -85,6 +106,19 @@ func (w *pacedPCMWriter) writeResilient(p []byte) (int, error) {
 			return 0, waitErr
 		}
 	}
+}
+
+// Close closes the writer currently feeding the call, tolerating a writer
+// that EPIPE recovery already closed.
+func (w *pacedPCMWriter) Close() error {
+	closer, ok := w.w.(io.Closer)
+	if !ok {
+		return nil
+	}
+	if err := closer.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+		return err
+	}
+	return nil
 }
 
 func waitPCM(ctx context.Context, duration time.Duration) error {

@@ -702,7 +702,11 @@ func (p *PromptPlayer) playInput(ctx context.Context, fifo, input string, drainT
 	defer rawRead.Close()
 	// Closing a pollable FIFO wakes both pending writes and process output
 	// copying. Killing ffmpeg alone cannot wake a blocked Go output writer.
+	var pcm *pacedPCMWriter
 	stopClose := context.AfterFunc(mediaCtx, func() {
+		if pcm != nil {
+			_ = pcm.Close()
+		}
 		_ = pipe.Close()
 		_ = rawRead.Close()
 	})
@@ -714,7 +718,12 @@ func (p *PromptPlayer) playInput(ctx context.Context, fifo, input string, drainT
 	}
 	var output io.Writer = pipe
 	if info.Mode()&os.ModeNamedPipe != 0 {
-		output = &pacedPCMWriter{ctx: mediaCtx, w: pipe}
+		// EPIPE recovery re-opens the FIFO by path when the native reader
+		// drops it mid-prompt.
+		pcm = &pacedPCMWriter{ctx: mediaCtx, w: pipe, reopen: func(reopenCtx context.Context) (io.WriteCloser, error) {
+			return openPCMWriter(reopenCtx, fifo)
+		}}
+		output = pcm
 	}
 	writer := &pcmLimitWriter{w: output, max: 8_000 * 2 * 600}
 	filter := p.playbackFilter(mediaCtx, binary, input)
@@ -757,7 +766,11 @@ func (p *PromptPlayer) playInput(ctx context.Context, fifo, input string, drainT
 			return err
 		}
 		defer observer.Close()
-		if err := pipe.Close(); err != nil {
+		if pcm != nil {
+			if err := pcm.Close(); err != nil {
+				return err
+			}
+		} else if err := pipe.Close(); err != nil {
 			return err
 		}
 		return drainPCM(mediaCtx, observer, drainTail)
