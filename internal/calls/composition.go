@@ -18,6 +18,7 @@ import (
 
 	"github.com/voxmail/voxmail/internal/keypad"
 	"github.com/voxmail/voxmail/internal/mailer"
+	"github.com/voxmail/voxmail/internal/store"
 )
 
 func (s *Service) startCompose(sess *session, mode string) {
@@ -381,6 +382,19 @@ func (s *Service) startComposeLocked(sess *session, mode string) {
 	sess.EditingDraft = false
 	sess.RecipientKind = ""
 	if mode == "" {
+		// With saved contacts, offer typing or picking. Without any, keep
+		// the old behavior and go straight into typing. The lock is already
+		// held here, so baseContext() would deadlock; use Background instead.
+		var contacts []store.Contact
+		var listErr error
+		if s.Store != nil {
+			contacts, listErr = s.Store.ListContacts(context.Background(), sess.UserID)
+		}
+		if listErr == nil && len(contacts) > 0 {
+			transitionLocked(sess, "recipient_pick")
+			sess.Editor = nil
+			return
+		}
 		transitionLocked(sess, "compose")
 		sess.Editor = newIVREditor("compose")
 		return

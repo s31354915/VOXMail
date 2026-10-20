@@ -397,6 +397,10 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 		s.handleFolderAction(sess, key)
 	case "contacts":
 		s.handleContactMenu(sess, key)
+	case "recipient_pick":
+		s.handleRecipientPick(sess, key)
+	case "contact_pick":
+		s.handleContactPick(sess, key)
 	case "recipient_menu":
 		s.handleRecipientMenu(sess, key)
 	case "field_confirm":

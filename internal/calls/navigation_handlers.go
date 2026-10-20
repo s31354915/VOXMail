@@ -126,7 +126,10 @@ func (s *Service) handleDraftMenu(sess *session, key string) {
 	switch key {
 	case "1":
 		s.startCompose(sess, "")
-		s.prompt(sess, menuPrompt("compose"))
+		s.mu.Lock()
+		state := stateLocked(sess)
+		s.mu.Unlock()
+		s.prompt(sess, menuPrompt(string(state)))
 	case "2":
 		s.openDrafts(sess)
 	}
@@ -1172,6 +1175,84 @@ func contactPrompt(contacts []store.Contact, page int) string {
 		next = " Press 9 for more."
 	}
 	return "Contacts. " + strings.Join(parts, ". ") + "." + next + " Press pound to go back."
+}
+
+func (s *Service) handleRecipientPick(sess *session, key string) {
+	switch key {
+	case "1":
+		s.mu.Lock()
+		transitionLocked(sess, "compose")
+		sess.Editor = newIVREditor("compose")
+		s.mu.Unlock()
+		s.prompt(sess, menuPrompt("compose"))
+	case "2":
+		contacts, err := s.Store.ListContacts(s.baseContext(), sess.UserID)
+		if err != nil || len(contacts) == 0 {
+			s.prompt(sess, "Contacts are unavailable. "+menuPrompt("recipient_pick"))
+			return
+		}
+		s.mu.Lock()
+		sess.Contacts = contacts
+		sess.ContactPage = 0
+		transitionLocked(sess, "contact_pick")
+		s.mu.Unlock()
+		s.prompt(sess, contactPickPrompt(contacts, 0))
+	}
+}
+
+func (s *Service) handleContactPick(sess *session, key string) {
+	if key == "9" {
+		s.mu.Lock()
+		more := len(sess.Contacts) > (sess.ContactPage+1)*8
+		if more {
+			sess.ContactPage++
+		}
+		page := sess.ContactPage
+		contacts := append([]store.Contact(nil), sess.Contacts...)
+		s.mu.Unlock()
+		if more {
+			s.prompt(sess, contactPickPrompt(contacts, page))
+		} else {
+			s.prompt(sess, "There are no more contacts. "+contactPickPrompt(contacts, page))
+		}
+		return
+	}
+	if key < "1" || key > "8" {
+		s.prompt(sess, "That key is not available here. Press pound to go back. "+menuPrompt("recipient_pick"))
+		return
+	}
+	s.mu.Lock()
+	index := sess.ContactPage*8 + int(key[0]-'1')
+	if index >= len(sess.Contacts) {
+		page := sess.ContactPage
+		contacts := append([]store.Contact(nil), sess.Contacts...)
+		s.mu.Unlock()
+		s.prompt(sess, "There is no contact for that key. "+contactPickPrompt(contacts, page))
+		return
+	}
+	chosen := sess.Contacts[index]
+	sess.Draft.To = chosen.Email
+	sess.RecipientKind = ""
+	sess.Editor = nil
+	transitionLocked(sess, "recipient_menu")
+	s.mu.Unlock()
+	s.prompt(sess, s.promptForState(sess))
+}
+
+func contactPickPrompt(contacts []store.Contact, page int) string {
+	parts := make([]string, 0, len(contacts))
+	start := page * 8
+	for i := start; i < len(contacts); i++ {
+		if i == start+8 {
+			break
+		}
+		parts = append(parts, fmt.Sprintf("Press %d for %s, %s", i-start+1, contacts[i].Name, contacts[i].Email))
+	}
+	next := ""
+	if start+8 < len(contacts) {
+		next = " Press 9 for more."
+	}
+	return "Choose a contact. " + strings.Join(parts, ". ") + "." + next + " Press pound to go back."
 }
 
 func recipientPrompt(d draft) string {
