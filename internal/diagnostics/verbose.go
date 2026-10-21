@@ -22,14 +22,29 @@ func Enabled() bool {
 	return err == nil && enabled
 }
 
+// LogLevel resolves the deployment log level. VOXMAIL_LOG_LEVEL accepts
+// debug, info, warn and error (case-insensitive); VOXMAIL_VERBOSE=true is the
+// legacy switch that forces debug. An unset or unknown value means info.
+func LogLevel() slog.Level {
+	if Enabled() {
+		return slog.LevelDebug
+	}
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("VOXMAIL_LOG_LEVEL"))) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
+}
+
 // HandlerOptions also works before configuration is loaded, allowing startup
 // diagnostics to use the same deployment switch.
 func HandlerOptions() *slog.HandlerOptions {
-	level := slog.LevelInfo
-	if Enabled() {
-		level = slog.LevelDebug
-	}
-	return &slog.HandlerOptions{Level: level}
+	return &slog.HandlerOptions{Level: LogLevel()}
 }
 
 var operations atomic.Uint64

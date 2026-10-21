@@ -1,7 +1,11 @@
 services:
   voxmail:
     image: "${VOXMAIL_IMAGE:-ghcr.io/s31354915/voxmail:latest}"
-    pull_policy: always
+    # Refresh deliberately: `latest` is a moving tag, so compose no longer
+    # re-pulls it on every restart. Set VOXMAIL_IMAGE to a pinned release tag
+    # or digest for production, and run `docker compose pull` when you mean
+    # to move to a newer image.
+    pull_policy: missing
     restart: unless-stopped
     init: true
     stop_grace_period: 60s

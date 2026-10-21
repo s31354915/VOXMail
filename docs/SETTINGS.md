@@ -25,6 +25,7 @@ an HTML control or sending JSON directly does not bypass those limits.
 | `VOXMAIL_BARESIP_BINARY` | `baresip` | Baresip executable | Yes |
 | `VOXMAIL_BARESIP_CONFIG` | `$VOXMAIL_DATA_DIR/config/baresip` | Generated baresip configuration directory | Yes |
 | `VOXMAIL_TRUSTED_PROXY_CIDRS` | empty | Comma-separated valid CIDRs; only these immediate peers may supply trusted forwarding headers | Yes |
+| `VOXMAIL_LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, or `error`, case-insensitive; invalid values reject startup | Yes |
 | `VOXMAIL_IMAGE` | `ghcr.io/s31354915/voxmail:latest` in Compose | Prefer an immutable release tag or digest for controlled upgrades | Recreate |
 | `VOXMAIL_VOLUME_NAME` | `voxmail-data` in Compose | Named Docker volume used by backup/restore | Recreate |
 | `VOXMAIL_PROVISION_MODELS` | `0` in Compose | Explicitly provisions default speech models when enabled; suppressed in offline mode | Recreate |
@@ -133,5 +134,10 @@ does not assert that each account has synchronized successfully.
 `VOXMAIL_VERBOSE` is a deployment boolean, default `false`. Set it to `true`
 to enable Go debug traces and supported diagnostic modes for mbsync, Piper,
 Whisper, FFmpeg, Baresip, and the native bridge. Invalid boolean values reject
-startup. See [verbose diagnostics](OPERATIONS.md#verbose-diagnostics) for
+startup.
+
+`VOXMAIL_LOG_LEVEL` selects the Go log level without enabling child-process
+diagnostic modes: `debug`, `info`, `warn`, or `error`, case-insensitive,
+default `info`. `VOXMAIL_VERBOSE=true` still forces `debug`; invalid values
+reject startup. See [verbose diagnostics](OPERATIONS.md#verbose-diagnostics) for
 recreation and log collection commands.

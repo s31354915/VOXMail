@@ -49,6 +49,12 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	logLevel := strings.ToLower(strings.TrimSpace(os.Getenv("VOXMAIL_LOG_LEVEL")))
+	switch logLevel {
+	case "", "debug", "info", "warn", "warning", "error":
+	default:
+		return Config{}, fmt.Errorf("VOXMAIL_LOG_LEVEL must be one of debug, info, warn, or error")
+	}
 	for _, key := range []string{"VOXMAIL_MAX_CALLS", "VOXMAIL_HISTORY_RETENTION_DAYS", "VOXMAIL_HISTORY_MAX_ROWS"} {
 		if value := os.Getenv(key); value != "" {
 			if _, err := strconv.Atoi(value); err != nil {
