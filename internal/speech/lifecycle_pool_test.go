@@ -49,10 +49,9 @@ func TestPoolSharesWorkerAcrossOverlappingActivations(t *testing.T) {
 	if first == nil || firstLease == nil {
 		t.Fatal("first activation failed")
 	}
-	if _, secondLease := pool.Activate(model, 2); secondLease == nil {
+	second, secondLease := pool.Activate(model, 2)
+	if second == nil || secondLease == nil {
 		t.Fatal("second activation failed")
-	} else {
-		defer secondLease.Release()
 	}
 	third, thirdLease := pool.Activate(model, 5)
 	if third == nil || thirdLease == nil {
@@ -78,6 +77,11 @@ func TestPoolSharesWorkerAcrossOverlappingActivations(t *testing.T) {
 	if pool.ReleaseKeepWarm(model) {
 		t.Fatal("keep-warm release succeeded for a voice that was never pinned")
 	}
+
+	secondLease.Release()
+	first.waitWarmIdle()
+	second.waitWarmIdle()
+	third.waitWarmIdle()
 }
 
 // KeepWarm pins survive call releases; only ReleaseKeepWarm lifts a pin,
@@ -87,7 +91,8 @@ func TestKeepWarmPinsSurviveReleases(t *testing.T) {
 	model := fakePoolVoice(t, root, "pinned.onnx", "pinned-model")
 	pool := NewRuntimePool(filepath.Join(root, "fake-piper.sh"), root, filepath.Join(root, "missing-whisper"), "unused", filepath.Join(root, "runtime"), "python3", false)
 
-	if pool.KeepWarm(model, 3) == nil {
+	pinned := pool.KeepWarm(model, 3)
+	if pinned == nil {
 		t.Fatal("KeepWarm returned no runtime")
 	}
 	if _, lease := pool.Activate(model, 3); lease == nil {
@@ -108,6 +113,8 @@ func TestKeepWarmPinsSurviveReleases(t *testing.T) {
 	if _, ok := pooledWorkerRefs(pool, model); ok {
 		t.Fatal("worker stayed pooled after the pin was released")
 	}
+
+	pinned.waitWarmIdle()
 }
 
 // A resident engine pools one resident worker per voice, shared across
@@ -165,6 +172,9 @@ func TestResidentWorkerLifecycle(t *testing.T) {
 	if ok {
 		t.Fatal("resident worker stayed pooled after the last release")
 	}
+
+	first.waitWarmIdle()
+	second.waitWarmIdle()
 }
 
 // The pool warms Whisper once, shared by every runtime regardless of voice
@@ -194,7 +204,6 @@ func TestRuntimePoolSharesWhisperWarmAcrossSpeeds(t *testing.T) {
 	if second == nil || secondLease == nil {
 		t.Fatal("second activation failed")
 	}
-	defer secondLease.Release()
 	if first == second {
 		t.Fatal("different speeds should build distinct runtimes")
 	}
@@ -223,4 +232,8 @@ func TestRuntimePoolSharesWhisperWarmAcrossSpeeds(t *testing.T) {
 	if standalone.sttShared != nil {
 		t.Fatal("standalone runtime must not inherit pool whisper state")
 	}
+
+	secondLease.Release()
+	first.waitWarmIdle()
+	second.waitWarmIdle()
 }

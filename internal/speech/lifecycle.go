@@ -368,6 +368,10 @@ type Runtime struct {
 	residentEnabled bool
 	residentPython  string
 	onZero          func()
+	// warmWG tracks the warm-up goroutines Activate spawned so a caller
+	// that dismantles the runtime's directory tree can wait for them to
+	// stop writing first.
+	warmWG sync.WaitGroup
 }
 
 type Lease struct {
@@ -504,6 +508,15 @@ func (p *RuntimePool) Activate(voice string, speed int) (*Runtime, *Lease) {
 	return runtime, runtime.Activate()
 }
 
+// waitWarmIdle blocks until every warm-up goroutine this runtime spawned has
+// exited, so nothing writes into the runtime's directory afterwards.
+func (r *Runtime) waitWarmIdle() {
+	if r == nil {
+		return
+	}
+	r.warmWG.Wait()
+}
+
 func SpeedExtra(speed int) []string {
 	speed = normalizeSpeed(speed)
 	// Piper's length_scale is inverse speech rate: speed 3 is Piper's own
@@ -551,7 +564,11 @@ func (r *Runtime) Activate() *Lease {
 		warmCtx, cancel := context.WithCancel(context.Background())
 		r.cancel = cancel
 		ready := r.ready
-		go r.warm(warmCtx, ready)
+		r.warmWG.Add(1)
+		go func() {
+			defer r.warmWG.Done()
+			r.warm(warmCtx, ready)
+		}()
 	}
 	r.refs++
 	r.mu.Unlock()
@@ -595,7 +612,7 @@ func (r *Runtime) warm(ctx context.Context, ready *capabilityReady) {
 		if warmDir == "" {
 			warmDir = os.TempDir()
 		}
-		if err := os.MkdirAll(warmDir, 0700); err != nil {
+		failWarm := func(err error) {
 			discard()
 			r.mu.Lock()
 			if r.ready == ready && r.worker == w {
@@ -606,20 +623,27 @@ func (r *Runtime) warm(ctx context.Context, ready *capabilityReady) {
 				r.ttsReady.finish(err)
 			}
 			r.mu.Unlock()
+		}
+		// Pool teardown clears r.ready under r.mu before dismantling the
+		// runtime. Creating the warm-up scratch file under that same lock,
+		// and only while the runtime is still active, keeps a torn-down
+		// runtime from writing into a directory its owner may already be
+		// removing.
+		r.mu.Lock()
+		if r.ready != ready {
+			r.mu.Unlock()
+			discard()
+			return
+		}
+		if err := os.MkdirAll(warmDir, 0700); err != nil {
+			r.mu.Unlock()
+			failWarm(err)
 			return
 		}
 		file, releaseFile, err := maintenance.CreateTemp(warmDir, ".piper-warm-*.wav")
+		r.mu.Unlock()
 		if err != nil {
-			discard()
-			r.mu.Lock()
-			if r.ready == ready && r.worker == w {
-				if owned {
-					r.worker = nil
-				}
-				r.ttsErr = err
-				r.ttsReady.finish(err)
-			}
-			r.mu.Unlock()
+			failWarm(err)
 			return
 		}
 		defer releaseFile()
