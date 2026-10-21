@@ -5,6 +5,7 @@
   <title>VOXMail Console</title>
   <style>
 {{CONSOLE_STYLES}}
+body[data-signed-in="true"] .site-header { display: none; }
 </style>
 </head>
 <body data-setup-available="unknown"><main>
@@ -55,7 +56,6 @@
         <button type="submit" class="primary">Confirm recovery</button>
       </form>
       <div class="status" id="auth-status" role="status" aria-live="polite" aria-atomic="true"></div>
-      <p class="auth-note"><img src="/assets/added-021-information-circle.svg" alt="" width="22" height="22"><span>IMAP synchronization is performed by <code>mbsync</code>; routine sync never expunges remote mail.</span></p>
     </div>
   </section>
   <section id="app" class="hidden">
