@@ -86,6 +86,12 @@ func (i Indexer) IndexAvailable(ctx context.Context, accountID, root string) err
 }
 
 func (i Indexer) index(ctx context.Context, accountID, root string, purge bool) error {
+	// Fail fast on a context that is already cancelled, before any store
+	// access: the stamp load is the scan's first query and the walk would
+	// otherwise start against a dead context.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	scanID := newScanID()
 	modTime := func(info os.FileInfo) string { return info.ModTime().UTC().Format(time.RFC3339Nano) }
 	// One stamp query per scan replaces one FindMailIndex query per file:

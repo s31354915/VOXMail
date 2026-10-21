@@ -212,14 +212,16 @@ printf '%s\n' 'From: sender@example.com' 'To: u@example.com' 'Subject: downloade
 	}
 }
 
-// Inject only the lookup boundary; all other indexing operations remain real.
+// Inject only the scan's first store boundary; all other indexing operations
+// remain real. The stamp load replaced the per-file lookup as the boundary the
+// recovery scan hits first.
 type unavailableIndexStore struct {
 	mailindex.IndexStore
 	err error
 }
 
-func (s unavailableIndexStore) FindMailIndex(context.Context, string, string) (store.MailIndexRecord, error) {
-	return store.MailIndexRecord{}, s.err
+func (s unavailableIndexStore) ListMailIndexStamps(context.Context, string) (map[string]store.MailIndexStamp, error) {
+	return nil, s.err
 }
 
 func TestPartialIndexHonorsCancellation(t *testing.T) {
@@ -238,11 +240,11 @@ type cancelOnceIndexStore struct {
 	cancel context.CancelFunc
 }
 
-func (s *cancelOnceIndexStore) FindMailIndex(ctx context.Context, account, path string) (store.MailIndexRecord, error) {
+func (s *cancelOnceIndexStore) ListMailIndexStamps(ctx context.Context, account string) (map[string]store.MailIndexStamp, error) {
 	if s.cancel != nil {
 		s.cancel()
 		s.cancel = nil
-		return store.MailIndexRecord{}, ctx.Err()
+		return nil, ctx.Err()
 	}
-	return s.IndexStore.FindMailIndex(ctx, account, path)
+	return s.IndexStore.ListMailIndexStamps(ctx, account)
 }
