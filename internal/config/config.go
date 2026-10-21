@@ -20,6 +20,7 @@ type Config struct {
 	ControlSocket        string
 	MaxCalls             int
 	MaxConcurrentSyncs   int
+	IMAPIdle             bool
 	STTBinary            string
 	STTModel             string
 	PiperBinary          string
@@ -56,6 +57,14 @@ func Load() (Config, error) {
 	default:
 		return Config{}, fmt.Errorf("VOXMAIL_LOG_LEVEL must be one of debug, info, warn, or error")
 	}
+	imapIdle := true
+	if raw := strings.TrimSpace(os.Getenv("VOXMAIL_IMAP_IDLE")); raw != "" {
+		parsed, err := strconv.ParseBool(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("VOXMAIL_IMAP_IDLE must be a boolean: %w", err)
+		}
+		imapIdle = parsed
+	}
 	for _, key := range []string{"VOXMAIL_MAX_CALLS", "VOXMAIL_MAX_CONCURRENT_SYNCS", "VOXMAIL_HISTORY_RETENTION_DAYS", "VOXMAIL_HISTORY_MAX_ROWS"} {
 		if value := os.Getenv(key); value != "" {
 			if _, err := strconv.Atoi(value); err != nil {
@@ -73,6 +82,7 @@ func Load() (Config, error) {
 		ControlSocket:      env("VOXMAIL_CONTROL_SOCKET", filepath.Join(dataDir, "run", "baresip.sock")),
 		MaxCalls:           envInt("VOXMAIL_MAX_CALLS", 10),
 		MaxConcurrentSyncs: envInt("VOXMAIL_MAX_CONCURRENT_SYNCS", 2),
+		IMAPIdle:           imapIdle,
 		STTBinary:          env("VOXMAIL_STT_BINARY", "whisper-cli"),
 		STTModel:           env("VOXMAIL_STT_MODEL", filepath.Join(dataDir, "whisper", "ggml-base.en-q5_1.bin")),
 		PiperBinary:        env("VOXMAIL_PIPER_BINARY", "piper"),

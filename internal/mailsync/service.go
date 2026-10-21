@@ -92,6 +92,12 @@ type Service struct {
 	// Zero or a negative value falls back to the package default of 2; values
 	// below 1 never make sense, so they keep the default too.
 	MaxConcurrentSyncs int
+	// IdleEnabled turns on per-account IMAP IDLE watchers so new INBOX mail
+	// triggers a targeted sync without waiting for the next scheduled sweep.
+	// Polling through SyncDue continues either way; the watchers only shorten
+	// the gap, and any watcher failure falls back to polling. Off keeps
+	// sweep-only behavior.
+	IdleEnabled bool
 	// EndpointResolver is required in production before mbsync is launched. It
 	// must return the exact numeric address that was policy-checked and dialed;
 	// the generated mbsync tunnel then uses that address without re-resolving
@@ -163,6 +169,9 @@ func (s *Service) Run(ctx context.Context) error {
 	s.ensureState()
 	s.running.Store(true)
 	defer s.running.Store(false)
+	if s.IdleEnabled {
+		_ = s.startIdleWatch(ctx)
+	}
 	_ = s.SyncAll(ctx)
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
