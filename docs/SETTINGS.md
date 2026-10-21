@@ -15,6 +15,7 @@ an HTML control or sending JSON directly does not bypass those limits.
 | `VOXMAIL_ENCRYPTION_KEY` | none | Required; at least 32 bytes. Keep it separate from `/data` backups | Yes |
 | `VOXMAIL_CONTROL_SOCKET` | `$VOXMAIL_DATA_DIR/run/baresip.sock` | Go/native baresip control socket | Yes |
 | `VOXMAIL_MAX_CALLS` | `10` | Integer from 1 through 100 | Yes |
+| `VOXMAIL_MAX_CONCURRENT_SYNCS` | `2` | Integer from 1 through 8. How many due mail accounts the scheduled sweep syncs at the same time | Yes |
 | `VOXMAIL_STT_BINARY` | `whisper-cli` | Whisper executable | Yes |
 | `VOXMAIL_STT_MODEL` | `$VOXMAIL_DATA_DIR/whisper/ggml-base.en.bin` | Whisper model path | Yes |
 | `VOXMAIL_PIPER_BINARY` | `piper` | Piper executable | Yes |

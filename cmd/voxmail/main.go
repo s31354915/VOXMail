@@ -427,7 +427,7 @@ func main() {
 	// while the call bridge remains available to send hangup commands.
 	server := &http.Server{Addr: cfg.HTTPAddr, Handler: webApp.Handler(), BaseContext: func(net.Listener) context.Context { return application.WorkerContext() }, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 90 * time.Second, IdleTimeout: 60 * time.Second}
 	indexer := &mailindex.Indexer{Store: db, Log: log}
-	syncService = &mailsync.Service{Store: db, Root: cfg.DataDir, QuarantineRoot: filepath.Join(cfg.DataDir, "quarantine"), Runner: mailsync.Runner{}, Index: indexer, Secrets: secrets, Log: log, EndpointResolver: mailsync.CheckPublicIMAPEndpoint}
+	syncService = &mailsync.Service{Store: db, Root: cfg.DataDir, MaxConcurrentSyncs: cfg.MaxConcurrentSyncs, QuarantineRoot: filepath.Join(cfg.DataDir, "quarantine"), Runner: mailsync.Runner{}, Index: indexer, Secrets: secrets, Log: log, EndpointResolver: mailsync.CheckPublicIMAPEndpoint}
 	if !cfg.OfflineMode {
 		bridgeService.Refresher = syncService
 		webApp.Sync = syncService
