@@ -338,7 +338,12 @@ func (s *Server) reorderAccounts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.Store.ReorderAccounts(r.Context(), u.ID, body.IDs); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		var input store.InputError
+		if errors.As(err, &input) {
+			writeError(w, http.StatusBadRequest, input.Error())
+			return
+		}
+		serverError(w, err)
 		return
 	}
 	_ = s.Store.Audit(r.Context(), u.ID, "accounts_reordered", fmt.Sprintf("count=%d", len(body.IDs)))
@@ -388,7 +393,8 @@ func (s *Server) validateAccount(w http.ResponseWriter, r *http.Request) {
 			} else if errors.Is(err, errStoredAccountCredentialsUnavailable) {
 				writeOperationalError(w, http.StatusBadGateway, err)
 			} else {
-				writeError(w, http.StatusBadRequest, err.Error())
+				// Unknown credential-fill failures are internal detail.
+				serverError(w, err)
 			}
 			return
 		}
