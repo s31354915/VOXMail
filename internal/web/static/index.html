@@ -37,7 +37,7 @@
         <div class="eyebrow">Welcome back</div><h2>Sign in to VOXMail</h2><p id="login-copy" class="form-copy">Manage your mail accounts, caller access, voice, and SIP settings from one place.</p>
         <label>Username<input name="username" autocomplete="username" placeholder="Your username" required></label>
         <label>Password<input name="password" type="password" autocomplete="current-password" placeholder="Your password" required></label>
-        <div class="grid"><label>Authenticator code <small>if enabled</small><input name="totp" inputmode="numeric" autocomplete="one-time-code" placeholder="6 digits"></label><label>Backup code <small>instead of TOTP</small><input name="backup_code" autocomplete="off" placeholder="Backup code"></label></div>
+        <details class="auth-more"><summary>Use an authenticator or backup code instead</summary><div><div class="grid"><label>Authenticator code <small>if enabled</small><input name="totp" inputmode="numeric" autocomplete="one-time-code" placeholder="6 digits"></label><label>Backup code <small>instead of TOTP</small><input name="backup_code" autocomplete="off" placeholder="Backup code"></label></div></div></details>
         <div class="form-actions"><button type="submit" class="primary">Sign in</button></div>
       </form>
       <div id="recovery-tools" class="auth-tools hidden"><div class="grid"><button id="reset-password" type="button"><img src="/assets/added-017-rotate-arrows.svg" alt="" width="18" height="18">Reset password</button><button id="bypass-totp" type="button"><img src="/assets/added-019-shield-with-half-filled-interior.svg" alt="" width="18" height="18">Bypass TOTP</button></div></div>
