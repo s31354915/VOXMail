@@ -548,6 +548,26 @@ func TestRegistrationFailureClassifiesOnlyNativeResponseCode(t *testing.T) {
 	}
 }
 
+func TestWriteConfigAndAccountRenderTLS(t *testing.T) {
+	dir := t.TempDir()
+	b := &Baresip{ConfigDir: dir, MaxCalls: 10}
+	settings := store.SIPSettings{Username: "alice", Password: "s3cret", Domain: "sip.example.com", Transport: "tls", RegInterval: 120}
+	if err := b.writeConfig(settings, true); err != nil {
+		t.Fatalf("writeConfig: %v", err)
+	}
+	config, err := os.ReadFile(filepath.Join(dir, "config"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(config), "sip_transports tls") {
+		t.Fatalf("config did not select the tls transport: %s", config)
+	}
+	account := buildAccount(settings)
+	if !strings.Contains(account, ";transport=tls") {
+		t.Fatalf("account did not use tls transport: %s", account)
+	}
+}
+
 func TestRTPPortRangeTracksMaxCalls(t *testing.T) {
 	for _, tc := range []struct {
 		maxCalls int
