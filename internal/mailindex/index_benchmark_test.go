@@ -20,6 +20,17 @@ type measuredIndexStore struct {
 	*store.Store
 	latency                                time.Duration
 	find, seen, upsert, attachments, purge int
+	stamps, seenBatch                      int
+}
+
+func (s *measuredIndexStore) ListMailIndexStamps(ctx context.Context, account string) (map[string]store.MailIndexStamp, error) {
+	defer func() { s.stamps++ }()
+	return s.Store.ListMailIndexStamps(ctx, account)
+}
+
+func (s *measuredIndexStore) MarkMailIndexSeenBatch(ctx context.Context, account, scan string, paths []string) (int64, error) {
+	defer func() { s.seenBatch += len(paths) }()
+	return s.Store.MarkMailIndexSeenBatch(ctx, account, scan, paths)
 }
 
 func (s *measuredIndexStore) FindMailIndex(ctx context.Context, account, path string) (store.MailIndexRecord, error) {

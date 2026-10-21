@@ -8,6 +8,13 @@ Create `.env` from the example and set a unique key:
 VOXMAIL_ENCRYPTION_KEY=<at least 32 random bytes>
 ```
 
+The key stretches through argon2id before use, so weak passphrases cost a
+memory-hard run per guess. Records sealed by this version carry a v2 marker;
+records sealed by older versions (HKDF-only or raw SHA-256 schedules) still
+open transparently after an upgrade, and are re-sealed under v2 the next time
+they are saved. The same key must stay on the deployment across restarts:
+older records can only be read while the key that sealed them is still in use.
+
 For telephone service, configure the provider credentials in the web console's
 **SIP connection** panel (registrar, SIP username, password, local bind port,
 registrar port, transport, registration interval). The `voxmail` process writes the baresip configuration
@@ -24,8 +31,9 @@ VOXMAIL_SIP_ACCOUNT=<sip:YOUR_NUMBER:YOUR_PASSWORD@YOUR_PROVIDER>;regint=300
 
 Provider-specific account syntax, outbound proxy, codecs, and NAT behavior are
 provider-dependent. Local SIP binding and registrar ports default independently
-to 5060, and RTP uses UDP
-10000–10100; both ranges must be reachable from the provider. Do not commit
+to 5060, and RTP uses UDP ports starting at 10000, with the range sized from
+the call limit (four ports per call, 32-port floor: 10000-10039 at the default
+limit of 10 calls); both ranges must be reachable from the provider. Do not commit
 provider credentials. A registration interval of `0` means “use the default”
 and is persisted/rendered as 300 seconds; the browser and API use the same
 normalization.
@@ -146,7 +154,7 @@ never use placeholder model files:
 
 ```sh
 VOXMAIL_PIPER_MODEL=/path/to/voice.onnx \
-VOXMAIL_WHISPER_MODEL=/path/to/ggml-base.en.bin \
+VOXMAIL_WHISPER_MODEL=/path/to/ggml-base.en-q5_1.bin \
 VOXMAIL_REAL_MODEL_TEXT='This is a VOXMail speech smoke test.' \
 VOXMAIL_REAL_MODEL_EXPECTED='speech smoke test' \
 scripts/real-model-smoke.sh
@@ -551,8 +559,8 @@ to, the client forwarding headers before passing requests to VOXMail.
 
 Confirm baresip registered (SIP connection panel or logs), the caller is
 whitelisted, and the PIN is entered followed by `#`. Check baresip and VOXMail
-logs. SIP needs TCP/UDP 5060 and RTP needs UDP 10000–10100 reachable from the
-provider.
+logs. SIP needs TCP/UDP 5060 and RTP needs UDP from 10000 up to the sized range
+(10000-10039 at the default call limit) reachable from the provider.
 
 Unexpected Baresip exits wait 2, 4, 8, 16, then at most 30 seconds before
 restarting. Successful process creation preserves this crash history; a child
@@ -606,6 +614,43 @@ engine containers use no network and read-only model mounts. The separate SIP
 peer checks use only local sockets and test registration, audio, DTMF, restart,
 and shutdown with native diagnostics enabled and disabled. The supplied image
 must be built from the current native source.
+
+## Resource tuning
+
+VOXMail ships with conservative defaults; the knobs below change how much CPU,
+memory and network a deployment uses. Set them in the deployment environment
+(or Compose `.env`) and recreate the service. All are listed in
+[Settings](SETTINGS.md).
+
+**Sync concurrency.** `VOXMAIL_MAX_CONCURRENT_SYNCS` (default `2`, allowed
+`1`-`8`) sets how many due mail accounts the scheduled sweep syncs at the same
+time. Two keeps a slow or unreachable provider from holding up the sweep while
+bounding concurrent mbsync and SQLite write load; raise it only on hardware
+with headroom, and re-run the synchronization benchmark in
+[Performance](PERFORMANCE.md) after changing it.
+
+**IMAP IDLE.** `VOXMAIL_IMAP_IDLE` (default `true`) watches each account's
+INBOX over IMAP IDLE and starts an incremental sync the moment new mail
+arrives, so the sweep itself can stay infrequent. Set `false` for providers
+that reject IDLE or keep dropping idle connections; sweeps then remain the
+only sync trigger. Idle watchers reconnect with backoff (one to ten minutes)
+and re-check account configuration every minute.
+
+**Log level.** `VOXMAIL_LOG_LEVEL` (default `info`) throttles Go diagnostics
+volume; `warn` or `error` trims log churn on busy deployments, while `debug`
+(available always via `VOXMAIL_VERBOSE=true`) is for troubleshooting only.
+See [Verbose diagnostics](#verbose-diagnostics).
+
+**Speech models.** The default Whisper model is the quantized
+`ggml-base.en-q5_1.bin` build: about 57 MB to download instead of 148 MB, and
+noticeably less memory and CPU per transcription at similar accuracy. It is
+overridable with `VOXMAIL_STT_MODEL`; see [Models](#models).
+
+**Child processes.** Piper, Whisper, FFmpeg and mbsync share bounded
+execution: output capture, per-operation time caps and process-group cleanup
+are covered in [Child-process execution limits](#child-process-execution-limits),
+and the speech prompt cache in `/data/prompts` is capped at 512 files /
+128 MiB. These bounds apply regardless of the settings above.
 
 ## Child-process execution limits
 

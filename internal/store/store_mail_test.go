@@ -246,6 +246,32 @@ func TestReorderAccountsRequiresCompleteOwnedSet(t *testing.T) {
 	}
 }
 
+func TestReorderAccountsClassifiesInputErrors(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "mail.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name string
+		ids  []string
+	}{
+		{"missing user", []string{"a-order-1"}},
+		{"empty id", []string{"a-order-1", " "}},
+		{"duplicate id", []string{"a-order-1", "a-order-1"}},
+	} {
+		err := db.ReorderAccounts(ctx, "u-classify", tc.ids)
+		if err == nil {
+			t.Fatalf("%s: expected rejection", tc.name)
+		}
+		var input InputError
+		if !errors.As(err, &input) {
+			t.Fatalf("%s: error %v is not marked as client input", tc.name, err)
+		}
+	}
+}
+
 func TestListMailUnreadOnlyUsesMappedInbox(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "mail.db"))
 	if err != nil {

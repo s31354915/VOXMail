@@ -212,6 +212,22 @@ func TestTestAlertReleasesPendingAfterCompletion(t *testing.T) {
 	}
 }
 
+func TestTestAlertDialFailureIsSanitized(t *testing.T) {
+	db := seedAlertStore(t)
+	bridge := &fakeBridge{err: errors.New("dial tcp 10.255.0.9:5060: connect: internal transport detail")}
+	s := &Service{Store: db, Bridge: bridge, MinDelay: time.Minute}
+	err := s.TestAlert(context.Background(), "u1")
+	if err == nil {
+		t.Fatal("expected the dial failure to surface")
+	}
+	if strings.Contains(err.Error(), "10.255.0.9") || strings.Contains(err.Error(), "transport") {
+		t.Fatalf("dial failure leaked internal detail: %v", err)
+	}
+	if got := err.Error(); got != "the test alert call could not be placed" {
+		t.Fatalf("expected the sanitized message, got %q", got)
+	}
+}
+
 func TestTestAlertRequiresPhone(t *testing.T) {
 	db, err := store.Open(t.TempDir() + "/test.db")
 	if err != nil {

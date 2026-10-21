@@ -28,7 +28,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Minute)
 	defer cancel()
 	voices := filepath.Join(root, "voices")
-	whisper := filepath.Join(root, "whisper", "ggml-base.en.bin")
+	whisper := filepath.Join(root, "whisper", "ggml-base.en-q5_1.bin")
 	if err := speech.Provision(ctx, voices, whisper); err != nil {
 		fail(err)
 	}

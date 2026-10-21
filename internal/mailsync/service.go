@@ -43,6 +43,20 @@ const (
 // runTimeout returns the hard execution cap for one mbsync invocation of the
 // given kind. A run that exceeds it is killed and recorded as failed rather
 // than left open indefinitely.
+// defaultMaxConcurrentSyncs is the scheduled sweep's concurrency bound. Two
+// keeps one slow provider from holding later accounts hostage while leaving
+// headroom for the single SQLite connection the store shares.
+const defaultMaxConcurrentSyncs = 2
+
+// syncConcurrencyLimit returns the configured scheduled-sync concurrency,
+// floored at 1 so a misconfigured value cannot deadlock the sweep.
+func (s *Service) syncConcurrencyLimit() int {
+	if s.MaxConcurrentSyncs > 0 {
+		return s.MaxConcurrentSyncs
+	}
+	return defaultMaxConcurrentSyncs
+}
+
 func (s *Service) runTimeout(kind string) time.Duration {
 	if kind == "initial" || kind == "reconciliation" || kind == "manual" {
 		if s.InitialSyncTimeout > 0 {
@@ -74,6 +88,16 @@ type Service struct {
 	// InitialSyncTimeout instead. Zero falls back to the package defaults.
 	SyncTimeout        time.Duration
 	InitialSyncTimeout time.Duration
+	// MaxConcurrentSyncs bounds how many due accounts SyncDue runs at once.
+	// Zero or a negative value falls back to the package default of 2; values
+	// below 1 never make sense, so they keep the default too.
+	MaxConcurrentSyncs int
+	// IdleEnabled turns on per-account IMAP IDLE watchers so new INBOX mail
+	// triggers a targeted sync without waiting for the next scheduled sweep.
+	// Polling through SyncDue continues either way; the watchers only shorten
+	// the gap, and any watcher failure falls back to polling. Off keeps
+	// sweep-only behavior.
+	IdleEnabled bool
 	// EndpointResolver is required in production before mbsync is launched. It
 	// must return the exact numeric address that was policy-checked and dialed;
 	// the generated mbsync tunnel then uses that address without re-resolving
@@ -145,6 +169,9 @@ func (s *Service) Run(ctx context.Context) error {
 	s.ensureState()
 	s.running.Store(true)
 	defer s.running.Store(false)
+	if s.IdleEnabled {
+		_ = s.startIdleWatch(ctx)
+	}
 	_ = s.SyncAll(ctx)
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
@@ -227,18 +254,28 @@ func (s *Service) SyncDue(ctx context.Context) error {
 	// held every other account's schedule hostage. Run them concurrently with
 	// a small bound; per-account ownership is still enforced by the busy map
 	// inside syncAccount.
-	const maxConcurrentSyncs = 4
-	sem := make(chan struct{}, maxConcurrentSyncs)
+	sem := make(chan struct{}, s.syncConcurrencyLimit())
 	var wg sync.WaitGroup
 	var errMu sync.Mutex
 	var syncErr error
 	for _, account := range due {
 		wg.Add(1)
-		sem <- struct{}{}
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			wg.Done()
+			wg.Wait()
+			return errors.Join(syncErr, ctx.Err())
+		}
 		go func(account store.Account) {
 			defer wg.Done()
 			defer func() { <-sem }()
 			if err := s.syncAccount(ctx, account, s.nextKind(ctx, account)); err != nil {
+				if errors.Is(err, store.ErrAccountDeleting) {
+					// The account is being removed; skip it quietly instead
+					// of failing the whole sweep.
+					return
+				}
 				if s.Log != nil {
 					s.Log.Error("mail sync failed", "account", account.ID, "error", err)
 				}

@@ -9,7 +9,7 @@ func clearEnv(t *testing.T) {
 	t.Helper()
 	for _, key := range []string{
 		"VOXMAIL_DATA_DIR", "VOXMAIL_HTTP_ADDR", "VOXMAIL_DB_PATH", "VOXMAIL_ENCRYPTION_KEY", "VOXMAIL_OFFLINE_MODE", "VOXMAIL_VERBOSE",
-		"VOXMAIL_CONTROL_SOCKET", "VOXMAIL_MAX_CALLS", "VOXMAIL_STT_BINARY", "VOXMAIL_STT_MODEL",
+		"VOXMAIL_CONTROL_SOCKET", "VOXMAIL_MAX_CALLS", "VOXMAIL_MAX_CONCURRENT_SYNCS", "VOXMAIL_STT_BINARY", "VOXMAIL_STT_MODEL",
 		"VOXMAIL_PIPER_BINARY", "VOXMAIL_PIPER_MODEL", "VOXMAIL_VOICE_DIR", "VOXMAIL_RECORDINGS_DIR",
 		"VOXMAIL_GREETING_PATH", "VOXMAIL_BARESIP_BINARY", "VOXMAIL_BARESIP_CONFIG", "VOXMAIL_TRUSTED_PROXY_CIDRS",
 		"VOXMAIL_HISTORY_RETENTION_DAYS", "VOXMAIL_HISTORY_MAX_ROWS",
@@ -31,6 +31,9 @@ func TestLoadDefaults(t *testing.T) {
 	if c.MaxCalls != 10 {
 		t.Errorf("MaxCalls = %d", c.MaxCalls)
 	}
+	if c.MaxConcurrentSyncs != 2 {
+		t.Errorf("MaxConcurrentSyncs = %d, want default 2", c.MaxConcurrentSyncs)
+	}
 	if c.HistoryRetentionDays != 365 || c.HistoryMaxRows != 100000 {
 		t.Errorf("history defaults = %d days/%d rows", c.HistoryRetentionDays, c.HistoryMaxRows)
 	}
@@ -49,6 +52,7 @@ func TestLoadCustom(t *testing.T) {
 	t.Setenv("VOXMAIL_HTTP_ADDR", ":9999")
 	t.Setenv("VOXMAIL_OFFLINE_MODE", "true")
 	t.Setenv("VOXMAIL_MAX_CALLS", "7")
+	t.Setenv("VOXMAIL_MAX_CONCURRENT_SYNCS", "3")
 	t.Setenv("VOXMAIL_HISTORY_RETENTION_DAYS", "90")
 	t.Setenv("VOXMAIL_HISTORY_MAX_ROWS", "5000")
 	t.Setenv("VOXMAIL_TRUSTED_PROXY_CIDRS", "203.0.113.0/24, 2001:db8::/32,203.0.113.0/24")
@@ -56,7 +60,7 @@ func TestLoadCustom(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if c.DataDir != "/custom/data" || c.HTTPAddr != ":9999" || !c.OfflineMode || c.MaxCalls != 7 || c.HistoryRetentionDays != 90 || c.HistoryMaxRows != 5000 {
+	if c.DataDir != "/custom/data" || c.HTTPAddr != ":9999" || !c.OfflineMode || c.MaxCalls != 7 || c.MaxConcurrentSyncs != 3 || c.HistoryRetentionDays != 90 || c.HistoryMaxRows != 5000 {
 		t.Errorf("custom values not applied: %+v", c)
 	}
 	if want := "/custom/data/sqlite/voxmail.db"; c.DBPath != want {
@@ -112,6 +116,21 @@ func TestLoadRejectsInvalidMaxCalls(t *testing.T) {
 	t.Setenv("VOXMAIL_MAX_CALLS", "9999")
 	if _, err := Load(); err == nil {
 		t.Fatal("Load accepted MaxCalls above 100")
+	}
+}
+
+func TestLoadRejectsInvalidMaxConcurrentSyncs(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("VOXMAIL_ENCRYPTION_KEY", "01234567890123456789012345678901")
+	t.Setenv("VOXMAIL_MAX_CONCURRENT_SYNCS", "0")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load accepted MaxConcurrentSyncs below 1")
+	}
+	clearEnv(t)
+	t.Setenv("VOXMAIL_ENCRYPTION_KEY", "01234567890123456789012345678901")
+	t.Setenv("VOXMAIL_MAX_CONCURRENT_SYNCS", "9")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load accepted MaxConcurrentSyncs above 8")
 	}
 }
 

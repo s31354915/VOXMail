@@ -46,10 +46,46 @@ func (s *Service) openMessages(sess *session, unreadOnly bool, description strin
 	transitionLocked(sess, "list")
 	s.mu.Unlock()
 	if len(mails) == 0 {
-		s.prompt(sess, "No messages in "+description+". Press pound to go back.")
+		if unreadOnly {
+			s.prompt(sess, "You have no unread messages. Press pound to go back.")
+		} else {
+			s.prompt(sess, "No messages in "+description+". Press pound to go back.")
+		}
 	} else {
-		s.prompt(sess, listPrompt(mails[0], 0, len(mails)))
+		prompt := listPrompt(mails[0], 0, len(mails))
+		if unreadOnly {
+			prompt = unreadCountPrompt(len(mails)) + " " + prompt
+		}
+		s.prompt(sess, prompt)
 	}
+}
+
+// unreadCountPrompt tells the caller how many unread messages they are about
+// to hear before the list starts, so the scale is known before the first item.
+func unreadCountPrompt(count int) string {
+	if count == 1 {
+		return "You have 1 unread message."
+	}
+	return fmt.Sprintf("You have %d unread messages.", count)
+}
+
+// announceUnreadCount is the account menu's count shortcut: it speaks the
+// account's unread count without opening the list, then repeats the menu.
+func (s *Service) announceUnreadCount(sess *session, account store.Account) {
+	count, err := s.Store.CountUnreadForAccount(s.baseContext(), sess.UserID, account.ID)
+	if err != nil {
+		s.prompt(sess, "The unread count is temporarily unavailable. "+s.accountMenuPrompt(sess, account))
+		return
+	}
+	if count == 0 {
+		s.prompt(sess, account.CanonicalName+" has no unread messages. "+s.accountMenuPrompt(sess, account))
+		return
+	}
+	countLine := fmt.Sprintf("%s has %d unread messages.", account.CanonicalName, count)
+	if count == 1 {
+		countLine = account.CanonicalName + " has 1 unread message."
+	}
+	s.prompt(sess, countLine+" "+s.accountMenuPrompt(sess, account))
 }
 
 func (s *Service) handleAccountMenu(sess *session, key string) {
@@ -103,6 +139,8 @@ func (s *Service) handleSelectedAccountMenu(sess *session, key string) {
 	switch key {
 	case "1":
 		s.openAccountFolders(sess, account)
+	case "5":
+		s.announceUnreadCount(sess, account)
 	case "2":
 		s.mu.Lock()
 		transitionLocked(sess, "draft_menu")
@@ -1049,9 +1087,9 @@ func accountPrompt(accounts []store.Account, page int) string {
 
 func (s *Service) accountMenuPrompt(sess *session, account store.Account) string {
 	if !s.alertsAvailable(sess) {
-		return fmt.Sprintf("%s. Press 1 to listen to mail, 2 to send an email, or 3 to refresh. Press pound to go back.", account.CanonicalName)
+		return fmt.Sprintf("%s. Press 1 to listen to mail, 2 to send an email, 3 to refresh, or 5 for the unread count. Press pound to go back.", account.CanonicalName)
 	}
-	return fmt.Sprintf("%s. Press 1 to listen to mail, 2 to send an email, 3 to refresh, or 4 for account settings. Press pound to go back.", account.CanonicalName)
+	return fmt.Sprintf("%s. Press 1 to listen to mail, 2 to send an email, 3 to refresh, 4 for account settings, or 5 for the unread count. Press pound to go back.", account.CanonicalName)
 }
 
 func standardFolderRole(key string) (string, string) {

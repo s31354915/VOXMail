@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/emersion/go-imap"
+	"github.com/emersion/go-imap-idle"
 	"github.com/emersion/go-imap/client"
 	"github.com/voxmail/voxmail/internal/netguard"
 )
@@ -684,4 +685,86 @@ func (c *Client) boundaryError(stage string, err error) error {
 		err = errors.Join(err, contextErr)
 	}
 	return operation.Wrap("imap", stage, category, err)
+}
+
+// idleBudget bounds one IDLE session so a silent provider cannot hold the
+// transport deadline machinery indefinitely. The watcher re-enters IDLE
+// right after each bounded session ends, so the bound never delays a
+// notification by more than the remaining second of a session.
+const idleBudget = 24 * time.Minute
+
+// Idle selects folder and enters IMAP IDLE (RFC 2177). It blocks until the
+// server reports a mailbox update, the session budget or ctx expires, or the
+// transport fails. sawUpdate is true only for a real mailbox update, the
+// caller's cue to run a sync; every other return ends the session without
+// one, and the caller decides whether to reconnect or fall back to polling.
+func (c *Client) Idle(ctx context.Context, folder string) (sawUpdate bool, retErr error) {
+	if c == nil || c.conn == nil {
+		return false, fmt.Errorf("IMAP connection is unavailable")
+	}
+	if ctx == nil {
+		ctx = c.ctx
+	}
+	if err := c.ctx.Err(); err != nil {
+		return false, err
+	}
+	if folder != "" {
+		if _, err := c.conn.Select(folder, false); err != nil {
+			return false, operation.Wrap("imap", "select", operation.Protocol, err)
+		}
+	}
+	// go-imap applies its per-command deadline (commandTimeout) to every
+	// command execution, including IDLE, so the session would be cut off at
+	// 45 seconds. Widen the transport for the bounded session and restore
+	// both on the way out.
+	sessionCtx, cancel := context.WithTimeout(ctx, idleBudget)
+	defer cancel()
+	c.conn.Timeout = 0
+	defer func() { c.conn.Timeout = commandTimeout }()
+	if err := c.raw.SetDeadline(time.Now().Add(idleBudget + time.Minute)); err != nil {
+		return false, operation.Wrap("imap", "idle", operation.Protocol, err)
+	}
+	updates := make(chan client.Update, 16)
+	c.conn.Updates = updates
+	defer func() {
+		// The reader goroutine may still be pushing updates it saw before
+		// the session ended; drain them so it never blocks on a send.
+		for drained := true; drained; {
+			select {
+			case _, drained = <-updates:
+			default:
+				drained = false
+			}
+		}
+		c.conn.Updates = nil
+	}()
+	stop := make(chan struct{})
+	idleDone := make(chan error, 1)
+	idleClient := idle.NewClient(c.conn)
+	go func() { idleDone <- idleClient.Idle(stop) }()
+	defer func() {
+		close(stop)
+		if idleDone != nil {
+			select {
+			case <-idleDone:
+			case <-time.After(cleanupTimeout):
+			}
+		}
+	}()
+	for {
+		select {
+		case <-sessionCtx.Done():
+			return false, sessionCtx.Err()
+		case update := <-updates:
+			if _, ok := update.(*client.MailboxUpdate); ok {
+				return true, nil
+			}
+		case err := <-idleDone:
+			idleDone = nil
+			if err != nil {
+				return false, operation.Wrap("imap", "idle", operation.Protocol, err)
+			}
+			return false, nil
+		}
+	}
 }

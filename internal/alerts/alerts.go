@@ -373,7 +373,12 @@ func (s *Service) TestAlert(ctx context.Context, userID string) error {
 		s.mu.Lock()
 		delete(s.testLast, userID)
 		s.mu.Unlock()
-		return fmt.Errorf("the test alert call could not be placed: %w", err)
+		// Dial errors carry internal dial targets and transport detail; the
+		// client gets the sanitized message and the log gets the cause.
+		if s.Log != nil {
+			s.Log.Warn("test alert dial failed", "user_id", userID, "error", err)
+		}
+		return fmt.Errorf("the test alert call could not be placed")
 	}
 	s.finishWG.Add(1)
 	go func() {

@@ -3,9 +3,11 @@ package mailsync
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -731,5 +733,150 @@ func TestReconciliationRetainsLiveUIDsAcrossPhysicalRemap(t *testing.T) {
 	rows, err = db.ListIndexedMail(ctx, "a")
 	if err != nil || len(rows) != 0 {
 		t.Fatalf("old UIDVALIDITY incorrectly retained: %+v %v", rows, err)
+	}
+}
+
+func newSyncDueFixture(t *testing.T, count int) (*Service, *store.Store) {
+	t.Helper()
+	db, err := store.Open(filepath.Join(t.TempDir(), "voxmail.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	ctx := context.Background()
+	if err := db.CreateUser(ctx, store.User{ID: "sync-user", Username: "sync-user", PasswordHash: "p", PINHash: "p", Role: "user", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	box, err := secret.New("sync-test-key-with-more-than-32-characters-123456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runnerPath := filepath.Join(t.TempDir(), "fake-mbsync")
+	script := "#!/bin/sh\nsleep 1\n"
+	if err := os.WriteFile(runnerPath, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < count; i++ {
+		account := store.Account{
+			ID: fmt.Sprintf("due-account-%d", i), UserID: "sync-user", CanonicalName: fmt.Sprintf("Account %d", i),
+			Email: fmt.Sprintf("user%d@example.com", i), SenderName: "User",
+			IMAPHost: "imap.example", IMAPUser: "user", IMAPPassword: "imap-password",
+			SMTPHost: "smtp.example", SMTPUser: "user", SMTPPassword: "smtp-password", FolderMap: `{}`,
+		}
+		if err := db.SaveAccount(ctx, box, account); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service := &Service{
+		Store: db, Root: t.TempDir(),
+		Runner: Runner{Binary: runnerPath},
+		Index:  &mailindex.Indexer{Store: db},
+	}
+	return service, db
+}
+
+func countingResolver(t *testing.T) (func(context.Context, string, int) (string, error), func() (int, int)) {
+	t.Helper()
+	var mu sync.Mutex
+	active, peak, total := 0, 0, 0
+	resolver := func(_ context.Context, host string, port int) (string, error) {
+		mu.Lock()
+		active++
+		total++
+		if active > peak {
+			peak = active
+		}
+		mu.Unlock()
+		time.Sleep(250 * time.Millisecond)
+		mu.Lock()
+		active--
+		mu.Unlock()
+		return "8.8.8.8:993", nil
+	}
+	report := func() (int, int) {
+		mu.Lock()
+		defer mu.Unlock()
+		return peak, total
+	}
+	return resolver, report
+}
+
+func TestSyncDueEnforcesDefaultConcurrencyLimit(t *testing.T) {
+	service, db := newSyncDueFixture(t, 4)
+	resolver, report := countingResolver(t)
+	service.EndpointResolver = resolver
+	if err := service.SyncDue(context.Background()); err != nil {
+		t.Fatalf("SyncDue: %v", err)
+	}
+	peak, total := report()
+	if peak > 2 {
+		t.Fatalf("peak concurrent syncs = %d, want at most the default 2", peak)
+	}
+	if total != 4 {
+		t.Fatalf("resolver calls = %d, want one per due account (4)", total)
+	}
+	for i := 0; i < 4; i++ {
+		if run, err := db.LatestSyncRun(context.Background(), fmt.Sprintf("due-account-%d", i), true); err != nil || !run.Success {
+			t.Fatalf("account %d latest successful run = %+v err %v, want success", i, run, err)
+		}
+	}
+}
+
+func TestSyncDueHonorsConfiguredConcurrencyLimit(t *testing.T) {
+	service, db := newSyncDueFixture(t, 4)
+	service.MaxConcurrentSyncs = 3
+	resolver, report := countingResolver(t)
+	service.EndpointResolver = resolver
+	if err := service.SyncDue(context.Background()); err != nil {
+		t.Fatalf("SyncDue: %v", err)
+	}
+	peak, total := report()
+	if peak > 3 {
+		t.Fatalf("peak concurrent syncs = %d, want at most the configured 3", peak)
+	}
+	if total != 4 {
+		t.Fatalf("resolver calls = %d, want one per due account (4)", total)
+	}
+	if run, err := db.LatestSyncRun(context.Background(), "due-account-3", true); err != nil || !run.Success {
+		t.Fatalf("fourth account latest successful run = %+v err %v, want success", run, err)
+	}
+}
+
+func TestSyncDueSkipsAccountPendingDeletion(t *testing.T) {
+	service, db := newSyncDueFixture(t, 2)
+	resolver, report := countingResolver(t)
+	service.EndpointResolver = resolver
+	service.ensureState()
+	service.mu.Lock()
+	service.deleting["due-account-0"] = true
+	service.mu.Unlock()
+	if err := service.SyncDue(context.Background()); err != nil {
+		t.Fatalf("SyncDue returned an error for a deletion-pending account: %v", err)
+	}
+	if _, total := report(); total != 1 {
+		t.Fatalf("resolver calls = %d, want 1 (deletion-pending account skipped)", total)
+	}
+	if run, err := db.LatestSyncRun(context.Background(), "due-account-0", false); err == nil && run.Success {
+		t.Fatalf("deletion-pending account recorded a sync run: %+v", run)
+	}
+	if run, err := db.LatestSyncRun(context.Background(), "due-account-1", true); err != nil || !run.Success {
+		t.Fatalf("surviving account latest successful run = %+v err %v, want success", run, err)
+	}
+}
+
+func TestSyncDueCancellationStopsAdmittingNewAccounts(t *testing.T) {
+	service, _ := newSyncDueFixture(t, 4)
+	resolver, report := countingResolver(t)
+	service.EndpointResolver = resolver
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- service.SyncDue(ctx) }()
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("SyncDue error after cancellation = %v, want context.Canceled", err)
+	}
+	if _, total := report(); total > 2 {
+		t.Fatalf("resolver calls = %d, want none beyond the concurrent bound after cancellation", total)
 	}
 }

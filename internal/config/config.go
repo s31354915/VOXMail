@@ -19,6 +19,8 @@ type Config struct {
 	EncryptionKey        string
 	ControlSocket        string
 	MaxCalls             int
+	MaxConcurrentSyncs   int
+	IMAPIdle             bool
 	STTBinary            string
 	STTModel             string
 	PiperBinary          string
@@ -49,7 +51,21 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	for _, key := range []string{"VOXMAIL_MAX_CALLS", "VOXMAIL_HISTORY_RETENTION_DAYS", "VOXMAIL_HISTORY_MAX_ROWS"} {
+	logLevel := strings.ToLower(strings.TrimSpace(os.Getenv("VOXMAIL_LOG_LEVEL")))
+	switch logLevel {
+	case "", "debug", "info", "warn", "warning", "error":
+	default:
+		return Config{}, fmt.Errorf("VOXMAIL_LOG_LEVEL must be one of debug, info, warn, or error")
+	}
+	imapIdle := true
+	if raw := strings.TrimSpace(os.Getenv("VOXMAIL_IMAP_IDLE")); raw != "" {
+		parsed, err := strconv.ParseBool(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("VOXMAIL_IMAP_IDLE must be a boolean: %w", err)
+		}
+		imapIdle = parsed
+	}
+	for _, key := range []string{"VOXMAIL_MAX_CALLS", "VOXMAIL_MAX_CONCURRENT_SYNCS", "VOXMAIL_HISTORY_RETENTION_DAYS", "VOXMAIL_HISTORY_MAX_ROWS"} {
 		if value := os.Getenv(key); value != "" {
 			if _, err := strconv.Atoi(value); err != nil {
 				return Config{}, fmt.Errorf("%s must be an integer: %w", key, err)
@@ -57,18 +73,20 @@ func Load() (Config, error) {
 		}
 	}
 	c := Config{
-		HTTPAddr:      env("VOXMAIL_HTTP_ADDR", "127.0.0.1:8080"),
-		OfflineMode:   offlineMode,
-		Verbose:       verbose,
-		DataDir:       dataDir,
-		DBPath:        env("VOXMAIL_DB_PATH", filepath.Join(dataDir, "sqlite", "voxmail.db")),
-		EncryptionKey: os.Getenv("VOXMAIL_ENCRYPTION_KEY"),
-		ControlSocket: env("VOXMAIL_CONTROL_SOCKET", filepath.Join(dataDir, "run", "baresip.sock")),
-		MaxCalls:      envInt("VOXMAIL_MAX_CALLS", 10),
-		STTBinary:     env("VOXMAIL_STT_BINARY", "whisper-cli"),
-		STTModel:      env("VOXMAIL_STT_MODEL", filepath.Join(dataDir, "whisper", "ggml-base.en.bin")),
-		PiperBinary:   env("VOXMAIL_PIPER_BINARY", "piper"),
-		PiperModel:    env("VOXMAIL_PIPER_MODEL", filepath.Join(dataDir, "voices", "en_US-hfc_male-medium.onnx")),
+		HTTPAddr:           env("VOXMAIL_HTTP_ADDR", "127.0.0.1:8080"),
+		OfflineMode:        offlineMode,
+		Verbose:            verbose,
+		DataDir:            dataDir,
+		DBPath:             env("VOXMAIL_DB_PATH", filepath.Join(dataDir, "sqlite", "voxmail.db")),
+		EncryptionKey:      os.Getenv("VOXMAIL_ENCRYPTION_KEY"),
+		ControlSocket:      env("VOXMAIL_CONTROL_SOCKET", filepath.Join(dataDir, "run", "baresip.sock")),
+		MaxCalls:           envInt("VOXMAIL_MAX_CALLS", 10),
+		MaxConcurrentSyncs: envInt("VOXMAIL_MAX_CONCURRENT_SYNCS", 2),
+		IMAPIdle:           imapIdle,
+		STTBinary:          env("VOXMAIL_STT_BINARY", "whisper-cli"),
+		STTModel:           env("VOXMAIL_STT_MODEL", filepath.Join(dataDir, "whisper", "ggml-base.en-q5_1.bin")),
+		PiperBinary:        env("VOXMAIL_PIPER_BINARY", "piper"),
+		PiperModel:         env("VOXMAIL_PIPER_MODEL", filepath.Join(dataDir, "voices", "en_US-hfc_male-medium.onnx")),
 		// PiperPython runs the resident Piper worker; PiperResident turns
 		// that engine off for debugging (VOXMAIL_PIPER_RESIDENT=0). An
 		// unparsable value keeps the engine on rather than blocking startup
@@ -83,6 +101,9 @@ func Load() (Config, error) {
 		TrustedProxyCIDRs:    trustedProxyCIDRs,
 		HistoryRetentionDays: envInt("VOXMAIL_HISTORY_RETENTION_DAYS", 365),
 		HistoryMaxRows:       envInt("VOXMAIL_HISTORY_MAX_ROWS", 100000),
+	}
+	if c.MaxConcurrentSyncs < 1 || c.MaxConcurrentSyncs > 8 {
+		return Config{}, fmt.Errorf("VOXMAIL_MAX_CONCURRENT_SYNCS must be between 1 and 8")
 	}
 	if c.MaxCalls < 1 || c.MaxCalls > 100 {
 		return Config{}, fmt.Errorf("VOXMAIL_MAX_CALLS must be between 1 and 100")

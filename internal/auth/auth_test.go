@@ -2,6 +2,7 @@ package auth
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -13,6 +14,9 @@ func TestPasswordHash(t *testing.T) {
 	}
 	if _, err := Hash(string(make([]byte, MaxPasswordBytes+1))); !errors.Is(err, ErrPasswordTooLong) {
 		t.Fatalf("long password error=%v, want ErrPasswordTooLong", err)
+	}
+	if !strings.HasPrefix(hash, "$2a$12$") && !strings.HasPrefix(hash, "$2y$12$") {
+		t.Fatalf("password hash cost %q, want cost 12", hash[:7])
 	}
 }
 

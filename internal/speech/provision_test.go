@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -231,5 +232,17 @@ func TestInstalledVoiceDiscoveryRequiresUsablePair(t *testing.T) {
 	}
 	if _, ok := ResolveVoice(root, "../local_voice"); ok {
 		t.Fatal("path traversal voice was accepted")
+	}
+}
+
+func TestDefaultWhisperModelIsQuantized(t *testing.T) {
+	if !strings.Contains(WhisperBaseENURL, "ggml-base.en-q5_1.bin") {
+		t.Fatalf("default whisper download %q, want the quantized q5_1 model", WhisperBaseENURL)
+	}
+	if WhisperBaseENSHA256 != "4baf70dd0d7c4247ba2b81fafd9c01005ac77c2f9ef064e00dcf195d0e2fdd2f" {
+		t.Fatalf("default whisper checksum %q, want the q5_1 checksum", WhisperBaseENSHA256)
+	}
+	if strings.Contains(WhisperBaseENSHA256, "a03779c8") {
+		t.Fatal("provisioning still references the fp16 base.en checksum")
 	}
 }

@@ -3,10 +3,25 @@ package store
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/voxmail/voxmail/internal/secret"
 )
+
+// normalizeSIPTransport lowercases and trims the transport and keeps only the
+// three supported values, falling back to udp otherwise, so a legacy or
+// hand-edited row cannot put an unsupported transport into the baresip config.
+func normalizeSIPTransport(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "tcp":
+		return "tcp"
+	case "tls":
+		return "tls"
+	default:
+		return "udp"
+	}
+}
 
 func (s *Store) GetSIP(ctx context.Context) (SIPSettings, error) {
 	var st SIPSettings
@@ -22,6 +37,7 @@ func (s *Store) GetSIP(ctx context.Context) (SIPSettings, error) {
 		st.RegistrarPort = st.Port
 	}
 	st.Port = st.RegistrarPort
+	st.Transport = normalizeSIPTransport(st.Transport)
 	st.Enabled = enabled != 0
 	return st, nil
 }
@@ -46,9 +62,7 @@ func (s *Store) UpsertSIP(ctx context.Context, box *secret.Box, storage SIPSetti
 		storage.RegistrarPort = 5060
 	}
 	storage.Port = storage.RegistrarPort
-	if storage.Transport == "" {
-		storage.Transport = "udp"
-	}
+	storage.Transport = normalizeSIPTransport(storage.Transport)
 	if storage.RegInterval == 0 {
 		storage.RegInterval = 300
 	}

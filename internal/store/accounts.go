@@ -346,18 +346,26 @@ func (s *Store) FinishCleanupJob(ctx context.Context, jobID string, cleanupErr e
 }
 
 // ReorderAccounts applies a complete, owner-scoped order in one transaction.
+// InputError marks a store rejection caused by the caller's input whose
+// message is safe to show the requesting client verbatim. Store errors that
+// are not wrapped in it are internal detail and must not reach a 4xx body.
+type InputError struct{ Err error }
+
+func (e InputError) Error() string { return e.Err.Error() }
+func (e InputError) Unwrap() error { return e.Err }
+
 func (s *Store) ReorderAccounts(ctx context.Context, userID string, ids []string) error {
 	if strings.TrimSpace(userID) == "" || len(ids) == 0 {
-		return fmt.Errorf("user and account order are required")
+		return InputError{fmt.Errorf("user and account order are required")}
 	}
 	seen := make(map[string]struct{}, len(ids))
 	for i, id := range ids {
 		ids[i] = strings.TrimSpace(id)
 		if ids[i] == "" {
-			return fmt.Errorf("account order contains an empty ID")
+			return InputError{fmt.Errorf("account order contains an empty ID")}
 		}
 		if _, ok := seen[ids[i]]; ok {
-			return fmt.Errorf("account order contains a duplicate ID")
+			return InputError{fmt.Errorf("account order contains a duplicate ID")}
 		}
 		seen[ids[i]] = struct{}{}
 	}
@@ -387,11 +395,11 @@ func (s *Store) ReorderAccounts(ctx context.Context, userID string, ids []string
 		return err
 	}
 	if len(owned) != len(ids) {
-		return fmt.Errorf("account order must include every owned account")
+		return InputError{fmt.Errorf("account order must include every owned account")}
 	}
 	for _, id := range ids {
 		if _, ok := owned[id]; !ok {
-			return fmt.Errorf("account %q is not owned by user", id)
+			return InputError{fmt.Errorf("account %q is not owned by user", id)}
 		}
 	}
 	for order, id := range ids {
@@ -400,7 +408,7 @@ func (s *Store) ReorderAccounts(ctx context.Context, userID string, ids []string
 			return err
 		}
 		if affected, _ := result.RowsAffected(); affected != 1 {
-			return fmt.Errorf("account %q is not owned by user", id)
+			return InputError{fmt.Errorf("account %q is not owned by user", id)}
 		}
 	}
 	return tx.Commit()

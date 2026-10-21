@@ -57,7 +57,9 @@ func TestValidateAddressRejectsReservedAndMappedPrivateRanges(t *testing.T) {
 		{name: "mapped-loopback", address: "[::ffff:127.0.0.1]:993"},
 		{name: "mapped-private", address: "[::ffff:10.0.0.8]:993"},
 		{name: "public-v4", address: "198.51.100.8:993", allowed: true},
-		{name: "public-v6", address: "[2001:db8::8]:993", allowed: true},
+		{name: "public-v6", address: "[2001:4860:4860::8888]:993", allowed: true},
+		{name: "v6-documentation", address: "[2001:db8::8]:993"},
+		{name: "nat64", address: "[64:ff9b::198.51.100.8]:993"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -77,11 +79,11 @@ func TestAllowedAddressesFiltersMixedAnswersAndDeduplicates(t *testing.T) {
 		{IP: net.ParseIP("127.0.0.1")},
 		{IP: net.ParseIP("::ffff:10.0.0.8")},
 		{IP: net.ParseIP("198.51.100.8")},
-		{IP: net.ParseIP("2001:db8::8")},
+		{IP: net.ParseIP("2001:4860:4860::8888")},
 		{IP: net.ParseIP("198.51.100.8")},
 	}
 	got := allowedAddresses(ips, 993, false)
-	want := []string{"198.51.100.8:993", "[2001:db8::8]:993"}
+	want := []string{"198.51.100.8:993", "[2001:4860:4860::8888]:993"}
 	if len(got) != len(want) {
 		t.Fatalf("allowedAddresses=%v, want %v", got, want)
 	}
