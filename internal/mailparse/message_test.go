@@ -147,6 +147,40 @@ func TestScanPreservesNestedFolderPath(t *testing.T) {
 	}
 }
 
+// A multipart body that stops mid part keeps the readable parts in strict
+// mode too: the part reader surfaces a swallowed unexpected EOF as a
+// premature boundary EOF ("multipart: NextPart: EOF") from the next
+// NextRawPart call, and a message that parsed up to the cut must stay
+// indexable instead of failing the whole parse.
+func TestParseKeepsPartsOnPrematureBoundaryEOF(t *testing.T) {
+	for _, tc := range []struct{ name, first, body string }{
+		{"truncated base64 attachment", "first part text", "--BOUND\r\nContent-Type: text/plain\r\n\r\nfirst part text\r\n--BOUND\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\naGVsbG8gd29ybG"},
+		{"second part body cut", "one", "--BOUND\r\nContent-Type: text/plain\r\n\r\none\r\n--BOUND\r\nContent-Type: application/octet-stream\r\n\r\npartial"},
+	} {
+		raw := "From: a@example.com\r\nSubject: Hi\r\nContent-Type: multipart/mixed; boundary=BOUND\r\n\r\n" + tc.body
+		m, err := Parse(strings.NewReader(raw))
+		if err != nil {
+			t.Fatalf("%s: strict parse dropped a partially readable message: %v", tc.name, err)
+		}
+		if !strings.Contains(m.OriginalText, tc.first) {
+			t.Fatalf("%s: first part lost, text=%q", tc.name, m.OriginalText)
+		}
+	}
+	// A text part cut mid body still fails strict (its read error is not a
+	// boundary EOF) and recovers through the lenient pass.
+	truncatedText := "From: a@example.com\r\nSubject: Hi\r\nContent-Type: multipart/mixed; boundary=BOUND\r\n\r\n--BOUND\r\nContent-Type: text/plain\r\n\r\nfirst part text\r\n--BOUND\r\nContent-Type: text/plain\r\n\r\npartial"
+	if _, err := Parse(strings.NewReader(truncatedText)); err == nil {
+		t.Fatal("strict parse accepted a text part cut mid body")
+	}
+	m, err := ParseLenient(strings.NewReader(truncatedText))
+	if err != nil {
+		t.Fatalf("lenient recovery failed: %v", err)
+	}
+	if !m.Recovered || !strings.Contains(m.OriginalText, "first part text") {
+		t.Fatalf("lenient lost the readable part: recovered=%v text=%q", m.Recovered, m.OriginalText)
+	}
+}
+
 func TestParseLenientKeepsTruncatedAttachment(t *testing.T) {
 	// A truncated base64 attachment (partially written message file, no
 	// closing MIME boundary) previously made the strict parse fail with

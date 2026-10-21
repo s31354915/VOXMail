@@ -190,10 +190,14 @@ func parsePart(header textproto.MIMEHeader, body io.Reader, budget *parseBudget,
 				break
 			}
 			if nextErr != nil {
-				if lenient {
+				if lenient || errors.Is(nextErr, io.EOF) || errors.Is(nextErr, io.ErrUnexpectedEOF) {
 					// A truncated or corrupted multipart body keeps the
 					// parts recovered so far instead of failing the whole
-					// message.
+					// message. A premature EOF at a boundary also surfaces
+					// as an EOF-flavored error in strict mode ("multipart:
+					// NextPart: EOF"), and a message that parsed up to the
+					// cut stays readable, so the boundary error must not
+					// drop it from the index.
 					break
 				}
 				return "", nil, fmt.Errorf("read multipart part: %w", nextErr)

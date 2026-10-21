@@ -75,7 +75,12 @@ func Generate(a Account) (string, error) {
 	exclusions := make([]string, 0, len(a.FolderMap))
 	for remote := range a.FolderMap {
 		if !strings.EqualFold(remote, "INBOX") && remote != "" {
-			exclusions = append(exclusions, "!"+quote(remote))
+			// Pattern exclusion and channel mailbox names reach the IMAP
+			// server verbatim, so remote names need modified UTF-7 here:
+			// a literal "&" is the UTF-7 shift character and mbsync would
+			// send it unencoded, failing the channel with "BAD Could not
+			// parse command".
+			exclusions = append(exclusions, "!"+quote(imapUTF7(remote)))
 		}
 	}
 	patterns := "*"
@@ -130,7 +135,7 @@ Remove None
 Sync All
 Expunge None
 SyncState *
-`, channel, name, quote(remote), name, quote(local))
+`, channel, name, quote(imapUTF7(remote)), name, quote(local))
 	}
 	return base, nil
 }
