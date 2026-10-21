@@ -37,7 +37,7 @@ var specs = map[State]StateSpec{
 	"pin":                   {State: "pin", Prompt: "Enter your PIN, then press pound.", Valid: nil, Back: "closed", Timeout: "closed", Repeatable: true},
 	"main":                  {State: "main", Prompt: MainMenuPrompt, Valid: fixed("1", "2", "3"), Repeatable: true},
 	"accounts":              {State: "accounts", Prompt: "Press 0 for all unread mail, choose an account, press 9 for more if available, or press pound to go back.", Valid: digits(0, 9), Back: "main", Repeatable: true},
-	"account_menu":          {State: "account_menu", Prompt: "Press 1 to listen to mail, 2 to send an email, 3 to refresh, or 4 for account settings when available.", Valid: fixed("1", "2", "3", "4"), Back: "accounts", Repeatable: true},
+	"account_menu":          {State: "account_menu", Prompt: "Press 1 to listen to mail, 2 to send an email, 3 to refresh, 4 for account settings when available, or 5 for the unread count.", Valid: fixed("1", "2", "3", "4", "5"), Back: "accounts", Repeatable: true},
 	"draft_menu":            {State: "draft_menu", Prompt: "Press 1 for a new email, 2 to resume a saved draft, or pound to go back.", Valid: fixed("1", "2"), Back: "account_menu", Repeatable: true},
 	"draft_list":            {State: "draft_list", Prompt: "Choose a saved draft, press 9 for more if available, or pound to go back.", Valid: digits(1, 9), Back: "draft_menu", Repeatable: true},
 	"draft_edit":            {State: "draft_edit", Prompt: "Edit message. Press 1 for recipients, 2 for the subject, 3 for the body, or 4 for attachments. Pound returns to review.", Valid: fixed("1", "2", "3", "4"), Back: "review", Repeatable: true},
