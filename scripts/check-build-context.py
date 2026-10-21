@@ -63,6 +63,12 @@ def copy_source(root, context):
         target = context / name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(root / name, target)
+    # Theme stylesheets (console-<name>.css) are drop-ins served via VOXMAIL_THEME
+    # and must reach the effective context or the go:embed glob finds no match.
+    for path in sorted((root / "internal/web/console").glob("console-*.css")):
+        target = context / path.relative_to(root)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, target)
     for path in (root / "internal/web/static/assets").iterdir():
         if path.is_file() and not path.is_symlink() and path.suffix in {".svg", ".png", ".webp"}:
             target = context / path.relative_to(root)
@@ -113,7 +119,7 @@ def main():
         for name in REQUIRED_CONTEXT:
             if not (output / "context" / name).is_file():
                 failures.append(f"required source missing from effective context: {name}")
-        for name in CONSOLE_SOURCES + ["go.mod", "go.sum", "cmd/voxmail/main.go", "internal/web/static/index.html"]:
+        for name in CONSOLE_SOURCES + ["internal/web/console/console-dark.css", "go.mod", "go.sum", "cmd/voxmail/main.go", "internal/web/static/index.html"]:
             if not (output / "builder" / name).is_file():
                 failures.append(f"application source missing from Go builder: {name}")
         for name in ["context-only.marker", "assets", "scripts", "tests", ".env.example"]:

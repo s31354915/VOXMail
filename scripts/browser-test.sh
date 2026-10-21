@@ -48,6 +48,7 @@ PY
 go build -o "$work/voxmail" "$root/cmd/voxmail"
 "$root/tests/browser/prepare.sh" "$work/data"
 env -i PATH="$PATH" \
+	VOXMAIL_THEME="${VOXMAIL_THEME:-}" \
 	VOXMAIL_DATA_DIR="$work/data" \
 	VOXMAIL_HTTP_ADDR="127.0.0.1:$port" \
 	VOXMAIL_ENCRYPTION_KEY=voxmail-browser-disposable-key-0123456789abcdef \

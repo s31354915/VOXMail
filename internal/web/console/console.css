@@ -330,6 +330,22 @@ button.link:hover:not(:disabled) {
   background: var(--accent-soft);
   transform: none;
 }
+/* sign-in options: extra sign-in paths collapsed, one choice surface */
+.auth-more { border: 1px solid var(--line); border-radius: 10px; margin-top: 0.2rem; background: var(--surface-soft); }
+.auth-more summary {
+  cursor: pointer; padding: 10px 14px; font-size: 0.92rem; color: var(--muted);
+  list-style: none; display: flex; align-items: center; gap: 8px;
+}
+.auth-more summary::-webkit-details-marker { display: none; }
+.auth-more summary::before {
+  content: ""; width: 7px; height: 7px; flex: 0 0 auto;
+  border-right: 1.6px solid currentColor; border-bottom: 1.6px solid currentColor;
+  transform: rotate(45deg); transition: transform 0.15s ease;
+}
+.auth-more[open] summary::before { transform: rotate(225deg); }
+.auth-more > div { padding: 4px 14px 14px; }
+.auth-more .grid { grid-template-columns: 1fr; gap: 0; }
+
 .form-actions {
   display: flex;
   gap: 10px;
