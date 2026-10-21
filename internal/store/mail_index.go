@@ -64,6 +64,69 @@ func (s *Store) MarkMailIndexSeen(ctx context.Context, accountID, path, scanID s
 	return err
 }
 
+// MailIndexStamp is the lightweight (path, size, mtime) projection the index
+// scan diffs against the maildir.
+type MailIndexStamp struct {
+	SourceSize int64
+	UpdatedAt  string
+}
+
+// ListMailIndexStamps loads every indexed path for an account in one query so
+// a scan can diff the maildir in memory instead of issuing one lookup per
+// file. The result's size is bounded by the account's indexed message count.
+func (s *Store) ListMailIndexStamps(ctx context.Context, accountID string) (map[string]MailIndexStamp, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT path,COALESCE(source_size,0),COALESCE(updated_at,'') FROM mail_messages WHERE account_id=?`, accountID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	stamps := make(map[string]MailIndexStamp)
+	for rows.Next() {
+		var path string
+		var stamp MailIndexStamp
+		if err := rows.Scan(&path, &stamp.SourceSize, &stamp.UpdatedAt); err != nil {
+			return nil, err
+		}
+		stamps[path] = stamp
+	}
+	return stamps, rows.Err()
+}
+
+// markMailIndexSeenBatchChunkSize bounds each batched update's parameter
+// count, staying well inside SQLite's host-parameter limit.
+const markMailIndexSeenBatchChunkSize = 500
+
+// MarkMailIndexSeenBatch marks every given path as seen by scanID in chunked
+// bulk updates and returns the number of rows updated. A path with no row is
+// not an error: the end-of-scan purge keeps relying on every live row
+// carrying the current scan id.
+func (s *Store) MarkMailIndexSeenBatch(ctx context.Context, accountID, scanID string, paths []string) (int64, error) {
+	var updated int64
+	for start := 0; start < len(paths); start += markMailIndexSeenBatchChunkSize {
+		end := start + markMailIndexSeenBatchChunkSize
+		if end > len(paths) {
+			end = len(paths)
+		}
+		chunk := paths[start:end]
+		query := `UPDATE mail_messages SET last_seen_scan=? WHERE account_id=? AND path IN (` + strings.Repeat("?,", len(chunk)-1) + "?)"
+		args := make([]any, 0, len(chunk)+2)
+		args = append(args, scanID, accountID)
+		for _, path := range chunk {
+			args = append(args, path)
+		}
+		result, err := s.DB.ExecContext(ctx, query, args...)
+		if err != nil {
+			return updated, err
+		}
+		count, err := result.RowsAffected()
+		if err != nil {
+			return updated, err
+		}
+		updated += count
+	}
+	return updated, nil
+}
+
 type MailIndexInput struct {
 	AccountID   string
 	Folder      string

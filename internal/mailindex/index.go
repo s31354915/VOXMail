@@ -3,9 +3,7 @@ package mailindex
 import (
 	"context"
 	"crypto/rand"
-	"database/sql"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net/mail"
@@ -20,6 +18,12 @@ import (
 )
 
 type IndexStore interface {
+	// ListMailIndexStamps loads the whole (path, size, mtime) projection in
+	// one query so the scan diffs in memory instead of issuing one lookup
+	// per maildir file.
+	ListMailIndexStamps(context.Context, string) (map[string]store.MailIndexStamp, error)
+	// MarkMailIndexSeenBatch bulk-marks unchanged paths with the scan id.
+	MarkMailIndexSeenBatch(context.Context, string, string, []string) (int64, error)
 	FindMailIndex(context.Context, string, string) (store.MailIndexRecord, error)
 	MarkMailIndexSeen(context.Context, string, string, string) error
 	UpsertMailIndex(context.Context, store.MailIndexInput) (int64, error)
@@ -84,18 +88,25 @@ func (i Indexer) IndexAvailable(ctx context.Context, accountID, root string) err
 func (i Indexer) index(ctx context.Context, accountID, root string, purge bool) error {
 	scanID := newScanID()
 	modTime := func(info os.FileInfo) string { return info.ModTime().UTC().Format(time.RFC3339Nano) }
-	err := mailparse.ScanMetadataEachContextWithFilterAndErrors(ctx, root, func(path string, info os.FileInfo) (bool, error) {
-		record, err := i.Store.FindMailIndex(ctx, accountID, path)
-		if errors.Is(err, sql.ErrNoRows) {
+	// One stamp query per scan replaces one FindMailIndex query per file:
+	// the walk diffs against the loaded map and unchanged paths are
+	// batch-marked after the walk. The map is bounded by the account's
+	// indexed message count.
+	stamps, err := i.Store.ListMailIndexStamps(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	unchanged := make([]string, 0, len(stamps))
+	err = mailparse.ScanMetadataEachContextWithFilterAndErrors(ctx, root, func(path string, info os.FileInfo) (bool, error) {
+		stamp, ok := stamps[path]
+		if !ok {
 			return true, nil
 		}
-		if err != nil {
-			return false, err
-		}
-		if record.SourceSize != info.Size() || record.UpdatedAt != modTime(info) {
+		if stamp.SourceSize != info.Size() || stamp.UpdatedAt != modTime(info) {
 			return true, nil
 		}
-		return false, i.Store.MarkMailIndexSeen(ctx, accountID, path, scanID)
+		unchanged = append(unchanged, path)
+		return false, nil
 	}, func(message mailparse.MaildirMessage) error {
 		select {
 		case <-ctx.Done():
@@ -108,16 +119,15 @@ func (i Indexer) index(ctx context.Context, accountID, root string, purge bool) 
 		if logger == nil {
 			logger = slog.Default()
 		}
-		_, existingErr := i.Store.FindMailIndex(ctx, accountID, path)
-		if existingErr == nil {
+		if _, exists := stamps[path]; exists {
 			// Preserve the previous record for this still-present message. Otherwise
 			// the successful end-of-scan purge would mistake an unparseable file for
-			// a deleted message and remove its last usable metadata.
+			// a deleted message and remove its last usable metadata. The stamp map
+			// was loaded at scan start, so it answers for the record the strict
+			// parse just failed on.
 			logger.Warn("mail index message failed strict parse; keeping existing record", "account_id", accountID, "path", path, "error", parseErr)
-			return i.Store.MarkMailIndexSeen(ctx, accountID, path, scanID)
-		}
-		if !errors.Is(existingErr, sql.ErrNoRows) {
-			return existingErr
+			unchanged = append(unchanged, path)
+			return nil
 		}
 		// A never-indexed file gets one lenient recovery attempt before the
 		// scan gives up on it: a truncated body, corrupt base64, or bare-LF
@@ -138,6 +148,14 @@ func (i Indexer) index(ctx context.Context, accountID, root string, purge bool) 
 	})
 	if err != nil {
 		return err
+	}
+	// The end-of-scan purge deletes every row the scan did not mark, so the
+	// batch mark must fully succeed before it runs. A failed batch returns
+	// before the purge, the same protection the per-file mark path had.
+	if len(unchanged) > 0 {
+		if _, err := i.Store.MarkMailIndexSeenBatch(ctx, accountID, scanID, unchanged); err != nil {
+			return err
+		}
 	}
 	if !purge {
 		return nil
