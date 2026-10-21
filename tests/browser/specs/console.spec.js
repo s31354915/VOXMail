@@ -481,6 +481,7 @@ test('covers setup, refresh, roles, account ordering, alerts, recovery, and CSP'
   const acceptedCode = await stableTotpCode(page, totpSecret);
   await page.locator('#login [name="username"]').fill(admin.username);
   await page.locator('#login [name="password"]').fill(admin.password);
+  await page.locator('#login details.auth-more').evaluate(el => el.open = true);
   await page.locator('#login [name="totp"]').fill(acceptedCode);
   await page.locator('#login button[type="submit"]').click();
   await expect(page.locator('#app')).toBeVisible();
@@ -488,12 +489,14 @@ test('covers setup, refresh, roles, account ordering, alerts, recovery, and CSP'
   await logoutAndWait(page);
   await page.locator('#login [name="username"]').fill(admin.username);
   await page.locator('#login [name="password"]').fill(admin.password);
+  await page.locator('#login details.auth-more').evaluate(el => el.open = true);
   await page.locator('#login [name="totp"]').fill(acceptedCode);
   await page.locator('#login button[type="submit"]').click();
   await expect(page.locator('#login')).toBeVisible();
   await expect(page.locator('#auth-status')).toContainText('authenticator');
 
   const nextCode = await stableTotpCode(page, totpSecret, acceptedCode);
+  await page.locator('#login details.auth-more').evaluate(el => el.open = true);
   await page.locator('#login [name="totp"]').fill(nextCode);
   await page.locator('#login button[type="submit"]').click();
   await expect(page.locator('#app')).toBeVisible();

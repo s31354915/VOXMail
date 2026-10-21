@@ -124,13 +124,13 @@ label input, label select, label textarea {
   padding: 9px 12px;
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
-label input::placeholder { color: var(--text-faint, #6d7688); }
+label input::placeholder { color: var(--text-faint, #8a93a8); }
 label input:focus, label select:focus, label textarea:focus {
   outline: none; border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 label input:disabled, label select:disabled { opacity: 0.6; }
-label small { display: block; margin-top: 0.3rem; font-size: 0.8rem; color: #6d7688; }
+label small { display: block; margin-top: 0.3rem; font-size: 0.8rem; color: #8a93a8; }
 .select-wrap { position: relative; display: block; }
 select { appearance: none; }
 .select-wrap::after {
@@ -152,7 +152,7 @@ select { appearance: none; }
 .form-actions { margin-top: 1.1rem; }
 .form-copy { color: var(--text-dim); margin: 0 0 1rem; }
 .field-label { font-weight: 600; color: var(--text); }
-.field-caption { display: block; font-size: 0.8rem; color: #6d7688; }
+.field-caption { display: block; font-size: 0.8rem; color: #8a93a8; }
 .field-error { color: var(--bad); font-size: 0.85rem; margin-top: 0.25rem; }
 
 label.row, label.check, label.radio {
@@ -247,7 +247,7 @@ progress::-moz-progress-bar { background: var(--accent-strong); }
 .auth-tools button { justify-content: center; font-size: 0.9rem; padding: 8px 12px; }
 .auth-note {
   display: flex; gap: 10px; align-items: flex-start;
-  margin-top: 1.2rem; color: #6d7688; font-size: 0.84rem;
+  margin-top: 1.2rem; color: #8a93a8; font-size: 0.84rem;
 }
 .auth-note img { flex: 0 0 auto; margin-top: 2px; }
 
@@ -311,7 +311,7 @@ progress::-moz-progress-bar { background: var(--accent-strong); }
 .task-heading { margin-bottom: 1.2rem; }
 .task-heading .eyebrow { color: var(--text-dim); }
 .route-panel { min-width: 0; }
-.footer-note { max-width: 1240px; margin: 0 auto; padding: 1rem 1.4rem 2.4rem; color: #6d7688; font-size: 0.85rem; }
+.footer-note { max-width: 1240px; margin: 0 auto; padding: 1rem 1.4rem 2.4rem; color: #8a93a8; font-size: 0.85rem; }
 
 /* ---------- operational panel ---------- */
 .operational-panel { margin-bottom: 1.1rem; }
@@ -442,6 +442,7 @@ pre {
 }
 @media (max-width: 768px) {
   body { font-size: 15px; }
+  .auth-story { order: 2; }
   .card, .panel, .auth-panel { padding: 1.1rem 1.15rem; }
   .grid { grid-template-columns: 1fr; gap: 0; }
   .site-header { padding-top: 1.6rem; }
