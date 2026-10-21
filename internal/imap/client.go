@@ -32,6 +32,13 @@ type Config struct {
 	Security string
 	Username string
 	Password string
+	// OperationTimeout is an optional outer bound on the connection's whole
+	// lifetime. Individual operations always keep their own per-command
+	// deadline, so a workload that legitimately walks many folders over one
+	// connection (reconciliation) passes a larger budget than the default
+	// without its later folders inheriting an already-spent clock. Zero
+	// keeps the standard limit.
+	OperationTimeout time.Duration
 	// TLSConfig is optional and is intended for deployments using a private
 	// CA. Its certificate verification settings are preserved; callers cannot
 	// enable plaintext authentication through this field.
@@ -101,7 +108,11 @@ func Open(ctx context.Context, cfg Config) (_ *Client, retErr error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	operationCtx, operationCancel := context.WithTimeout(ctx, operationTimeout)
+	lifetime := operationTimeout
+	if cfg.OperationTimeout > 0 {
+		lifetime = cfg.OperationTimeout
+	}
+	operationCtx, operationCancel := context.WithTimeout(ctx, lifetime)
 	setupCtx, setupCancel := context.WithTimeout(operationCtx, commandTimeout)
 	defer setupCancel()
 	if cfg.Port == 0 {
@@ -285,6 +296,16 @@ func (c *Client) operationContext() context.Context {
 	return context.Background()
 }
 
+// withCommandTimeout derives a fresh per-command budget from the
+// connection's controlling context. The caller must invoke the returned
+// cancel. Sharing one expiring clock across every operation previously let
+// a long folder scan consume the budget of the folders that followed it,
+// so the connection's transport kill fired mid-folder on whichever folder
+// happened to be running when the connection budget expired.
+func (c *Client) withCommandTimeout() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(c.operationContext(), commandTimeout)
+}
+
 func (c *Client) find(folder, messageID string) (*imap.SeqSet, error) {
 	identities, err := c.findMessages(folder, messageID, false)
 	if err != nil {
@@ -328,7 +349,9 @@ func (c *Client) findMessages(folder, messageID string, readOnly bool) ([]Messag
 	items := []imap.FetchItem{imap.FetchUid, imap.FetchFlags, imap.FetchEnvelope}
 	ch := make(chan *imap.Message, 32)
 	identities := make([]MessageIdentity, 0, len(uids))
-	err = drainResults(c.operationContext(), c.abortTransport, ch, func() error {
+	opCtx, opCancel := c.withCommandTimeout()
+	defer opCancel()
+	err = drainResults(opCtx, c.abortTransport, ch, func() error {
 		return c.conn.UidFetch(set, items, ch)
 	}, func(message *imap.Message) error {
 		if message == nil || message.Uid == 0 {
@@ -576,7 +599,9 @@ func (c *Client) ListFolders() (_ []string, retErr error) {
 	}
 	ch := make(chan *imap.MailboxInfo, 32)
 	var folders []string
-	err := drainResults(c.operationContext(), c.abortTransport, ch, func() error {
+	opCtx, opCancel := c.withCommandTimeout()
+	defer opCancel()
+	err := drainResults(opCtx, c.abortTransport, ch, func() error {
 		return c.conn.List("", "*", ch)
 	}, func(info *imap.MailboxInfo) error {
 		if info == nil || strings.TrimSpace(info.Name) == "" {
@@ -617,7 +642,9 @@ func (c *Client) ListMessageIdentities(folder string) (_ []MessageIdentity, _ ui
 	items := []imap.FetchItem{imap.FetchUid, imap.FetchFlags, imap.FetchEnvelope}
 	ch := make(chan *imap.Message, 32)
 	identities := make([]MessageIdentity, 0, status.Messages)
-	err = drainResults(c.operationContext(), c.abortTransport, ch, func() error {
+	opCtx, opCancel := c.withCommandTimeout()
+	defer opCancel()
+	err = drainResults(opCtx, c.abortTransport, ch, func() error {
 		return c.conn.Fetch(set, items, ch)
 	}, func(message *imap.Message) error {
 		if message == nil || message.Uid == 0 {

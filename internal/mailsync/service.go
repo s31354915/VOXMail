@@ -131,6 +131,13 @@ const syncRetryBackoff = 5 * time.Minute
 // flags may not reflect it yet.
 const readReconcileGrace = 30 * time.Minute
 
+// reconciliationConnectionBudget bounds one authenticated reconciliation
+// connection walking every remote folder. Each IMAP operation keeps its own
+// per-command deadline, so this outer budget only stops a silent provider
+// from holding the connection forever; a slow earlier folder can no longer
+// spend the clock of the folders that follow it.
+const reconciliationConnectionBudget = 10 * time.Minute
+
 func (s *Service) Run(ctx context.Context) error {
 	if s.Store == nil || s.Root == "" {
 		return fmt.Errorf("sync store and root are required")
@@ -717,7 +724,7 @@ func (s *Service) reconcileRemoteIdentity(ctx context.Context, account store.Acc
 	if port == 0 {
 		port = 993
 	}
-	connection, err := remoteimap.Open(ctx, remoteimap.Config{Host: account.IMAPHost, Address: imapAddress, Port: port, Security: account.IMAPSecurity, Username: account.IMAPUser, Password: password})
+	connection, err := remoteimap.Open(ctx, remoteimap.Config{Host: account.IMAPHost, Address: imapAddress, Port: port, Security: account.IMAPSecurity, Username: account.IMAPUser, Password: password, OperationTimeout: reconciliationConnectionBudget})
 	if err != nil {
 		return err
 	}
