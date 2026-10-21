@@ -367,6 +367,25 @@ func (b *Baresip) SetRegistrationState(phase, reason string) {
 	b.mu.Unlock()
 }
 
+// rtpPortBase is the low end of the UDP range baresip binds RTP media on.
+const rtpPortBase = 10000
+
+// rtpPortRange sizes the published RTP range from the call limit. Each active
+// call binds an RTP/RTCP port pair and teardown may rebind briefly, so four
+// ports per call with a 32-port floor covers the real need. The old fixed
+// 10000-10100 published 101 ports whatever the call limit was, an
+// unnecessarily wide listening surface for small deployments.
+func rtpPortRange(maxCalls int) (int, int) {
+	if maxCalls <= 0 {
+		maxCalls = 10
+	}
+	ports := maxCalls * 4
+	if ports < 32 {
+		ports = 32
+	}
+	return rtpPortBase, rtpPortBase + ports - 1
+}
+
 func (b *Baresip) writeConfig(settings store.SIPSettings, hasAccount bool) error {
 	if b.ConfigDir == "" {
 		return fmt.Errorf("sip: config dir is required")
@@ -389,6 +408,7 @@ func (b *Baresip) writeConfig(settings store.SIPSettings, hasAccount bool) error
 	if maxCalls <= 0 {
 		maxCalls = 10
 	}
+	rtpLow, rtpHigh := rtpPortRange(maxCalls)
 	config := fmt.Sprintf(`module_path /usr/local/lib/baresip/modules
 module_app voxmail.so
 module account.so
@@ -415,11 +435,11 @@ auplay_channels 1
 ausrc_format s16
 auplay_format s16
 audio_buffer 60-200
-rtp_ports 10000-10100
+rtp_ports %d-%d
 call_max_calls %d
 sip_listen 0.0.0.0:%d
 sip_transports %s
-`, maxCalls, localPort, transport)
+`, rtpLow, rtpHigh, maxCalls, localPort, transport)
 	if err := writeFileAtomic(b.ConfigDir, "config", config); err != nil {
 		return err
 	}

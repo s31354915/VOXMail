@@ -2,6 +2,7 @@ package sip
 
 import (
 	"context"
+	"fmt"
 	"github.com/voxmail/voxmail/internal/operation"
 	"net"
 	"os"
@@ -544,5 +545,32 @@ func TestRegistrationFailureClassifiesOnlyNativeResponseCode(t *testing.T) {
 		if category != string(tc.category) || code != tc.code {
 			t.Fatalf("%q: category=%s code=%d", tc.reason, category, code)
 		}
+	}
+}
+
+func TestRTPPortRangeTracksMaxCalls(t *testing.T) {
+	for _, tc := range []struct {
+		maxCalls int
+		want     string
+	}{{1, "rtp_ports 10000-10031"}, {10, "rtp_ports 10000-10039"}, {0, "rtp_ports 10000-10039"}, {25, "rtp_ports 10000-10099"}} {
+		low, high := rtpPortRange(tc.maxCalls)
+		if got := fmt.Sprintf("rtp_ports %d-%d", low, high); got != tc.want {
+			t.Errorf("maxCalls=%d range=%q want %q", tc.maxCalls, got, tc.want)
+		}
+	}
+	dir := t.TempDir()
+	b := &Baresip{ConfigDir: dir, MaxCalls: 10}
+	if err := b.writeConfig(store.SIPSettings{}, false); err != nil {
+		t.Fatalf("writeConfig: %v", err)
+	}
+	config, err := os.ReadFile(filepath.Join(dir, "config"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(config), "rtp_ports 10000-10100") {
+		t.Fatal("config still publishes the old fixed 101-port range")
+	}
+	if !strings.Contains(string(config), "rtp_ports 10000-10039") {
+		t.Fatalf("config missing the sized range: %s", config)
 	}
 }

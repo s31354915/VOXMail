@@ -31,8 +31,9 @@ VOXMAIL_SIP_ACCOUNT=<sip:YOUR_NUMBER:YOUR_PASSWORD@YOUR_PROVIDER>;regint=300
 
 Provider-specific account syntax, outbound proxy, codecs, and NAT behavior are
 provider-dependent. Local SIP binding and registrar ports default independently
-to 5060, and RTP uses UDP
-10000–10100; both ranges must be reachable from the provider. Do not commit
+to 5060, and RTP uses UDP ports starting at 10000, with the range sized from
+the call limit (four ports per call, 32-port floor: 10000-10039 at the default
+limit of 10 calls); both ranges must be reachable from the provider. Do not commit
 provider credentials. A registration interval of `0` means “use the default”
 and is persisted/rendered as 300 seconds; the browser and API use the same
 normalization.
@@ -558,8 +559,8 @@ to, the client forwarding headers before passing requests to VOXMail.
 
 Confirm baresip registered (SIP connection panel or logs), the caller is
 whitelisted, and the PIN is entered followed by `#`. Check baresip and VOXMail
-logs. SIP needs TCP/UDP 5060 and RTP needs UDP 10000–10100 reachable from the
-provider.
+logs. SIP needs TCP/UDP 5060 and RTP needs UDP from 10000 up to the sized range
+(10000-10039 at the default call limit) reachable from the provider.
 
 Unexpected Baresip exits wait 2, 4, 8, 16, then at most 30 seconds before
 restarting. Successful process creation preserves this crash history; a child
