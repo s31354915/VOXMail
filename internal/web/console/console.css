@@ -131,9 +131,9 @@ label input:focus, label select:focus, label textarea:focus {
 }
 label input:disabled, label select:disabled { opacity: 0.6; }
 label small { display: block; margin-top: 0.3rem; font-size: 0.8rem; color: #6d7688; }
-select-wrap { position: relative; display: block; }
+.select-wrap { position: relative; display: block; }
 select { appearance: none; }
-select-wrap::after {
+.select-wrap::after {
   content: ""; position: absolute; right: 12px; top: 50%;
   width: 8px; height: 8px; margin-top: -6px;
   border-right: 1.6px solid var(--text-dim); border-bottom: 1.6px solid var(--text-dim);
@@ -461,3 +461,18 @@ pre {
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
 }
+
+/* ---------- coverage fixes: classes the modules toggle or render ---------- */
+button.button.save {
+  background: var(--accent-strong); border-color: var(--accent-strong);
+  color: #0b0d12; font-weight: 650;
+}
+button.button.save:hover:not(:disabled) { background: var(--accent); border-color: var(--accent); }
+.folder-table-head {
+  display: flex; flex-wrap: wrap; gap: 4px 18px;
+  padding: 2px 6px 8px; font-size: 0.8rem; letter-spacing: 0.02em;
+  color: #798394; border-bottom: 1px solid var(--line-strong);
+}
+.folder-row.is-selected { background: var(--accent-soft); border-radius: 8px; }
+#sync-freshness { color: var(--text-dim); font-size: 0.85rem; }
+#sync-freshness.sync-stale { color: var(--warn); }
