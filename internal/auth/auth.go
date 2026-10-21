@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha1"
+	"crypto/subtle"
 	"encoding/base32"
 	"encoding/binary"
 	"errors"
@@ -14,7 +15,15 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-const MaxPasswordBytes = 72
+const (
+	MaxPasswordBytes = 72
+
+	// bcryptCost is the hashing cost applied to new password hashes. Cost
+	// 12 keeps sign-in verification comfortably inside the login latency
+	// budget while raising the offline attack cost above the library
+	// default.
+	bcryptCost = 12
+)
 
 var ErrPasswordTooLong = errors.New("password exceeds bcrypt's 72-byte limit")
 
@@ -22,7 +31,7 @@ func Hash(value string) (string, error) {
 	if len([]byte(value)) > MaxPasswordBytes {
 		return "", ErrPasswordTooLong
 	}
-	b, err := bcrypt.GenerateFromPassword([]byte(value), bcrypt.DefaultCost)
+	b, err := bcrypt.GenerateFromPassword([]byte(value), bcryptCost)
 	return string(b), err
 }
 
@@ -57,7 +66,7 @@ func TOTPWithStep(secret, code string, now time.Time) (int64, bool) {
 		if candidate < 0 {
 			continue
 		}
-		if generateTOTPAtStep(secret, candidate) == code {
+		if subtle.ConstantTimeCompare([]byte(generateTOTPAtStep(secret, candidate)), []byte(code)) == 1 {
 			return candidate, true
 		}
 	}

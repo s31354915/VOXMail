@@ -143,12 +143,34 @@ func allowedAddresses(ips []net.IPAddr, port int, allowPrivate bool) []string {
 	return addresses
 }
 
+// Precomputed non-routable IPv6 ranges. The documentation prefix is never
+// assigned to real hosts, and the NAT64 well-known prefix embeds an IPv4
+// address a gateway can translate into a private or metadata target.
+var (
+	v6DocumentationNet = mustCIDR("2001:db8::/32")
+	nat64Net           = mustCIDR("64:ff9b::/96")
+)
+
+func mustCIDR(cidr string) *net.IPNet {
+	_, network, err := net.ParseCIDR(cidr)
+	if err != nil {
+		panic(err)
+	}
+	return network
+}
+
+func inCIDR(ip net.IP, network *net.IPNet) bool {
+	return network != nil && network.Contains(ip)
+}
+
 func blocked(ip net.IP) bool {
 	if ip == nil {
 		return true
 	}
 	if v4 := ip.To4(); v4 != nil {
 		ip = v4
+	} else if inCIDR(ip, v6DocumentationNet) || inCIDR(ip, nat64Net) {
+		return true
 	}
 	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() || isCGNAT(ip)
 }
