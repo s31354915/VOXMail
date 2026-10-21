@@ -74,7 +74,7 @@ func Load() (Config, error) {
 		MaxCalls:           envInt("VOXMAIL_MAX_CALLS", 10),
 		MaxConcurrentSyncs: envInt("VOXMAIL_MAX_CONCURRENT_SYNCS", 2),
 		STTBinary:          env("VOXMAIL_STT_BINARY", "whisper-cli"),
-		STTModel:           env("VOXMAIL_STT_MODEL", filepath.Join(dataDir, "whisper", "ggml-base.en.bin")),
+		STTModel:           env("VOXMAIL_STT_MODEL", filepath.Join(dataDir, "whisper", "ggml-base.en-q5_1.bin")),
 		PiperBinary:        env("VOXMAIL_PIPER_BINARY", "piper"),
 		PiperModel:         env("VOXMAIL_PIPER_MODEL", filepath.Join(dataDir, "voices", "en_US-hfc_male-medium.onnx")),
 		// PiperPython runs the resident Piper worker; PiperResident turns

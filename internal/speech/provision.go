@@ -17,13 +17,16 @@ import (
 )
 
 const (
-	PiperModelURL    = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/hfc_male/medium/en_US-hfc_male-medium.onnx?download=true"
-	PiperConfigURL   = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/hfc_male/medium/en_US-hfc_male-medium.onnx.json?download=true"
-	WhisperBaseENURL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin?download=true"
+	PiperModelURL  = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/hfc_male/medium/en_US-hfc_male-medium.onnx?download=true"
+	PiperConfigURL = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/hfc_male/medium/en_US-hfc_male-medium.onnx.json?download=true"
+	// WhisperBaseENURL pins the quantized base.en-q5_1 model: same base.en
+	// accuracy class, roughly a third of the fp16 download and far less RAM
+	// per transcription.
+	WhisperBaseENURL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en-q5_1.bin?download=true"
 
 	PiperModelSHA256    = "d11e403a02bdf5a670c877b3dc56e0e1c8cece6fb30289586314dffdc0a78cb0"
 	PiperConfigSHA256   = "f66847424aed0bf99ecbb5d7cfde47c0a906f426a0daf7c46f305e7d21afd886"
-	WhisperBaseENSHA256 = "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002"
+	WhisperBaseENSHA256 = "4baf70dd0d7c4247ba2b81fafd9c01005ac77c2f9ef064e00dcf195d0e2fdd2f"
 )
 
 type VoiceSpec struct {
@@ -530,8 +533,9 @@ func installVoiceWithDownload(ctx context.Context, voiceDir string, voice VoiceS
 }
 
 // maxModelDownload is a safety ceiling for anything Provision may fetch. The
-// largest legitimate artifact is whisper.cpp's ggml-base.en.bin at roughly
-// 150MB, so 4GiB only guards against a server returning garbage.
+// largest legitimate artifact is the Piper voice or whisper.cpp's quantized
+// ggml-base.en-q5_1.bin at roughly 60MB, so 4GiB only guards against a server
+// returning garbage.
 const maxModelDownload = 4 << 30
 
 // Provision downloads only missing model files, writing each file atomically.

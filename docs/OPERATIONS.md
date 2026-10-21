@@ -154,7 +154,7 @@ never use placeholder model files:
 
 ```sh
 VOXMAIL_PIPER_MODEL=/path/to/voice.onnx \
-VOXMAIL_WHISPER_MODEL=/path/to/ggml-base.en.bin \
+VOXMAIL_WHISPER_MODEL=/path/to/ggml-base.en-q5_1.bin \
 VOXMAIL_REAL_MODEL_TEXT='This is a VOXMail speech smoke test.' \
 VOXMAIL_REAL_MODEL_EXPECTED='speech smoke test' \
 scripts/real-model-smoke.sh
