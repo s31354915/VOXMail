@@ -476,3 +476,53 @@ button.button.save:hover:not(:disabled) { background: var(--accent); border-colo
 .folder-row.is-selected { background: var(--accent-soft); border-radius: 8px; }
 #sync-freshness { color: var(--text-dim); font-size: 0.85rem; }
 #sync-freshness.sync-stale { color: var(--warn); }
+
+/* ---------- tables ---------- */
+table { width: 100%; border-collapse: separate; border-spacing: 0; margin-top: 12px; font-size: 0.9rem; overflow: hidden; }
+td, th { text-align: left; padding: 12px 11px; border-bottom: 1px solid var(--line); }
+
+@media (max-width: 1024px) {
+  #accounts table, #accounts tbody { display: block; width: 100%; white-space: normal; }
+  #accounts thead { display: none; }
+  #accounts tr { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; border-top: 1px solid var(--line); padding: 16px 0; }
+  #accounts td { display: block; min-width: 0; padding: 0; border: 0; overflow-wrap: anywhere; }
+  #accounts td:before {
+    content: attr(data-label); display: block;
+    font-size: 0.7rem; font-weight: 750; letter-spacing: 0.05em; text-transform: uppercase;
+    color: var(--text-dim); margin-bottom: 5px;
+  }
+  #accounts td[data-label="Address"], #accounts td[data-label="IMAP"],
+  #accounts td[data-label="Sync"], #accounts td[data-label="Actions"] { grid-column: 1/-1; }
+  #accounts .sync-detail { min-width: 0; max-width: none; }
+  #accounts td.actions { display: flex; flex-wrap: wrap; gap: 6px 12px; }
+  #accounts td.actions:before { flex-basis: 100%; }
+  #accounts td.actions button { padding: 8px 0; }
+  #accounts .operational-failure { margin-top: 10px; }
+}
+
+@media (max-width: 520px) {
+  table { display: block; overflow-x: auto; white-space: nowrap; }
+  td, th { padding: 10px 9px; }
+}
+
+/* ---------- mobile fixes: keep topbar single-row so task nav stays reachable, theme bare inputs ---------- */
+@media (max-width: 520px) {
+  .app-topbar { flex-wrap: nowrap; gap: 8px; }
+  .console-wordmark { height: 26px; }
+  .pill { max-width: 30vw; }
+  #logout { padding: 8px 12px; }
+}
+#alert-number-form input[name="number"] {
+  flex: 1 1 170px; width: auto; min-width: 0;
+  font: inherit; color: var(--text);
+  background: var(--bg-raise);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  padding: 9px 12px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+#alert-number-form input[name="number"]::placeholder { color: var(--text-faint, #8a93a8); }
+#alert-number-form input[name="number"]:focus {
+  outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
