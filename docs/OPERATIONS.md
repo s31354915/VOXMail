@@ -615,6 +615,43 @@ peer checks use only local sockets and test registration, audio, DTMF, restart,
 and shutdown with native diagnostics enabled and disabled. The supplied image
 must be built from the current native source.
 
+## Resource tuning
+
+VOXMail ships with conservative defaults; the knobs below change how much CPU,
+memory and network a deployment uses. Set them in the deployment environment
+(or Compose `.env`) and recreate the service. All are listed in
+[Settings](SETTINGS.md).
+
+**Sync concurrency.** `VOXMAIL_MAX_CONCURRENT_SYNCS` (default `2`, allowed
+`1`-`8`) sets how many due mail accounts the scheduled sweep syncs at the same
+time. Two keeps a slow or unreachable provider from holding up the sweep while
+bounding concurrent mbsync and SQLite write load; raise it only on hardware
+with headroom, and re-run the synchronization benchmark in
+[Performance](PERFORMANCE.md) after changing it.
+
+**IMAP IDLE.** `VOXMAIL_IMAP_IDLE` (default `true`) watches each account's
+INBOX over IMAP IDLE and starts an incremental sync the moment new mail
+arrives, so the sweep itself can stay infrequent. Set `false` for providers
+that reject IDLE or keep dropping idle connections; sweeps then remain the
+only sync trigger. Idle watchers reconnect with backoff (one to ten minutes)
+and re-check account configuration every minute.
+
+**Log level.** `VOXMAIL_LOG_LEVEL` (default `info`) throttles Go diagnostics
+volume; `warn` or `error` trims log churn on busy deployments, while `debug`
+(available always via `VOXMAIL_VERBOSE=true`) is for troubleshooting only.
+See [Verbose diagnostics](#verbose-diagnostics).
+
+**Speech models.** The default Whisper model is the quantized
+`ggml-base.en-q5_1.bin` build: about 57 MB to download instead of 148 MB, and
+noticeably less memory and CPU per transcription at similar accuracy. It is
+overridable with `VOXMAIL_STT_MODEL`; see [Models](#models).
+
+**Child processes.** Piper, Whisper, FFmpeg and mbsync share bounded
+execution: output capture, per-operation time caps and process-group cleanup
+are covered in [Child-process execution limits](#child-process-execution-limits),
+and the speech prompt cache in `/data/prompts` is capped at 512 files /
+128 MiB. These bounds apply regardless of the settings above.
+
 ## Child-process execution limits
 
 Piper, Whisper, FFmpeg and mbsync share the `internal/process` runner. Captured

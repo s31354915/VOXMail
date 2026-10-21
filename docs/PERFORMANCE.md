@@ -4,6 +4,16 @@ These controlled benchmarks measure specific sources of contention. They do not
 estimate real-provider throughput or establish a concurrency setting for every
 deployment. Run them on the deployment hardware before changing worker counts.
 
+Status (2026-10-21): the numbers in this document predate the hardening round
+landed on `fix/hardening-review`, which changed several of the surfaces they
+measure. The mail index scan now batch-loads per-account stamps in one query
+instead of one lookup per file, scheduled sweeps admit accounts two at a time
+(`VOXMAIL_MAX_CONCURRENT_SYNCS`, tunable 1-8) with context-aware admission,
+the default Whisper model is the quantized `base.en-q5_1` build (smaller
+download, less memory and CPU per transcription), and IMAP IDLE wakes
+incremental syncs between sweeps so mail arrives sooner without extra sweep
+load. Re-run the relevant benchmarks on your hardware before further tuning.
+
 ## Sequential account synchronization
 
 Command (2026-10-08, linux/amd64 codespace; runtime/CPU in the raw result):
