@@ -8,6 +8,13 @@ Create `.env` from the example and set a unique key:
 VOXMAIL_ENCRYPTION_KEY=<at least 32 random bytes>
 ```
 
+The key stretches through argon2id before use, so weak passphrases cost a
+memory-hard run per guess. Records sealed by this version carry a v2 marker;
+records sealed by older versions (HKDF-only or raw SHA-256 schedules) still
+open transparently after an upgrade, and are re-sealed under v2 the next time
+they are saved. The same key must stay on the deployment across restarts:
+older records can only be read while the key that sealed them is still in use.
+
 For telephone service, configure the provider credentials in the web console's
 **SIP connection** panel (registrar, SIP username, password, local bind port,
 registrar port, transport, registration interval). The `voxmail` process writes the baresip configuration
