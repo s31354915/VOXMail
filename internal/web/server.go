@@ -16,8 +16,10 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"path"
 	"reflect"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -29,10 +31,34 @@ import (
 	"github.com/voxmail/voxmail/internal/store"
 )
 
-//go:embed static/index.html static/console.bundle.js console/console.css
+//go:embed static/index.html static/console.bundle.js console/console.css console/console-*.css
 var consolePageFiles embed.FS
 
 var indexHTML = assembledConsole()
+
+// themeNameRe bounds VOXMAIL_THEME values to safe embedded-file name parts.
+var themeNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
+
+// consoleStylesPath resolves the console stylesheet for the configured theme.
+// Themes are drop-in stylesheets named console-<theme>.css next to the default
+// console.css; VOXMAIL_THEME=<theme> serves one, anything unset, malformed or
+// missing falls back to the default stylesheet.
+func consoleStylesPath() string {
+	name := strings.ToLower(strings.TrimSpace(os.Getenv("VOXMAIL_THEME")))
+	if name == "" {
+		return "console/console.css"
+	}
+	if !themeNameRe.MatchString(name) {
+		slog.Warn("ignoring VOXMAIL_THEME: invalid theme name", "theme", name)
+		return "console/console.css"
+	}
+	styles := "console/console-" + name + ".css"
+	if _, err := consolePageFiles.ReadFile(styles); err != nil {
+		slog.Warn("ignoring VOXMAIL_THEME: theme stylesheet not embedded", "theme", name)
+		return "console/console.css"
+	}
+	return styles
+}
 
 func assembledConsole() []byte {
 	read := func(path string) string {
@@ -45,7 +71,7 @@ func assembledConsole() []byte {
 	html := read("static/index.html")
 	for marker, path := range map[string]string{
 		"{{CONSOLE_SCRIPT}}": "static/console.bundle.js",
-		"{{CONSOLE_STYLES}}": "console/console.css",
+		"{{CONSOLE_STYLES}}": consoleStylesPath(),
 	} {
 		if strings.Count(html, marker) != 1 {
 			panic("console template must contain exactly one " + marker)

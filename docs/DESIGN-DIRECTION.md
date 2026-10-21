@@ -98,3 +98,14 @@ since Oct 21 ~14:25 EDT, fresh requests included). The hand-built path above pro
 without it; if 12ui unblocks, its candidates are used to polish the card and auth
 directions via `12ui convert` (which needs only the already-granted `design.convert`
 scope).
+
+## Shipping
+
+The dark design system lives in `internal/web/console/console-dark.css` and is
+opt-in: set `VOXMAIL_THEME=dark` and the console serves it in place of the
+default stylesheet. Themes are drop-in files: any stylesheet named
+`console-<theme>.css` in the same directory is servable without code changes,
+with `VOXMAIL_THEME` taking the theme name. The default UI keeps the previous look; the markup in
+`internal/web/static/index.html` serves both themes, so theme-independent
+fixes (the collapsible authenticator/backup-code row, fixed nav and section
+ids, the deduped sync note) apply either way.

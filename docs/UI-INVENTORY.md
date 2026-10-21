@@ -7,7 +7,7 @@ against main 3dd6998. Every item below must exist in the redesigned UI.
 ## Architecture
 
 - Single-page app, no framework: `internal/web/static/index.html` is the
-  only page (served by `GET /`); styles from `internal/web/console/console.css`
+  only page (served by `GET /`); styles from `internal/web/console/console.css`, or from `internal/web/console/console-<theme>.css` when `VOXMAIL_THEME=<theme>` (themes are drop-in stylesheets, e.g. `console-dark.css`; unknown or malformed names fall back to the default stylesheet)
   (~2,150 lines) are injected via the `{{CONSOLE_STYLES}}` placeholder;
   `internal/web/console/src/*.js` (14 ES modules) are bundled by
   `internal/web/console/build.mjs` into `static/console.bundle.js`.
