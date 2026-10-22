@@ -45,12 +45,12 @@ func TestAlertFolderMatch(t *testing.T) {
 
 func TestAlertText(t *testing.T) {
 	one := []store.AlertCandidate{{Folder: "INBOX", Sender: "Peach", Subject: "Your invoice"}}
-	text := alertText(one)
+	text := alertText(one, alertPromptContext{})
 	if !strings.Contains(text, "INBOX") || strings.Contains(text, "Peach") || strings.Contains(text, "Your invoice") {
 		t.Fatalf("alert disclosed sender/subject or omitted folder: %q", text)
 	}
 	many := append([]store.AlertCandidate{{Folder: "INBOX", Sender: "", Subject: ""}}, one...)
-	text = alertText(many)
+	text = alertText(many, alertPromptContext{})
 	if !strings.Contains(text, "2 new email messages") {
 		t.Fatalf("unexpected multi-alert text %q", text)
 	}
@@ -289,5 +289,28 @@ func TestAlertAttemptCapStopsReDialing(t *testing.T) {
 	}
 	if attempts != cap {
 		t.Fatalf("alert_attempts=%d, want %d", attempts, cap)
+	}
+}
+
+func TestAlertTextContextSuffixes(t *testing.T) {
+	cases := []struct {
+		name string
+		pctx alertPromptContext
+		want string
+	}{
+		{"base single account", alertPromptContext{}, "You have new email in Sent."},
+		{"several accounts connected", alertPromptContext{AccountsConnected: 2, AccountName: "Personal Gmail"}, "You have new email in Sent in Personal Gmail."},
+		{"shared caller number", alertPromptContext{AccountsConnected: 1, SharedNumber: true, Username: "sam"}, "You have new email in Sent from sam."},
+		{"both contexts", alertPromptContext{AccountsConnected: 3, AccountName: "Work", SharedNumber: true, Username: "sam"}, "You have new email in Sent in Work from sam."},
+	}
+	for _, tc := range cases {
+		got := alertText([]store.AlertCandidate{{Folder: "INBOX.Sent"}}, tc.pctx)
+		if got != tc.want {
+			t.Errorf("%s: alertText = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+	many := alertText([]store.AlertCandidate{{Folder: "INBOX.Sent"}, {Folder: "INBOX.Sent"}}, alertPromptContext{AccountsConnected: 2, AccountName: "Work"})
+	if !strings.Contains(many, "in Work") {
+		t.Errorf("multi-message prompt dropped the account name: %q", many)
 	}
 }

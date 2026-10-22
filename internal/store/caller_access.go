@@ -155,6 +155,12 @@ func (s *Store) accountName(ctx context.Context, accountID string) (string, erro
 	return name, err
 }
 
+// AccountDisplayName returns one account's canonical name, for prompts that
+// name the mailbox new mail landed in.
+func (s *Store) AccountDisplayName(ctx context.Context, accountID string) (string, error) {
+	return s.accountName(ctx, accountID)
+}
+
 // DeleteWhitelist removes the entry and every account binding behind it.
 func (s *Store) DeleteWhitelist(ctx context.Context, userID string, id int64) error {
 	tx, err := s.DB.BeginTx(ctx, nil)

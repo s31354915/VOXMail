@@ -23,7 +23,7 @@ func TestFriendlyFolderName(t *testing.T) {
 
 func TestAlertTextUsesFriendlyFolderNames(t *testing.T) {
 	list := []store.AlertCandidate{{Folder: "INBOX.Genealogy/Correspondence"}}
-	if got := alertText(list); got != "You have new email in Genealogy Correspondence." {
+	if got := alertText(list, alertPromptContext{}); got != "You have new email in Genealogy Correspondence." {
 		t.Fatalf("alertText=%q", got)
 	}
 }
