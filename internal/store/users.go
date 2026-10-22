@@ -2,6 +2,9 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"strings"
 	"time"
 )
 
@@ -12,6 +15,29 @@ func (s *Store) SetupCompleted(ctx context.Context) (bool, error) {
 	var completed int
 	err := s.DB.QueryRowContext(ctx, `SELECT setup_completed FROM system_settings WHERE id=1`).Scan(&completed)
 	return completed != 0, err
+}
+
+// ErrUsernameTaken reports a username that another account already uses.
+var ErrUsernameTaken = errors.New("username already exists")
+
+// UpdateUsername renames one user's sign-in username. The new name must be
+// unique across accounts, the same rule the setup and admin-create flows
+// enforce; the unique index remains the race-free backstop.
+func (s *Store) UpdateUsername(ctx context.Context, userID, username string) error {
+	username = strings.TrimSpace(username)
+	var existingID string
+	err := s.DB.QueryRowContext(ctx, `SELECT id FROM users WHERE username=?`, username).Scan(&existingID)
+	switch {
+	case err == nil && existingID != userID:
+		return ErrUsernameTaken
+	case err != nil && !errors.Is(err, sql.ErrNoRows):
+		return err
+	}
+	_, err = s.DB.ExecContext(ctx, `UPDATE users SET username=? WHERE id=?`, username, userID)
+	if err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed: users.username") {
+		return ErrUsernameTaken
+	}
+	return err
 }
 
 func (s *Store) UserCount(ctx context.Context) (int, error) {
@@ -108,29 +134,3 @@ func (s *Store) DeleteUser(ctx context.Context, id string) error {
 	return err
 }
 
-func (s *Store) AddWhitelist(ctx context.Context, entry WhitelistEntry) error {
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO caller_whitelist(user_id, phone, created_at) VALUES (?, ?, ?)`, entry.UserID, entry.Phone, time.Now().UTC().Format(time.RFC3339Nano))
-	return err
-}
-
-func (s *Store) ListWhitelist(ctx context.Context, userID string) ([]WhitelistEntry, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT id, user_id, phone FROM caller_whitelist WHERE user_id = ? ORDER BY phone`, userID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var result []WhitelistEntry
-	for rows.Next() {
-		var entry WhitelistEntry
-		if err := rows.Scan(&entry.ID, &entry.UserID, &entry.Phone); err != nil {
-			return nil, err
-		}
-		result = append(result, entry)
-	}
-	return result, rows.Err()
-}
-
-func (s *Store) DeleteWhitelist(ctx context.Context, userID string, id int64) error {
-	_, err := s.DB.ExecContext(ctx, `DELETE FROM caller_whitelist WHERE user_id = ? AND id = ?`, userID, id)
-	return err
-}

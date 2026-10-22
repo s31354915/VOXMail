@@ -13,7 +13,7 @@ import {
   loadAlertNumbers,
   resumeActiveVoiceInstall,
 } from "./voices.js";
-import { loadGlobalAlerts, loadUsers, loadSIP } from "./administration.js";
+import { loadGlobalAlerts, loadUsers, loadSIP, loadVerification, loadAdminCallerPanel } from "./administration.js";
 import { renderNavigation } from "./navigation.js";
 import { loadTwoFactor } from "./security.js";
 import { renderAuthState, initialSetupState } from "./authentication.js";
@@ -30,6 +30,7 @@ export async function loadAll() {
     await loadSettings();
     await loadVoices();
     if (window.isAdmin) await loadGlobalAlerts();
+    if (window.isAdmin) await loadVerification();
     await Promise.all([
       loadAccounts(),
       loadContacts(),
@@ -37,6 +38,7 @@ export async function loadAll() {
       state.alertsAvailable ? loadAlertNumbers() : Promise.resolve(),
       loadUsers(),
       window.isAdmin ? loadSIP() : Promise.resolve(),
+      window.isAdmin ? loadAdminCallerPanel() : Promise.resolve(),
     ]);
     if (window.isAdmin) void resumeActiveVoiceInstall();
   } catch (e) {

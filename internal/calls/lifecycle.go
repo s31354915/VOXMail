@@ -282,6 +282,10 @@ func (s *Service) onEstablished(message bridge.Message) {
 	switch sessState {
 	case "outgoing":
 		s.startTask(func() { s.playOutgoingAlert(sess) })
+	case "account_choice":
+		s.startTask(func() { s.speakAccountChoice(sess) })
+	case "verification":
+		s.startTask(func() { s.speakVerification(sess) })
 	default:
 		s.startTask(func() { s.greet(sess) })
 	}

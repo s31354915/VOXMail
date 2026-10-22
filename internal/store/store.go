@@ -250,9 +250,10 @@ type Contact struct {
 }
 
 type WhitelistEntry struct {
-	ID     int64  `json:"id"`
-	UserID string `json:"user_id"`
-	Phone  string `json:"phone"`
+	ID       int64  `json:"id"`
+	UserID   string `json:"user_id"`
+	Phone    string `json:"phone"`
+	Verified bool   `json:"verified"`
 }
 
 type AlertNumber struct {

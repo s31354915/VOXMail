@@ -173,6 +173,13 @@ type CallSessionInvalidator interface {
 	InvalidateUserSessions(string)
 }
 
+// VerificationDialer places one outgoing verification call that speaks a
+// number-ownership code. It is optional so the console remains testable
+// without a running call bridge.
+type VerificationDialer interface {
+	DialVerification(ctx context.Context, uri, userID, code string) error
+}
+
 type DeletionCallSessionInvalidator interface {
 	InvalidateUserSessionsForDeletion(string)
 }
@@ -212,6 +219,7 @@ type Server struct {
 	Preview           VoicePreviewer
 	SpeechPool        VoiceWarm
 	Calls             CallSessionInvalidator
+	Verification      VerificationDialer
 	Sync              AccountSyncer
 	DataRoot          string
 	VoiceDir          string
@@ -337,6 +345,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/recovery/request", s.requestRecovery)
 	mux.HandleFunc("POST /api/v1/recovery/confirm", s.confirmRecovery)
 	mux.HandleFunc("POST /api/v1/logout", s.logout)
+	mux.HandleFunc("POST /api/v1/security/username", s.changeUsername)
 	mux.HandleFunc("POST /api/v1/security/password", s.changePassword)
 	mux.HandleFunc("POST /api/v1/security/pin", s.changePIN)
 	mux.HandleFunc("POST /api/v1/security/2fa/setup", s.setup2FA)
@@ -366,7 +375,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/v1/contacts/{id}", s.deleteContact)
 	mux.HandleFunc("GET /api/v1/whitelist", s.whitelist)
 	mux.HandleFunc("POST /api/v1/whitelist", s.addWhitelist)
+	mux.HandleFunc("POST /api/v1/whitelist/verify", s.verifyWhitelist)
 	mux.HandleFunc("DELETE /api/v1/whitelist/{id}", s.deleteWhitelist)
+	mux.HandleFunc("GET /api/v1/admin/verification", s.verificationSettings)
+	mux.HandleFunc("PUT /api/v1/admin/verification", s.saveVerificationSettings)
+	mux.HandleFunc("GET /api/v1/admin/whitelist", s.adminWhitelistList)
+	mux.HandleFunc("POST /api/v1/admin/whitelist", s.adminAddWhitelist)
+	mux.HandleFunc("PUT /api/v1/admin/whitelist/order", s.reorderWhitelist)
 	mux.HandleFunc("GET /api/v1/settings", s.settings)
 	mux.HandleFunc("PUT /api/v1/settings", s.saveSettings)
 	mux.HandleFunc("GET /api/v1/admin/alerts", s.adminAlerts)

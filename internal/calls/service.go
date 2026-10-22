@@ -401,6 +401,8 @@ type session struct {
 	LastAlertOutcome     AlertOutcome
 	AlertOutcomeTerminal bool
 	ActiveAccount        string
+	Choices              []store.CallerRoute
+	VerificationCode     string
 	Editor               *keypad.MultiTap
 	Draft                draft
 	Drafts               []store.DraftRecord

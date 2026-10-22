@@ -75,6 +75,7 @@ func TestEveryStateHasTableDrivenInputNavigationAndCancellationTrace(t *testing.
 		"attachment_playback": "0", "move_menu": "1", "more_options": "1",
 		"contact_name": "1", "contact_confirm": "1", "field_confirm": "1",
 		"confirm_delete": "1", "compose": "1", "recipient_pick": "1", "contact_pick": "1", "recipient_menu": "1",
+		"account_choice": "1", "verification": "",
 		"recipient_input": "1", "subject_method": "1", "subject": "1",
 		"body_method": "1", "body": "1", "review": "1",
 		"forward_options": "1", "audio_recording": "0", "recording": "0",

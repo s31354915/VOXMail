@@ -8,7 +8,6 @@ import (
 	"net/mail"
 	"strings"
 
-	"github.com/voxmail/voxmail/internal/phone"
 	"github.com/voxmail/voxmail/internal/store"
 )
 
@@ -102,34 +101,12 @@ func (s *Server) whitelist(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	out, err := s.Store.ListWhitelist(r.Context(), u.ID)
+	out, err := s.Store.ListWhitelistDetail(r.Context(), u.ID)
 	if err != nil {
 		serverError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, out)
-}
-func (s *Server) addWhitelist(w http.ResponseWriter, r *http.Request) {
-	u, ok := s.require(w, r, true)
-	if !ok {
-		return
-	}
-	var e store.WhitelistEntry
-	if !decode(w, r, &e) {
-		return
-	}
-	e.UserID = u.ID
-	e.Phone = phone.Normalize(e.Phone)
-	if e.Phone == "" {
-		writeError(w, http.StatusBadRequest, "phone is required")
-		return
-	}
-	if err := s.Store.AddWhitelist(r.Context(), e); err != nil {
-		writeError(w, http.StatusConflict, "phone already belongs to a user")
-		return
-	}
-	_ = s.Store.Audit(r.Context(), u.ID, "caller_whitelist_added", e.Phone)
-	writeJSON(w, http.StatusCreated, e)
 }
 func (s *Server) deleteWhitelist(w http.ResponseWriter, r *http.Request) {
 	u, ok := s.require(w, r, true)

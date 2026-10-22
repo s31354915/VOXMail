@@ -16,6 +16,7 @@ import (
 
 	"github.com/voxmail/voxmail/internal/calls"
 	"github.com/voxmail/voxmail/internal/lifecycle"
+	"github.com/voxmail/voxmail/internal/phone"
 	"github.com/voxmail/voxmail/internal/store"
 )
 
@@ -223,7 +224,7 @@ func (s *Service) round(ctx context.Context) error {
 		outcome := func(state calls.AlertOutcome) {
 			s.logAlertOutcome(userID, ids, state)
 		}
-		err := s.Bridge.Dial(ctx, calls.DialRequest{URI: uri, UserID: userID, AccountID: list[0].AccountID, Text: alertText(list), Done: done, Outcome: outcome})
+		err := s.Bridge.Dial(ctx, calls.DialRequest{URI: uri, UserID: userID, AccountID: list[0].AccountID, Text: alertText(list, s.alertPromptContextFor(ctx, userID, list)), Done: done, Outcome: outcome})
 		if err != nil {
 			s.releasePending(userID)
 			s.clearInflight(ids)
@@ -442,13 +443,58 @@ func dialURI(phone, domain string) string {
 	return "sip:" + phone + "@" + domain
 }
 
-func alertText(list []store.AlertCandidate) string {
-	if len(list) == 1 {
-		c := list[0]
-		return "You have new email in " + friendlyFolderName(c.Folder) + "."
+// alertPromptContext carries the caller-facing context a prompt needs to
+// disambiguate itself: how many mail accounts the alert owner connected, the
+// account the new mail landed in, and whether the dialed number also serves
+// other VOXMail accounts (so the account username is spoken as "for the <username> account").
+type alertPromptContext struct {
+	AccountsConnected int
+	AccountName       string
+	SharedNumber      bool
+	Username          string
+}
+
+// alertPromptContextFor looks the context up for one alert call. Every
+// lookup is best-effort: a store error leaves the base prompt untouched
+// rather than delaying or dropping the call.
+func (s *Service) alertPromptContextFor(ctx context.Context, userID string, list []store.AlertCandidate) alertPromptContext {
+	var pctx alertPromptContext
+	if s.Store == nil || len(list) == 0 {
+		return pctx
 	}
-	c := list[0]
-	return fmt.Sprintf("You have %d new email messages. The latest is in %s.", len(list), friendlyFolderName(c.Folder))
+	if accounts, err := s.Store.ListAccounts(ctx, userID); err == nil {
+		pctx.AccountsConnected = len(accounts)
+	}
+	if routes, err := s.Store.AccountsForPhone(ctx, phone.Normalize(list[0].Phone)); err == nil {
+		pctx.SharedNumber = len(routes) > 1
+		for _, route := range routes {
+			if route.UserID == userID {
+				pctx.Username = route.Username
+				break
+			}
+		}
+	}
+	if name, err := s.Store.AccountDisplayName(ctx, list[0].AccountID); err == nil {
+		pctx.AccountName = name
+	}
+	return pctx
+}
+
+func alertText(list []store.AlertCandidate, pctx alertPromptContext) string {
+	var base string
+	if len(list) == 1 {
+		base = "You have new email in " + friendlyFolderName(list[0].Folder)
+	} else {
+		c := list[0]
+		base = fmt.Sprintf("You have %d new email messages. The latest is in %s", len(list), friendlyFolderName(c.Folder))
+	}
+	if pctx.AccountsConnected > 1 && pctx.AccountName != "" {
+		base += " in " + pctx.AccountName
+	}
+	if pctx.SharedNumber && pctx.Username != "" {
+		base += ", for the " + pctx.Username + " account"
+	}
+	return base + "."
 }
 
 // friendlyFolderName turns a raw maildir or IMAP folder path into something

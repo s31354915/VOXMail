@@ -514,6 +514,48 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "changed"})
 }
 
+type usernameChangeRequest struct {
+	Current     string `json:"current_password"`
+	NewUsername string `json:"new_username"`
+}
+
+// changeUsername renames the signed-in user. It follows the same safety
+// pattern as changePassword: confirm the current password, validate the new
+// value, then rotate the session. The new username must not already be used
+// by another account, the same rule creation enforces.
+func (s *Server) changeUsername(w http.ResponseWriter, r *http.Request) {
+	u, ok := s.require(w, r, true)
+	if !ok {
+		return
+	}
+	var req usernameChangeRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if !auth.Check(u.PasswordHash, req.Current) {
+		writeFieldError(w, "current_password", "current password is incorrect")
+		return
+	}
+	username := strings.TrimSpace(req.NewUsername)
+	if len(username) < 3 || len(username) > 64 {
+		writeFieldError(w, "new_username", "username must be 3-64 characters")
+		return
+	}
+	if err := s.Store.UpdateUsername(r.Context(), u.ID, username); err != nil {
+		if errors.Is(err, store.ErrUsernameTaken) {
+			writeFieldError(w, "new_username", "that username is already used by another account")
+			return
+		}
+		serverError(w, err)
+		return
+	}
+	_ = s.Store.Audit(r.Context(), u.ID, "username_changed", "")
+	if !s.replaceUserSession(w, r, u.ID) {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "changed"})
+}
+
 type pinChangeRequest struct {
 	CurrentPassword string `json:"current_password"`
 	NewPIN          string `json:"new_pin"`

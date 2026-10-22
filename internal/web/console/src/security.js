@@ -12,7 +12,7 @@ export function securityFieldError(form, name, message) {
 export function clearSecurityErrors(form) {
   const forms = form
     ? [form]
-    : [$("#password-form"), $("#pin-form"), $("#twofa-form")];
+    : [$("#username-form"), $("#password-form"), $("#pin-form"), $("#twofa-form")];
   forms.forEach((f) => {
     f.querySelectorAll("[aria-invalid]").forEach((el) =>
       el.removeAttribute("aria-invalid"),
@@ -45,6 +45,10 @@ export function validateSecurity(form) {
           input.name,
           "Use a password of 12–72 UTF-8 bytes.",
         );
+    } else if (input.name === "new_username") {
+      const value = input.value.trim();
+      if (value.length < 3 || value.length > 64)
+        securityFieldError(form, input.name, "Use 3-64 characters.");
     } else if (input.name === "new_pin" && !/^[0-9]{4,12}$/.test(input.value))
       securityFieldError(form, input.name, "Use a PIN of 4–12 digits.");
     else if (input.name === "code" && !/^[0-9]{6}$/.test(input.value))
@@ -200,7 +204,7 @@ export async function twoFactorAction(run) {
 export function initializeSecurity() {
   document
     .querySelectorAll(
-      "#password-form input,#pin-form input,#twofa-form input[name]",
+      "#username-form input,#password-form input,#pin-form input,#twofa-form input[name]",
     )
     .forEach((input) => {
       const form = input.form,
@@ -231,6 +235,19 @@ export function initializeSecurity() {
       "Password changed; other web sessions were signed out.",
     );
   };
+  $("#username-form").onsubmit = (e) => {
+    e.preventDefault();
+    const f = e.target;
+    saveSecurity(
+      f,
+      "/api/v1/security/username",
+      {
+        current_password: f.elements.current_password.value,
+        new_username: f.elements.new_username.value,
+      },
+      "Username changed; other web sessions were signed out.",
+    );
+  };
   $("#pin-form").onsubmit = (e) => {
     e.preventDefault();
     const f = e.target;
@@ -244,7 +261,7 @@ export function initializeSecurity() {
       "Telephone PIN changed; telephone sessions were signed out.",
     );
   };
-  for (const name of ["password", "pin"])
+  for (const name of ["username", "password", "pin"])
     $("#" + name + "-cancel").onclick = () => {
       const f = $("#" + name + "-form");
       f.reset();
