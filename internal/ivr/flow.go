@@ -15,6 +15,9 @@ const (
 	StateCompose State = "compose"
 	StateReview  State = "review"
 	StateClosed  State = "closed"
+
+	StateAccountChoice State = "account_choice"
+	StateVerification  State = "verification"
 )
 
 type Session struct {

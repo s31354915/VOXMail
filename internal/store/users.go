@@ -134,29 +134,3 @@ func (s *Store) DeleteUser(ctx context.Context, id string) error {
 	return err
 }
 
-func (s *Store) AddWhitelist(ctx context.Context, entry WhitelistEntry) error {
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO caller_whitelist(user_id, phone, created_at) VALUES (?, ?, ?)`, entry.UserID, entry.Phone, time.Now().UTC().Format(time.RFC3339Nano))
-	return err
-}
-
-func (s *Store) ListWhitelist(ctx context.Context, userID string) ([]WhitelistEntry, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT id, user_id, phone FROM caller_whitelist WHERE user_id = ? ORDER BY phone`, userID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var result []WhitelistEntry
-	for rows.Next() {
-		var entry WhitelistEntry
-		if err := rows.Scan(&entry.ID, &entry.UserID, &entry.Phone); err != nil {
-			return nil, err
-		}
-		result = append(result, entry)
-	}
-	return result, rows.Err()
-}
-
-func (s *Store) DeleteWhitelist(ctx context.Context, userID string, id int64) error {
-	_, err := s.DB.ExecContext(ctx, `DELETE FROM caller_whitelist WHERE user_id = ? AND id = ?`, userID, id)
-	return err
-}

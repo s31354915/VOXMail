@@ -388,7 +388,7 @@ func main() {
 	voiceInstaller := speech.AdministratorVoiceInstaller{Validate: func(ctx context.Context, model string) error {
 		return (speech.Piper{Binary: cfg.PiperBinary, Model: model}).Warm(ctx, filepath.Join(cfg.DataDir, "run", "speech"))
 	}}
-	webApp := &web.Server{VoiceInstaller: voiceInstaller, Store: db, Secrets: secrets, Log: log, SIP: sipBridge, Alerts: alertService, Voice: voiceService, Preview: voiceService, Calls: bridgeService, DataRoot: cfg.DataDir, VoiceDir: cfg.VoiceDir, SpeechPool: speechPool, OfflineMode: cfg.OfflineMode, TrustedProxyCIDRs: cfg.TrustedProxyCIDRs, RuntimeStatus: runtimeStatus, Ready: func(ctx context.Context) error {
+	webApp := &web.Server{VoiceInstaller: voiceInstaller, Store: db, Secrets: secrets, Log: log, SIP: sipBridge, Alerts: alertService, Voice: voiceService, Preview: voiceService, Calls: bridgeService, Verification: bridgeService, DataRoot: cfg.DataDir, VoiceDir: cfg.VoiceDir, SpeechPool: speechPool, OfflineMode: cfg.OfflineMode, TrustedProxyCIDRs: cfg.TrustedProxyCIDRs, RuntimeStatus: runtimeStatus, Ready: func(ctx context.Context) error {
 		if cfg.OfflineMode {
 			return nil
 		}

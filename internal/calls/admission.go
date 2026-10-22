@@ -9,6 +9,7 @@ import (
 	"github.com/voxmail/voxmail/internal/ivr"
 	"github.com/voxmail/voxmail/internal/lifecycle"
 	"github.com/voxmail/voxmail/internal/phone"
+	"github.com/voxmail/voxmail/internal/store"
 )
 
 func (s *Service) admit(conn net.Conn, message bridge.Message) error {
@@ -16,13 +17,33 @@ func (s *Service) admit(conn net.Conn, message bridge.Message) error {
 		return s.sendBridge(conn, bridge.Message{Type: "hangup", CallID: message.CallID, Code: 500, Reason: "server unavailable"})
 	}
 	phone := phone.Normalize(message.From)
+	// A caller proving ownership of a number hears its verification code
+	// before any PIN lockout check, so a locked caller can still complete a
+	// pending number verification.
+	if verification, verr := s.Store.PendingIncomingVerification(s.baseContext(), phone); verr == nil {
+		return s.admitVerification(conn, message, verification)
+	}
 	if locked := s.pinLockedUntil(phone); !locked.IsZero() {
 		return s.sendBridge(conn, bridge.Message{Type: "hangup", CallID: message.CallID, Code: 603, Reason: "caller is temporarily locked out"})
 	}
-	user, err := s.Store.UserByPhone(s.baseContext(), phone)
-	if err != nil || !user.Enabled {
+	// One number may sit on several accounts, even across users. Every
+	// reachable account is a route; more than one route opens with an
+	// account-choice menu instead of the usual welcome greeting.
+	routes, err := s.Store.AccountsForPhone(s.baseContext(), phone)
+	if err != nil {
 		return s.sendBridge(conn, bridge.Message{Type: "hangup", CallID: message.CallID, Code: 603, Reason: "caller not authorized"})
 	}
+	if len(routes) == 0 {
+		// Legacy deployments kept numbers on the caller list before account
+		// bindings existed; a whitelisted number with no bindings still
+		// reaches its one owning account exactly as it did before.
+		user, userErr := s.Store.UserByPhone(s.baseContext(), phone)
+		if userErr != nil || !user.Enabled {
+			return s.sendBridge(conn, bridge.Message{Type: "hangup", CallID: message.CallID, Code: 603, Reason: "caller not authorized"})
+		}
+		routes = []store.CallerRoute{{UserID: user.ID}}
+	}
+	userID := routes[0].UserID
 	s.mu.Lock()
 	/* Baresip can report a lifecycle event more than once. A call ID is the
 	 * idempotency key: a duplicate call_incoming must not replace the
@@ -36,8 +57,54 @@ func (s *Service) admit(conn net.Conn, message bridge.Message) error {
 	busy := s.sipApplying || (s.MaxCalls > 0 && len(s.sessions) >= s.MaxCalls)
 	if !busy && !shuttingDown {
 		flow := ivr.NewSession(message.CallID)
-		flow.State = ivr.StatePIN
-		s.sessions[message.CallID] = &session{CallID: message.CallID, UserID: user.ID, Phone: phone, State: "pin", Flow: flow, TxPath: message.TxPath, RxPath: message.RxPath}
+		sess := &session{CallID: message.CallID, UserID: userID, Phone: phone, State: "pin", Flow: flow, TxPath: message.TxPath, RxPath: message.RxPath}
+		if len(routes) > 1 {
+			flow.State = ivr.StateAccountChoice
+			sess.State = "account_choice"
+			sess.Choices = routes
+		} else {
+			flow.State = ivr.StatePIN
+		}
+		s.sessions[message.CallID] = sess
+		s.armInactivityTimeoutLocked(sess)
+	}
+	s.mu.Unlock()
+	if shuttingDown {
+		return s.sendBridge(conn, bridge.Message{Type: "hangup", CallID: message.CallID, Code: 503, Reason: "server is shutting down"})
+	}
+	if busy {
+		return s.sendBridge(conn, bridge.Message{Type: "hangup", CallID: message.CallID, Code: 486, Reason: "all lines are busy"})
+	}
+	if err := s.sendBridge(conn, bridge.Message{Type: "answer", CallID: message.CallID, UserID: userID}); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	// The session can disappear between the answer and this lookup (the call
+	// closed, or the user's sessions were invalidated); guard the nil case
+	// instead of panicking inside the bridge event loop.
+	if sess := s.sessions[message.CallID]; sess != nil && s.Media != nil {
+		sess.Runtime, sess.Lease, sess.EmailRuntime, sess.EmailLease = s.Media.ActivateForUserSpeeds(userID)
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+// admitVerification answers a call-in number verification: the code the
+// caller submitted in the web console is spoken once and the call ends. No
+// session state besides the code is needed.
+func (s *Service) admitVerification(conn net.Conn, message bridge.Message, verification store.CallerVerification) error {
+	phone := phone.Normalize(message.From)
+	s.mu.Lock()
+	if existing := s.sessions[message.CallID]; existing != nil && !existing.Closed {
+		s.mu.Unlock()
+		return nil
+	}
+	shuttingDown := s.shuttingDown
+	busy := s.sipApplying || (s.MaxCalls > 0 && len(s.sessions) >= s.MaxCalls)
+	if !busy && !shuttingDown {
+		flow := ivr.NewSession(message.CallID)
+		flow.State = ivr.StateVerification
+		s.sessions[message.CallID] = &session{CallID: message.CallID, UserID: verification.UserID, Phone: phone, State: "verification", VerificationCode: verification.Code, Flow: flow, TxPath: message.TxPath, RxPath: message.RxPath}
 		s.armInactivityTimeoutLocked(s.sessions[message.CallID])
 	}
 	s.mu.Unlock()
@@ -47,15 +114,12 @@ func (s *Service) admit(conn net.Conn, message bridge.Message) error {
 	if busy {
 		return s.sendBridge(conn, bridge.Message{Type: "hangup", CallID: message.CallID, Code: 486, Reason: "all lines are busy"})
 	}
-	if err := s.sendBridge(conn, bridge.Message{Type: "answer", CallID: message.CallID, UserID: user.ID}); err != nil {
+	if err := s.sendBridge(conn, bridge.Message{Type: "answer", CallID: message.CallID, UserID: verification.UserID}); err != nil {
 		return err
 	}
 	s.mu.Lock()
-	// The session can disappear between the answer and this lookup (the call
-	// closed, or the user's sessions were invalidated); guard the nil case
-	// instead of panicking inside the bridge event loop.
 	if sess := s.sessions[message.CallID]; sess != nil && s.Media != nil {
-		sess.Runtime, sess.Lease, sess.EmailRuntime, sess.EmailLease = s.Media.ActivateForUserSpeeds(user.ID)
+		sess.Runtime, sess.Lease, sess.EmailRuntime, sess.EmailLease = s.Media.ActivateForUserSpeeds(verification.UserID)
 	}
 	s.mu.Unlock()
 	return nil

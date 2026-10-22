@@ -77,7 +77,257 @@ export async function loadSIP() {
   }
 }
 
+export async function loadVerification() {
+  if (!window.isAdmin) return;
+  try {
+    const v = await api("/api/v1/admin/verification");
+    $("#verification-incoming").checked = !!v.verification_incoming;
+    $("#verification-outgoing").checked = !!v.verification_outgoing;
+    $("#verification-dialin").value = v.verification_dialin || "";
+    $("#verification-panel").classList.remove("hidden");
+  } catch (_) {
+    $("#verification-panel").classList.add("hidden");
+  }
+}
+
+export async function loadAdminCallerPanel() {
+  if (!window.isAdmin) return;
+  try {
+    const users = await api("/api/v1/users");
+    const userSelect = $("#admin-phone-form")?.elements.user_id;
+    if (userSelect) {
+      userSelect.innerHTML = users
+        .map(
+          (u) =>
+            '<option value="' + esc(u.id) + '">' + esc(u.username) + "</option>",
+        )
+        .join("");
+    }
+    $("#admin-caller-panel").classList.remove("hidden");
+    if (userSelect) await loadAdminCallerAccounts(userSelect.value);
+    await loadAdminCallerPhones();
+  } catch (_) {
+    $("#admin-caller-panel").classList.add("hidden");
+  }
+}
+
+export async function loadAdminCallerAccounts(userID) {
+  try {
+    const data = await api("/api/v1/admin/whitelist?user_id=" + encodeURIComponent(userID));
+    populateAdminAccountSelect(data.accounts || []);
+    renderAdminPhones(data.whitelist || []);
+  } catch (_) {
+    $("#admin-caller-panel").classList.add("hidden");
+  }
+}
+
+function populateAdminAccountSelect(accounts) {
+  const select = $("#admin-phone-form")?.elements.account_id;
+  if (!select) return;
+  select.innerHTML = accounts
+    .map(
+      (a) =>
+        '<option value="' + esc(a.id) + '">' + esc(a.canonical_name || a.name || a.id) + "</option>",
+    )
+    .join("");
+}
+
+export async function loadAdminCallerPhones() {
+  const userID = $("#admin-phone-form")?.elements.user_id?.value;
+  if (!userID) return;
+  try {
+    const data = await api("/api/v1/admin/whitelist?user_id=" + encodeURIComponent(userID));
+    const select = $("#admin-phone-order-form")?.elements.phone;
+    state.adminCallerPhones = data.whitelist || [];
+    if (select) {
+      select.innerHTML = state.adminCallerPhones
+        .map(
+          (x) =>
+            '<option value="' + esc(x.phone) + '">' + esc(x.phone) + "</option>",
+        )
+        .join("");
+      $("#admin-phone-order-form").classList.toggle("hidden", !state.adminCallerPhones.length);
+      renderAdminOrder(state.adminCallerPhones[0]?.phone);
+    }
+  } catch (_) {}
+}
+
+function renderAdminPhones(rows) {
+  $("#admin-phones").innerHTML = rows.length
+    ? "<ul>" +
+      rows
+        .map((x) => {
+          const names = (x.accounts || [])
+            .map((a) => esc(a.account_name))
+            .join(", ");
+          return (
+            "<li>" +
+            esc(x.phone) +
+            (x.verified ? "" : ' <span class="muted">unverified</span>') +
+            (names ? " → " + names : "") +
+            ' <button class="link" data-order-phone="' + esc(x.phone) + '">Reorder</button>' +
+            ' <button class="link" data-delete-admin-phone="' + x.id + '">Remove</button>' +
+            "</li>"
+          );
+        })
+        .join("") +
+      "</ul>"
+    : "<p>No caller numbers for this user.</p>";
+  applyMutationPending("#admin-phones");
+}
+
+function renderAdminOrder(phone) {
+  const row = state.adminCallerPhones.find((x) => x.phone === phone);
+  const list = $("#admin-phone-order");
+  if (!row) {
+    list.innerHTML = "";
+    return;
+  }
+  list.innerHTML = (row.accounts || [])
+    .map(
+      (a, n) =>
+        "<li>" + esc(a.account_name) +
+        ' <span class="admin-order-buttons"><button class="link" data-order-up="' + esc(a.account_id) + '" aria-label="Move ' + esc(a.account_name) + ' up" title="Move up">↑</button>' +
+        '<button class="link" data-order-down="' + esc(a.account_id) + '" aria-label="Move ' + esc(a.account_name) + ' down" title="Move down">↓</button></span></li>',
+    )
+    .join("");
+  list.dataset.phone = phone;
+}
+
+export function initializeVerification() {
+  $("#save-verification").onclick = async () => {
+    const button = $("#save-verification");
+    if (!beginMutation(button)) return;
+    const epoch = state.sessionEpoch;
+    clearOperationFeedback(button);
+    try {
+      await api("/api/v1/admin/verification", {
+        method: "PUT",
+        body: JSON.stringify({
+          verification_incoming: $("#verification-incoming").checked,
+          verification_outgoing: $("#verification-outgoing").checked,
+          verification_dialin: $("#verification-dialin").value.trim(),
+        }),
+      });
+      if (epoch !== state.sessionEpoch) return;
+      status("Number verification settings saved.");
+    } catch (x) {
+      if (epoch === state.sessionEpoch)
+        operationFeedback(button, "Verification settings could not be saved: " + x.message);
+    } finally {
+      if (epoch === state.sessionEpoch) endMutation(button);
+    }
+  };
+}
+
+export function initializeAdminCallerPanel() {
+  $("#admin-phone-form")?.elements.user_id?.addEventListener("change", (e) => {
+    loadAdminCallerAccounts(e.target.value).then(loadAdminCallerPhones);
+  });
+  $("#admin-phone-form").onsubmit = async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    if (!beginMutation(f, 'button[type="submit"]')) return;
+    const epoch = state.sessionEpoch;
+    clearOperationFeedback(f);
+    try {
+      await api("/api/v1/admin/whitelist", {
+        method: "POST",
+        body: JSON.stringify(formData(f)),
+      });
+      if (epoch !== state.sessionEpoch) return;
+      f.elements.phone.value = "";
+      await loadAdminCallerAccounts(f.elements.user_id.value);
+      await loadAdminCallerPhones();
+      status("Verified number added for that account.");
+    } catch (x) {
+      if (epoch === state.sessionEpoch)
+        operationFeedback(f, "The number could not be added: " + x.message);
+    } finally {
+      if (epoch === state.sessionEpoch) endMutation(f, 'button[type="submit"]');
+    }
+  };
+  $("#admin-phone-order-form").onsubmit = async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    if (!beginMutation(f, 'button[type="submit"]')) return;
+    const epoch = state.sessionEpoch;
+    clearOperationFeedback(f);
+    try {
+      const list = $("#admin-phone-order");
+      const ids = [...list.querySelectorAll("li")].map(
+        (li) => li.querySelector("[data-order-up]").dataset.orderUp,
+      );
+      await api("/api/v1/admin/whitelist/order", {
+        method: "PUT",
+        body: JSON.stringify({
+          user_id: $("#admin-phone-form").elements.user_id.value,
+          phone: list.dataset.phone,
+          account_ids: ids,
+        }),
+      });
+      if (epoch !== state.sessionEpoch) return;
+      await loadAdminCallerAccounts($("#admin-phone-form").elements.user_id.value);
+      status("Caller menu order saved.");
+    } catch (x) {
+      if (epoch === state.sessionEpoch)
+        operationFeedback(f, "The order could not be saved: " + x.message);
+    } finally {
+      if (epoch === state.sessionEpoch) endMutation(f, 'button[type="submit"]');
+    }
+  };
+  $("#admin-phone-order-form")?.elements.phone?.addEventListener("change", (e) =>
+    renderAdminOrder(e.target.value),
+  );
+  $("#admin-phone-order-cancel").onclick = () =>
+    renderAdminOrder($("#admin-phone-order-form").elements.phone.value);
+  $("#admin-phones").onclick = async (e) => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    if (b.dataset.orderPhone) {
+      $("#admin-phone-order-form").elements.phone.value = b.dataset.orderPhone;
+      renderAdminOrder(b.dataset.orderPhone);
+      $("#admin-phone-order-form").scrollIntoView({ behavior: "smooth" });
+      return;
+    }
+    if (!b.dataset.deleteAdminPhone || !beginMutation("#admin-phones")) return;
+    const epoch = state.sessionEpoch;
+    clearOperationFeedback("#admin-phones");
+    try {
+      await api("/api/v1/whitelist/" + b.dataset.deleteAdminPhone, { method: "DELETE" });
+      if (epoch !== state.sessionEpoch) return;
+      await loadAdminCallerAccounts($("#admin-phone-form").elements.user_id.value);
+      await loadAdminCallerPhones();
+      status("Number removed.");
+    } catch (x) {
+      if (epoch === state.sessionEpoch)
+        operationFeedback("#admin-phones", "The number could not be removed: " + x.message);
+    } finally {
+      if (epoch === state.sessionEpoch) endMutation("#admin-phones");
+    }
+  };
+  $("#admin-phone-order").onclick = async (e) => {
+    const b = e.target.closest("[data-order-up],[data-order-down]");
+    if (!b || !beginMutation("#admin-phone-order")) return;
+    try {
+      const list = $("#admin-phone-order");
+      const items = [...list.querySelectorAll("li")];
+      const id = b.dataset.orderUp || b.dataset.orderDown;
+      const i = items.findIndex((li) => li.querySelector("[data-order-up]").dataset.orderUp === id);
+      const delta = b.dataset.orderUp ? -1 : 1;
+      const j = i + delta;
+      if (i < 0 || j < 0 || j >= items.length) return;
+      list.insertBefore(items[j], delta < 0 ? items[i] : items[j].nextSibling);
+      list.insertBefore(items[i], delta < 0 ? items[j] : null);
+    } finally {
+      endMutation("#admin-phone-order");
+    }
+  };
+}
+
 export function initializeAdministration() {
+  initializeVerification();
+  initializeAdminCallerPanel();
   $("#save-global-alerts").onclick = async () => {
     const button = $("#save-global-alerts");
     if (!beginMutation(button)) return;

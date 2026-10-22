@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS users (
 );
 CREATE TABLE IF NOT EXISTS caller_whitelist (
  id INTEGER PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
- phone TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL
+ phone TEXT NOT NULL, verified INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+ UNIQUE(user_id, phone)
 );
 CREATE TABLE IF NOT EXISTS accounts (
  id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -48,7 +49,10 @@ CREATE TABLE IF NOT EXISTS settings (
 CREATE TABLE IF NOT EXISTS system_settings (
 	id INTEGER PRIMARY KEY CHECK (id = 1),
 	alerts_available INTEGER NOT NULL DEFAULT 1,
-	setup_completed INTEGER NOT NULL DEFAULT 0
+	setup_completed INTEGER NOT NULL DEFAULT 0,
+	verification_incoming INTEGER NOT NULL DEFAULT 1,
+	verification_outgoing INTEGER NOT NULL DEFAULT 1,
+	verification_dialin TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS sip_settings (
  id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -327,6 +331,59 @@ FROM remote_folders WHERE local_path<>''`); err != nil {
 	if err := s.applyMigration(ctx, 28, `CREATE TABLE IF NOT EXISTS voice_keep_warm (
  voice TEXT PRIMARY KEY, keep_warm INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL
 )`); err != nil {
+		return err
+	}
+	// Caller whitelist loses its global phone uniqueness so one number can
+	// serve several accounts, with the caller choosing at admission. Existing
+	// rows stay verified: they were added under the stricter old rule.
+	// Bindings pin each whitelist number to specific accounts in first-added
+	// order; the account-choice menu reads that order.
+	if err := s.applyMigration(ctx, 29, `
+CREATE TABLE caller_whitelist_v29 (
+ id INTEGER PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ phone TEXT NOT NULL, verified INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+ UNIQUE(user_id, phone)
+);
+INSERT INTO caller_whitelist_v29(id, user_id, phone, verified, created_at)
+ SELECT id, user_id, phone, 1, created_at FROM caller_whitelist;
+DROP TABLE caller_whitelist;
+ALTER TABLE caller_whitelist_v29 RENAME TO caller_whitelist;
+CREATE TABLE caller_number_accounts (
+ id INTEGER PRIMARY KEY,
+ user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+ phone TEXT NOT NULL,
+ position INTEGER NOT NULL DEFAULT 0,
+ created_at TEXT NOT NULL,
+ UNIQUE(user_id, phone, account_id)
+);
+INSERT INTO caller_number_accounts(user_id, account_id, phone, position, created_at)
+ SELECT w.user_id, a.id, w.phone,
+   ROW_NUMBER() OVER (PARTITION BY w.user_id, w.phone ORDER BY a.display_order, a.created_at),
+   w.created_at
+ FROM caller_whitelist w JOIN accounts a ON a.user_id = w.user_id;
+CREATE TABLE caller_verifications (
+ id INTEGER PRIMARY KEY,
+ user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ phone TEXT NOT NULL,
+ code TEXT NOT NULL,
+ method TEXT NOT NULL,
+ created_at TEXT NOT NULL,
+ expires_at TEXT NOT NULL,
+ consumed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS caller_verifications_phone_idx ON caller_verifications(phone, consumed_at);
+`); err != nil {
+		return err
+	}
+	// Administrator verification policy: which verification call directions
+	// are offered, and the dial-in number a caller uses when the system
+	// cannot derive one itself.
+	if err := s.applyColumnMigration(ctx, 30, "system_settings", []struct{ name, declaration string }{
+		{"verification_incoming", "INTEGER NOT NULL DEFAULT 1"},
+		{"verification_outgoing", "INTEGER NOT NULL DEFAULT 1"},
+		{"verification_dialin", "TEXT NOT NULL DEFAULT ''"},
+	}); err != nil {
 		return err
 	}
 	return nil

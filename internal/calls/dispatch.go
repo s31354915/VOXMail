@@ -28,6 +28,16 @@ func (s *Service) handleDTMF(conn net.Conn, message bridge.Message) error {
 		s.mu.Unlock()
 		return s.handleMenu(conn, sess, message)
 	}
+	// A verification call listens for nothing; keep the line open while the
+	// code is spoken and ignore every key.
+	if sess.State == "verification" {
+		s.mu.Unlock()
+		return nil
+	}
+	if sess.State == "account_choice" {
+		s.mu.Unlock()
+		return s.chooseCallerAccount(conn, sess, message.Digit)
+	}
 	if message.Digit == "*" {
 		sess.PIN = ""
 		s.mu.Unlock()

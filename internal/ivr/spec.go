@@ -35,6 +35,8 @@ func digits(min, max int) func(string) bool {
 var specs = map[State]StateSpec{
 	"closed":                {State: "closed", Prompt: "This call is closed.", Valid: fixed(), Timeout: "closed", Repeatable: true},
 	"pin":                   {State: "pin", Prompt: "Enter your PIN, then press pound.", Valid: nil, Back: "closed", Timeout: "closed", Repeatable: true},
+	"account_choice":        {State: "account_choice", Prompt: "Please choose the VOXMail account.", Valid: digits(1, 9), Back: "closed", Timeout: "closed", Repeatable: true},
+	"verification":          {State: "verification", Prompt: "One moment.", Valid: nil, Back: "closed", Timeout: "closed", Repeatable: true},
 	"main":                  {State: "main", Prompt: MainMenuPrompt, Valid: fixed("1", "2", "3"), Repeatable: true},
 	"accounts":              {State: "accounts", Prompt: "Press 0 for all unread mail, choose an account, press 9 for more if available, or press pound to go back.", Valid: digits(0, 9), Back: "main", Repeatable: true},
 	"account_menu":          {State: "account_menu", Prompt: "Press 1 to listen to mail, 2 to send an email, 3 to refresh, 4 for account settings when available, or 5 for the unread count.", Valid: fixed("1", "2", "3", "4", "5"), Back: "accounts", Repeatable: true},

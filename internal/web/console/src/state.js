@@ -6,6 +6,8 @@ export const state = {
   syncSeenStates: new Map(),
   csrf: "",
   accounts: [],
+  pendingVerification: null,
+  adminCallerPhones: [],
   contacts: [],
   alertsAvailable: true,
   sessionEpoch: 0,
