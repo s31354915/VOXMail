@@ -446,7 +446,7 @@ func dialURI(phone, domain string) string {
 // alertPromptContext carries the caller-facing context a prompt needs to
 // disambiguate itself: how many mail accounts the alert owner connected, the
 // account the new mail landed in, and whether the dialed number also serves
-// other VOXMail accounts (so the account username has to be spoken).
+// other VOXMail accounts (so the account username is spoken as "for the <username> account").
 type alertPromptContext struct {
 	AccountsConnected int
 	AccountName       string
@@ -492,7 +492,7 @@ func alertText(list []store.AlertCandidate, pctx alertPromptContext) string {
 		base += " in " + pctx.AccountName
 	}
 	if pctx.SharedNumber && pctx.Username != "" {
-		base += " from " + pctx.Username
+		base += ", for the " + pctx.Username + " account"
 	}
 	return base + "."
 }

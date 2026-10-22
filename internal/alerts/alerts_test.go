@@ -300,8 +300,8 @@ func TestAlertTextContextSuffixes(t *testing.T) {
 	}{
 		{"base single account", alertPromptContext{}, "You have new email in Sent."},
 		{"several accounts connected", alertPromptContext{AccountsConnected: 2, AccountName: "Personal Gmail"}, "You have new email in Sent in Personal Gmail."},
-		{"shared caller number", alertPromptContext{AccountsConnected: 1, SharedNumber: true, Username: "sam"}, "You have new email in Sent from sam."},
-		{"both contexts", alertPromptContext{AccountsConnected: 3, AccountName: "Work", SharedNumber: true, Username: "sam"}, "You have new email in Sent in Work from sam."},
+		{"shared caller number", alertPromptContext{AccountsConnected: 1, SharedNumber: true, Username: "sam"}, "You have new email in Sent, for the sam account."},
+		{"both contexts", alertPromptContext{AccountsConnected: 3, AccountName: "Work", SharedNumber: true, Username: "sam"}, "You have new email in Sent in Work, for the sam account."},
 	}
 	for _, tc := range cases {
 		got := alertText([]store.AlertCandidate{{Folder: "INBOX.Sent"}}, tc.pctx)
