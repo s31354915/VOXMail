@@ -472,8 +472,19 @@ func phase1(base string) {
 
 	fmt.Println("caller whitelist")
 	admin.must("POST", "/api/v1/whitelist", map[string]any{"phone": ""}, 400)
-	admin.must("POST", "/api/v1/whitelist", map[string]any{"phone": "sip:" + phone + "@provider.example;transport=udp"}, 201)
-	admin.must("POST", "/api/v1/whitelist", map[string]any{"phone": phone}, 409)
+	// Verification defaults leave both directions open, so a method is
+	// required before the account.
+	admin.must("POST", "/api/v1/whitelist", map[string]any{"phone": "sip:" + phone + "@provider.example;transport=udp"}, 400)
+	admin.must("POST", "/api/v1/whitelist", map[string]any{"phone": "sip:" + phone + "@provider.example;transport=udp", "method": "incoming"}, 400)
+	wlData := admin.must("POST", "/api/v1/accounts", acct("Whitelist Mail", "imap.example.com", 993, "a", "pw", &map[string]string{"INBOX": "Inbox"}, &[]string{"INBOX"}), 201)
+	var wlAccount map[string]string
+	_ = json.Unmarshal(wlData, &wlAccount)
+	wlAccountID := wlAccount["id"]
+	check(wlAccountID != "", "whitelist section created its own account")
+	wlAdd := admin.must("POST", "/api/v1/whitelist", map[string]any{"phone": "sip:" + phone + "@provider.example;transport=udp", "account_id": wlAccountID, "method": "incoming"}, 202)
+	check(bodyContains(wlAdd, "call_in"), "whitelist add answers with a call-in verification prompt")
+	// Re-adding upserts the row and restarts verification instead of a 409.
+	admin.must("POST", "/api/v1/whitelist", map[string]any{"phone": phone, "account_id": wlAccountID, "method": "incoming"}, 202)
 	got = admin.must("GET", "/api/v1/whitelist", nil, 200)
 	check(bodyContains(got, phone), "whitelist is normalized and lists the entry")
 	check(!bodyContains(bob2.must("GET", "/api/v1/whitelist", nil, 200), phone), "another user cannot see foreign whitelist entries")
@@ -485,8 +496,10 @@ func phase1(base string) {
 			entryID = fmt.Sprintf("%v", e["id"])
 		}
 	}
+	check(entryID != "", "whitelist entry is addressable by id")
 	admin.must("DELETE", "/api/v1/whitelist/"+entryID, nil, 204)
 	admin.must("DELETE", "/api/v1/whitelist/not-a-number", nil, 400)
+	admin.must("DELETE", "/api/v1/accounts/"+wlAccountID, nil, 202)
 
 	fmt.Println("console and security headers")
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
