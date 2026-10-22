@@ -114,6 +114,13 @@ body[data-signed-in="true"] .site-header { display: none; }
     </section>
     </section>
     <section class="card route-panel hidden" tabindex="-1" data-route="security" id="security"><h2 id="security-panel">Account security</h2><div class="grid">
+      <form id="username-form" aria-describedby="username-copy" novalidate><h3>Change username</h3><p id="username-copy">
+Your username is the sign-in name for your web account.</p>
+        <label>Current password<input name="current_password" type="password" autocomplete="current-password" required></label>
+        <label>New username<input name="new_username" type="text" autocomplete="username" required minlength="3" maxlength="64" aria-describedby="username-help"><small id="username-help">
+3–64 characters. Another account cannot already use it.</small></label>
+        <div class="row"><button type="button" id="username-cancel">Cancel</button><button type="submit" class="primary">Change username</button></div><div id="username-status" class="status" role="status" aria-live="polite" aria-atomic="true" tabindex="-1"></div>
+      </form>
       <form id="password-form" aria-describedby="password-copy" novalidate><h3>Change password</h3><p id="password-copy">Choose a unique password for your web account.</p>
         <label>Current password<input name="current_password" type="password" autocomplete="current-password" required></label>
         <label>New password<input name="new_password" type="password" autocomplete="new-password" required maxlength="72" aria-describedby="password-help"><small id="password-help">12–72 UTF-8 bytes. Other web sessions will be signed out.</small></label>

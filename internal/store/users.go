@@ -2,6 +2,9 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"strings"
 	"time"
 )
 
@@ -12,6 +15,29 @@ func (s *Store) SetupCompleted(ctx context.Context) (bool, error) {
 	var completed int
 	err := s.DB.QueryRowContext(ctx, `SELECT setup_completed FROM system_settings WHERE id=1`).Scan(&completed)
 	return completed != 0, err
+}
+
+// ErrUsernameTaken reports a username that another account already uses.
+var ErrUsernameTaken = errors.New("username already exists")
+
+// UpdateUsername renames one user's sign-in username. The new name must be
+// unique across accounts, the same rule the setup and admin-create flows
+// enforce; the unique index remains the race-free backstop.
+func (s *Store) UpdateUsername(ctx context.Context, userID, username string) error {
+	username = strings.TrimSpace(username)
+	var existingID string
+	err := s.DB.QueryRowContext(ctx, `SELECT id FROM users WHERE username=?`, username).Scan(&existingID)
+	switch {
+	case err == nil && existingID != userID:
+		return ErrUsernameTaken
+	case err != nil && !errors.Is(err, sql.ErrNoRows):
+		return err
+	}
+	_, err = s.DB.ExecContext(ctx, `UPDATE users SET username=? WHERE id=?`, username, userID)
+	if err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed: users.username") {
+		return ErrUsernameTaken
+	}
+	return err
 }
 
 func (s *Store) UserCount(ctx context.Context) (int, error) {

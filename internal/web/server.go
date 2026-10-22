@@ -337,6 +337,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/recovery/request", s.requestRecovery)
 	mux.HandleFunc("POST /api/v1/recovery/confirm", s.confirmRecovery)
 	mux.HandleFunc("POST /api/v1/logout", s.logout)
+	mux.HandleFunc("POST /api/v1/security/username", s.changeUsername)
 	mux.HandleFunc("POST /api/v1/security/password", s.changePassword)
 	mux.HandleFunc("POST /api/v1/security/pin", s.changePIN)
 	mux.HandleFunc("POST /api/v1/security/2fa/setup", s.setup2FA)
