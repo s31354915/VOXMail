@@ -263,7 +263,7 @@ func (s *Server) verifyWhitelist(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.AccountID != "" {
 		if err := s.Store.AddCallerAccount(r.Context(), u.ID, req.Phone, req.AccountID, true); err != nil {
-			if errors.Is(err, store.ErrAccountNotFound) {
+			if errors.Is(err, store.ErrAccountNotFound) || strings.Contains(err.Error(), "belongs to another user") {
 				writeError(w, http.StatusBadRequest, "unknown account")
 				return
 			}
@@ -296,7 +296,6 @@ func (s *Server) verificationDomain(ctx context.Context) string {
 	}
 	return strings.TrimSpace(settings.Domain)
 }
-
 
 // verificationTTL is how long a verification code stays usable.
 const verificationTTL = 10 * time.Minute

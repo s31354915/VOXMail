@@ -61,7 +61,7 @@ type VerificationSettings struct {
 }
 
 var (
-	// ErrUsernameTaken reports that another account already holds a username.	// ErrVerificationInvalid reports a wrong, expired, or already used code.
+	// ErrVerificationInvalid reports a wrong, expired, or already used code.
 	ErrVerificationInvalid = errors.New("verification code is invalid or expired")
 	// ErrVerificationUnavailable reports that no verification direction is
 	// enabled, so a number cannot be verified right now.
@@ -176,7 +176,9 @@ func (s *Store) DeleteWhitelist(ctx context.Context, userID string, id int64) er
 }
 
 // nextCallerPosition allocates the next menu slot for a user's number.
-func (s *Store) nextCallerPosition(ctx context.Context, q interface{ QueryRowContext(context.Context, string, ...any) *sql.Row }, userID, number string) (int, error) {
+func (s *Store) nextCallerPosition(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, userID, number string) (int, error) {
 	var maxPos sql.NullInt64
 	if err := q.QueryRowContext(ctx, `SELECT MAX(position) FROM caller_number_accounts WHERE user_id = ? AND phone = ?`, userID, number).Scan(&maxPos); err != nil {
 		return 0, err

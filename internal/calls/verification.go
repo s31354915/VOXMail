@@ -91,8 +91,14 @@ func (s *Service) chooseCallerAccount(conn net.Conn, sess *session, digit string
 	sess.UserID = chosen.UserID
 	sess.Choices = nil
 	transitionLocked(sess, "pin")
+	// Media runtime and leases were activated for the first route's user
+	// before the caller chose; switch them to the picked account's user so
+	// prompts speak at that user's speeds.
+	if s.Media != nil {
+		sess.Runtime, sess.Lease, sess.EmailRuntime, sess.EmailLease = s.Media.ActivateForUserSpeeds(chosen.UserID)
+	}
 	s.mu.Unlock()
-	s.prompt(sess, "Welcome to VOXMail, "+chosen.Username+". Enter your PIN, then press pound.")
+	s.prompt(sess, chosen.Username+". Enter your PIN, then press pound.")
 	return nil
 }
 
