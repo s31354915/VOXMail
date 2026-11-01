@@ -46,6 +46,17 @@ func startPiperWorker(ctx context.Context, p Piper) (*piperWorker, error) {
 }
 
 func (w *piperWorker) synthesize(ctx context.Context, text, output string, speed int) error {
+	return w.synthesizeSpeed(ctx, text, output, speed, false)
+}
+
+// synthesizeForced applies the caller's speech rate even when the runtime
+// baked a length scale into Extra: the requested speed replaces the baked
+// one, so an on-call speed change works on every provisioning path.
+func (w *piperWorker) synthesizeForced(ctx context.Context, text, output string, speed int) error {
+	return w.synthesizeSpeed(ctx, text, output, speed, true)
+}
+
+func (w *piperWorker) synthesizeSpeed(ctx context.Context, text, output string, speed int, force bool) error {
 	if w == nil {
 		return fmt.Errorf("piper worker is nil")
 	}
@@ -78,8 +89,27 @@ func (w *piperWorker) synthesize(ctx context.Context, text, output string, speed
 	// A shared engine applies the call's speech rate per request; a runtime
 	// that baked Extra flags keeps them and skips the override.
 	p := w.p
-	if speed >= 1 && speed <= 5 && !hasLengthScaleExtra(p.Extra) {
-		p.Extra = append(SpeedExtra(speed), p.Extra...)
+	if speed >= 1 && speed <= 5 {
+		if force {
+			// Forced speed: drop any baked length scale and apply the
+			// caller's rate instead of competing with a duplicate flag.
+			filtered := make([]string, 0, len(p.Extra)+2)
+			skipNext := false
+			for _, flag := range p.Extra {
+				if skipNext {
+					skipNext = false
+					continue
+				}
+				if flag == "--length_scale" {
+					skipNext = true
+					continue
+				}
+				filtered = append(filtered, flag)
+			}
+			p.Extra = append(SpeedExtra(speed), filtered...)
+		} else if !hasLengthScaleExtra(p.Extra) {
+			p.Extra = append(SpeedExtra(speed), p.Extra...)
+		}
 	}
 	return synthesizePiper(workerCtx, p, text, output)
 }

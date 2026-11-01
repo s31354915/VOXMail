@@ -277,6 +277,9 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 		case "folder_action":
 			backUsingFlowLocked(sess, "folders")
 		case "read", "confirm_delete":
+			sess.BodyPaused = false
+			sess.BodyChunks = nil
+			sess.BodyMarkRead = nil
 			backUsingFlowLocked(sess, "list")
 		case "attachment_menu", "attachment_playback":
 			if sess.AttachmentCancel != nil {
@@ -502,7 +505,13 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 			sess.Cursor = 0
 		}
 		m := sess.Messages[sess.Cursor]
+		isRead := string(stateLocked(sess)) == "read"
 		s.mu.Unlock()
+		// While a message body plays or sits paused, keys 4, 6 and 7 are
+		// pause, skip and speech rate instead of their read-menu meanings.
+		if isRead && s.handleBodyPlaybackKey(sess, key) {
+			return nil
+		}
 		if key == "1" {
 			s.readMessage(sess, m)
 		} else if key == "2" {
@@ -550,6 +559,11 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 			transitionLocked(sess, next)
 			cursor, total := sess.Cursor, len(sess.Messages)
 			sess.BodyPending = nil
+			sess.BodyChunks = nil
+			sess.BodyIndex = 0
+			sess.BodyPaused = false
+			sess.BodyInterrupted = false
+			sess.BodyMarkRead = nil
 			s.mu.Unlock()
 			if next == "list_actions" {
 				s.prompt(sess, fmt.Sprintf("Message %d of %d. From %s. Subject %s. %s", cursor+1, total, spokenHeader(m.Sender, "unknown sender", 240), spokenHeader(m.Subject, "no subject", 300), menuPrompt("list_actions")))

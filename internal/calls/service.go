@@ -449,6 +449,19 @@ type session struct {
 	// promptsHeard marks editor states whose keypad instructions already
 	// played on this call, so re-entry speaks the short reminder instead.
 	promptsHeard map[string]bool
+
+	// Body playback controls (round-2 review): the chunks of the message
+	// page being read, the next chunk to play, whether playback is paused,
+	// whether the last key interrupted body audio, the caller's speech rate
+	// (0 = the voice's normal pace), the mark-read hook for resumed short
+	// bodies, and whether the read menu last played its short tier.
+	BodyChunks      []string
+	BodyIndex       int
+	BodyPaused      bool
+	BodyInterrupted bool
+	BodySpeed       int
+	BodyMarkRead    func()
+	ReadMenuShort   bool
 	// PendingAttachmentRemove tracks the two-press confirmation before an
 	// attachment is removed in attachment_edit.
 	PendingAttachmentRemove bool
@@ -725,7 +738,10 @@ func (s *Service) interruptPrompt(callID string) {
 	s.mu.Lock()
 	sess := s.sessions[callID]
 	var cancel context.CancelFunc
-	if sess != nil && !sess.Closed {
+	// Only a press that arrives while audio is actually playing interrupts
+	// it: an idle keypress at a quiet menu must not leave the interrupted
+	// flag set for the next handler to misread as a barge-in.
+	if sess != nil && !sess.Closed && sess.mediaPlays > 0 {
 		cancel = sess.playCancel
 		sess.playInterrupted = true
 	}

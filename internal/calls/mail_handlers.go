@@ -154,9 +154,29 @@ func (s *Service) readMessage(sess *session, m store.MailSummary) {
 	menu := menuPrompt("read")
 	s.mu.Lock()
 	sess.BodyPending = nil
+	sess.BodyChunks = nil
+	sess.BodyIndex = 0
+	sess.BodyPaused = false
+	sess.BodyInterrupted = false
+	sess.BodyMarkRead = markRead
 	s.mu.Unlock()
 	if runeLen(body) <= singlePromptBodyRunes {
+		// Even a short body tracks as one chunk, so the pause, skip and
+		// speech-rate keys still work while it plays.
+		s.mu.Lock()
+		sess.BodyChunks = []string{body}
+		s.mu.Unlock()
 		s.prompt(sess, header+" "+body+" "+menu)
+		if s.wasInterrupted(sess) {
+			s.mu.Lock()
+			sess.BodyInterrupted = true
+			s.mu.Unlock()
+			return
+		}
+		s.mu.Lock()
+		sess.BodyIndex = 1
+		sess.BodyMarkRead = nil
+		s.mu.Unlock()
 		markRead()
 		return
 	}
@@ -175,6 +195,7 @@ func (s *Service) readMessage(sess *session, m store.MailSummary) {
 	}
 	s.mu.Lock()
 	sess.BodyPending = all[len(initial):]
+	sess.BodyChunks = initial
 	s.mu.Unlock()
 	chunks := initial
 	first := header
@@ -187,27 +208,32 @@ func (s *Service) readMessage(sess *session, m store.MailSummary) {
 	// as its own short prompt instead of being buried after a long body.
 	s.prompt(sess, first)
 	// A keypress during the opening spent its turn: skip the rest of the
-	// body and the menu so the pressed key takes effect right away.
+	// body and the menu so the pressed key takes effect right away. Keys 4,
+	// 6 and 7 arrive as pause, skip and speech-rate while the body plays.
 	if s.wasInterrupted(sess) {
+		s.mu.Lock()
+		sess.BodyInterrupted = true
+		s.mu.Unlock()
 		return
 	}
+	s.mu.Lock()
+	sess.BodyIndex = 1
+	sess.BodyMarkRead = nil
+	s.mu.Unlock()
 	markRead()
 	if len(chunks) > 0 {
-		s.playSpeechChunks(sess, chunks)
+		s.playBodyFrom(sess, 1)
 	}
 	if s.wasInterrupted(sess) {
 		return
 	}
-	if len(sess.BodyPending) > 0 {
-		s.prompt(sess, "This is a long message. Press 9 to hear the rest. "+menu)
-		return
-	}
-	s.promptMenu(sess, menu)
+	s.readMenuTail(sess)
 }
 
 // speakMoreBody plays the next page of a long message body that did not fit
 // into the first read. It reports whether there was more to play; when false,
-// key 9 falls through to the more-options menu as before.
+// key 9 falls through to the more-options menu as before. The page streams
+// with the same pause, skip and speech-rate controls as the first page.
 func (s *Service) speakMoreBody(sess *session) bool {
 	s.mu.Lock()
 	pending := sess.BodyPending
@@ -224,14 +250,127 @@ func (s *Service) speakMoreBody(sess *session) bool {
 	}
 	sess.BodyPending = pending
 	more := len(pending) > 0
+	sess.BodyChunks = page
+	sess.BodyIndex = 0
+	sess.BodyPaused = false
+	sess.BodyInterrupted = false
+	sess.BodyMarkRead = nil
 	s.mu.Unlock()
-	text := strings.Join(page, " ")
-	if more {
-		text += " Press 9 to keep going, or pound to return."
-	} else {
-		text += " That is the end of the message. " + menuPrompt("read")
+	s.playBodyFrom(sess, 0)
+	if s.wasInterrupted(sess) {
+		return true
 	}
-	s.prompt(sess, text)
+	if more {
+		s.prompt(sess, "Press 9 to keep going, or pound to return.")
+	} else {
+		s.prompt(sess, "That is the end of the message. "+s.readMenuPrompt(sess))
+	}
+	return true
+}
+
+// readMenuPrompt returns the read-state menu, tiered: the full recitation
+// the first time a message is read on the call, then a short tier that
+// leaves the remaining controls behind star, which repeats the full menu.
+func (s *Service) readMenuPrompt(sess *session) string {
+	if s == nil || sess == nil {
+		return menuPrompt("read")
+	}
+	s.mu.Lock()
+	short := sess.ReadMenuShort
+	sess.ReadMenuShort = true
+	s.mu.Unlock()
+	if short {
+		return "Press 0 for the next message, 1 to read again, 3 to reply, or 6 to delete. Press star to hear the rest of the controls."
+	}
+	return menuPrompt("read")
+}
+
+// readMenuTail speaks what follows a finished or resumed body page: the
+// page-more hint when unheard pages remain, else the tiered read menu.
+func (s *Service) readMenuTail(sess *session) {
+	if s.wasInterrupted(sess) {
+		return
+	}
+	s.mu.Lock()
+	pending := len(sess.BodyPending) > 0
+	s.mu.Unlock()
+	if pending {
+		s.promptMenu(sess, "Press 9 to hear the rest. "+s.readMenuPrompt(sess))
+		return
+	}
+	s.promptMenu(sess, s.readMenuPrompt(sess))
+}
+
+// handleBodyPlaybackKey lets keys 4, 6 and 7 act as pause, skip forward and
+// speech-rate while a message body plays or sits paused, instead of their
+// usual read-menu meanings. It reports whether the key was consumed.
+func (s *Service) handleBodyPlaybackKey(sess *session, key string) bool {
+	if s == nil || sess == nil {
+		return false
+	}
+	s.mu.Lock()
+	state := string(stateLocked(sess))
+	hasBody := len(sess.BodyChunks) > 0
+	paused := sess.BodyPaused
+	interrupted := sess.BodyInterrupted
+	s.mu.Unlock()
+	control := key == "4" || key == "6" || key == "7"
+	if state != "read" || !hasBody || (!paused && !interrupted) {
+		return false
+	}
+	if !control {
+		// Any other key pressed on a live or paused body ends the playback
+		// context and takes its normal read-menu meaning.
+		s.mu.Lock()
+		sess.BodyChunks = nil
+		sess.BodyIndex = 0
+		sess.BodyPaused = false
+		sess.BodyInterrupted = false
+		sess.BodyMarkRead = nil
+		s.mu.Unlock()
+		return false
+	}
+	s.mu.Lock()
+	index := sess.BodyIndex
+	speed := sess.BodySpeed
+	sess.BodyInterrupted = false
+	s.mu.Unlock()
+	switch key {
+	case "4":
+		if paused {
+			s.prompt(sess, "Continuing.")
+			s.playBodyFrom(sess, index)
+			s.readMenuTail(sess)
+		} else {
+			s.mu.Lock()
+			sess.BodyPaused = true
+			s.mu.Unlock()
+			// The paused guidance is its own menu; the read menu would only
+			// bury the resume key under ten other controls.
+			s.prompt(sess, "Paused. Press 4 to keep going, 6 to skip ahead, 7 to change the speech speed, or pound to go back.")
+		}
+	case "6":
+		s.mu.Lock()
+		sess.BodyIndex = index + 1
+		s.mu.Unlock()
+		s.prompt(sess, "Skipping ahead.")
+		s.playBodyFrom(sess, index+1)
+		s.readMenuTail(sess)
+	case "7":
+		next, word := 0, "Normal speech rate."
+		switch speed {
+		case 0:
+			next, word = 5, "Speaking faster."
+		case 5:
+			next, word = 1, "Speaking slower."
+		}
+		s.mu.Lock()
+		sess.BodySpeed = next
+		s.mu.Unlock()
+		s.prompt(sess, word)
+		s.playBodyFrom(sess, index)
+		s.readMenuTail(sess)
+	}
 	return true
 }
 
