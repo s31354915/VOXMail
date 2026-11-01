@@ -803,6 +803,22 @@ func (r *Runtime) Synthesize(ctx context.Context, text, output string) error {
 	return worker.synthesize(ctx, text, output, speed)
 }
 
+// SynthesizeAt synthesizes with a caller-provided Piper speech rate for this
+// request only: the shared engine applies the speech rate per request, so an
+// on-call speed change never reloads the voice.
+func (r *Runtime) SynthesizeAt(ctx context.Context, text, output string, speed int) error {
+	if err := r.WaitTTS(ctx); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	worker := r.worker
+	r.mu.Unlock()
+	if worker == nil {
+		return fmt.Errorf("piper worker is not active")
+	}
+	return worker.synthesizeForced(ctx, text, output, normalizeSpeed(speed))
+}
+
 func (l *Lease) Release() {
 	if l == nil || l.runtime == nil {
 		return

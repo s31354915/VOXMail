@@ -1027,8 +1027,24 @@ func (s *Service) handleFieldMethod(sess *session, key, field string) {
 		} else {
 			sess.Editor.Text = sess.Draft.Body
 		}
+		prompt := s.entryPrompt(sess, field)
 		s.mu.Unlock()
-		s.prompt(sess, menuPrompt(field))
+		s.prompt(sess, prompt)
+		return
+	}
+	// Key 3 on the subject method menu skips the subject line entirely: the
+	// draft keeps an empty subject and the call moves on to the body.
+	if key == "3" && field == "subject" {
+		s.mu.Lock()
+		sess.Draft.Subject = ""
+		next := "body_method"
+		if sess.EditingDraft {
+			next = "review"
+			sess.EditingDraft = false
+		}
+		transitionLocked(sess, next)
+		s.mu.Unlock()
+		s.prompt(sess, "Subject skipped. "+menuPrompt(next))
 		return
 	}
 	if key == "2" {

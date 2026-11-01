@@ -21,8 +21,8 @@ const (
 	mediaSampleRate     int64 = 8000
 	mediaChannels       int64 = 1
 	mediaBytesPerSample       = 2 // signed little-endian 16-bit PCM
-	defaultSpeechWindow       = 30 * time.Second
-	maxSpeechWindow           = 60 * time.Second
+	defaultSpeechWindow       = 120 * time.Second
+	maxSpeechWindow           = 300 * time.Second
 )
 
 type VoiceRecorder struct {
@@ -34,8 +34,8 @@ type VoiceRecorder struct {
 }
 
 func (r *VoiceRecorder) audioWindow() time.Duration {
-	if r == nil || r.Window <= 0 || r.Window > 60*time.Second {
-		return 30 * time.Second
+	if r == nil || r.Window <= 0 || r.Window > maxSpeechWindow {
+		return defaultSpeechWindow
 	}
 	return r.Window
 }
@@ -74,11 +74,53 @@ func (r *VoiceRecorder) RecordAndTranscribeUntilWithStatus(ctx context.Context, 
 	return r.recordAndTranscribe(ctx, runtime, rawPath, offset, stop, afterCapture)
 }
 
+// transcriptionChunkWindow bounds one STT segment: converting and
+// transcribing finished audio overlaps the caller still speaking, so a long
+// dictation finishes transcribing moments after the caller stops instead of
+// starting from zero. The 300-second window cap keeps the in-flight chunk
+// count below the channel buffers below, so the pipeline cannot deadlock.
+const transcriptionChunkWindow = 20 * time.Second
+
 func (r *VoiceRecorder) recordAndTranscribe(ctx context.Context, runtime *speech.Runtime, rawPath string, offset int64, stop <-chan struct{}, afterCapture func()) (string, error) {
 	if r == nil || rawPath == "" {
 		return "", fmt.Errorf("voice recorder is not configured")
 	}
 	window := r.speechWindow()
+	sttRuntime := runtime
+	if sttRuntime == nil {
+		sttRuntime = r.Runtime
+	}
+	dir := r.Dir
+	if dir == "" {
+		dir = filepath.Dir(rawPath)
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", err
+	}
+	if offset < 0 {
+		return "", fmt.Errorf("invalid recording offset")
+	}
+	// Whisper warm-up stays lazy so the engine readies while the caller is
+	// still speaking rather than delaying the first recording.
+	resolveWhisper := func(ctx context.Context) (speech.Whisper, error) {
+		if sttRuntime != nil {
+			if err := sttRuntime.WaitWhisper(ctx); err != nil {
+				return speech.Whisper{}, err
+			}
+			return sttRuntime.Whisper, nil
+		}
+		return r.Whisper, nil
+	}
+	if window <= transcriptionChunkWindow {
+		return r.transcribeWholeWindow(ctx, resolveWhisper, rawPath, offset, dir, window, stop, afterCapture)
+	}
+	return r.transcribeOverlapped(ctx, resolveWhisper, rawPath, offset, dir, window, stop, afterCapture)
+}
+
+// transcribeWholeWindow is the single-segment path for recordings at or under
+// one transcription chunk: wait for capture to end, then convert and
+// transcribe exactly as before.
+func (r *VoiceRecorder) transcribeWholeWindow(ctx context.Context, resolveWhisper func(context.Context) (speech.Whisper, error), rawPath string, offset int64, dir string, window time.Duration, stop <-chan struct{}, afterCapture func()) (string, error) {
 	timer := time.NewTimer(window)
 	defer timer.Stop()
 	select {
@@ -120,21 +162,6 @@ func (r *VoiceRecorder) recordAndTranscribe(ctx context.Context, runtime *speech
 			return "", err
 		}
 	}
-	dir := r.Dir
-	if dir == "" {
-		dir = filepath.Dir(rawPath)
-	}
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return "", err
-	}
-	raw, err := os.Open(rawPath)
-	if err != nil {
-		return "", err
-	}
-	defer raw.Close()
-	if _, err := raw.Seek(offset, io.SeekStart); err != nil {
-		return "", err
-	}
 	segment, releaseSegment, err := maintenance.CreateTemp(dir, ".recording-*.pcm")
 	if err != nil {
 		return "", err
@@ -142,13 +169,33 @@ func (r *VoiceRecorder) recordAndTranscribe(ctx context.Context, runtime *speech
 	defer releaseSegment()
 	segmentPath := segment.Name()
 	defer os.Remove(segmentPath)
-	if _, err := io.Copy(segment, io.LimitReader(raw, captureEnd-offset)); err != nil {
-		segment.Close()
+	raw, err := os.Open(rawPath)
+	if err != nil {
 		return "", err
 	}
+	if _, err := raw.Seek(offset, io.SeekStart); err != nil {
+		raw.Close()
+		return "", err
+	}
+	_, copyErr := io.Copy(segment, io.LimitReader(raw, captureEnd-offset))
+	raw.Close()
 	if err := segment.Close(); err != nil {
 		return "", err
 	}
+	if copyErr != nil {
+		return "", copyErr
+	}
+	whisper, err := resolveWhisper(ctx)
+	if err != nil {
+		return "", err
+	}
+	return r.transcribeSegment(ctx, whisper, segmentPath)
+}
+
+// transcribeSegment converts one captured PCM segment to the 16 kHz mono WAV
+// the STT engine expects, transcribes it, and removes the intermediate file.
+func (r *VoiceRecorder) transcribeSegment(ctx context.Context, whisper speech.Whisper, segmentPath string) (string, error) {
+	dir := filepath.Dir(segmentPath)
 	wav, releaseWav, err := maintenance.CreateTemp(dir, ".recording-*.wav")
 	if err != nil {
 		return "", err
@@ -165,22 +212,187 @@ func (r *VoiceRecorder) recordAndTranscribe(ctx context.Context, runtime *speech
 	if output, err := convert.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("recording conversion: %w: %s", err, strings.TrimSpace(string(output)))
 	}
-	// The call's activated runtime owns STT readiness. The recorder's own
-	// Runtime is only a fallback for callers without a per-call runtime (and
-	// for tests); with the runtime pool it is never activated, so waiting on
-	// it would fail with "speech runtime is not active" on every recording.
-	sttRuntime := runtime
-	if sttRuntime == nil {
-		sttRuntime = r.Runtime
+	return whisper.TranscribeAndRemove(ctx, wavPath)
+}
+
+// transcribeOverlapped streams a long recording through Whisper in chunks
+// while capture continues: each transcription chunk of captured audio is
+// copied, converted and handed to the engine while the caller keeps speaking,
+// so when the recording ends only the final chunk still needs transcribing.
+func (r *VoiceRecorder) transcribeOverlapped(ctx context.Context, resolveWhisper func(context.Context) (speech.Whisper, error), rawPath string, offset int64, dir string, window time.Duration, stop <-chan struct{}, afterCapture func()) (string, error) {
+	type chunkJob struct {
+		index   int
+		path    string
+		release func()
 	}
-	whisper := r.Whisper
-	if sttRuntime != nil {
-		if err := sttRuntime.WaitWhisper(ctx); err != nil {
+	type chunkResult struct {
+		index int
+		text  string
+		err   error
+	}
+	// A 300-second window yields at most 15 chunks, so buffered channels of
+	// 16 never block and the pipeline cannot deadlock.
+	jobs := make(chan chunkJob, 16)
+	results := make(chan chunkResult, 16)
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		var whisper speech.Whisper
+		resolved := false
+		var resolveErr error
+		for job := range jobs {
+			if ctx.Err() != nil {
+				os.Remove(job.path)
+				job.release()
+				continue
+			}
+			if !resolved {
+				whisper, resolveErr = resolveWhisper(ctx)
+				resolved = true
+			}
+			if resolveErr != nil {
+				os.Remove(job.path)
+				job.release()
+				select {
+				case results <- chunkResult{index: job.index, err: resolveErr}:
+					continue
+				case <-ctx.Done():
+					return
+				}
+			}
+			text, err := r.transcribeSegment(ctx, whisper, job.path)
+			os.Remove(job.path)
+			job.release()
+			select {
+			case results <- chunkResult{index: job.index, text: text, err: err}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	cursor := offset - offset%mediaBytesPerSample
+	chunkCount := 0
+	stopped := false
+	deadline := time.Now().Add(window)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		wait := transcriptionChunkWindow
+		if wait > remaining {
+			wait = remaining
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-timer.C:
+		case <-stop:
+			timer.Stop()
+			stopped = true
+		case <-ctx.Done():
+			timer.Stop()
+			close(jobs)
+			<-workerDone
+			return "", ctx.Err()
+		}
+		// Give the baresip writer a beat to flush the bytes for the audio
+		// just spoken so a chunk boundary does not clip the last word.
+		settleTarget := cursor + 2*mediaSampleRate*mediaBytesPerSample
+		if info, statErr := os.Stat(rawPath); statErr == nil && info.Size() < settleTarget {
+			settle := time.Now().Add(200 * time.Millisecond)
+			for time.Now().Before(settle) {
+				time.Sleep(50 * time.Millisecond)
+				latest, latestErr := os.Stat(rawPath)
+				if latestErr != nil || latest.Size() >= settleTarget {
+					break
+				}
+			}
+		}
+		info, err := os.Stat(rawPath)
+		if err != nil {
+			close(jobs)
+			<-workerDone
 			return "", err
 		}
-		whisper = sttRuntime.Whisper
+		end := info.Size()
+		if end > cursor {
+			segment, releaseSegment, err := maintenance.CreateTemp(dir, ".recording-*.pcm")
+			if err != nil {
+				close(jobs)
+				<-workerDone
+				return "", err
+			}
+			raw, openErr := os.Open(rawPath)
+			if openErr != nil {
+				releaseSegment()
+				os.Remove(segment.Name())
+				close(jobs)
+				<-workerDone
+				return "", openErr
+			}
+			if _, seekErr := raw.Seek(cursor, io.SeekStart); seekErr != nil {
+				raw.Close()
+				segment.Close()
+				releaseSegment()
+				os.Remove(segment.Name())
+				close(jobs)
+				<-workerDone
+				return "", seekErr
+			}
+			_, copyErr := io.Copy(segment, io.LimitReader(raw, end-cursor))
+			raw.Close()
+			segment.Close()
+			if copyErr != nil {
+				releaseSegment()
+				os.Remove(segment.Name())
+				close(jobs)
+				<-workerDone
+				return "", copyErr
+			}
+			jobs <- chunkJob{index: chunkCount, path: segment.Name(), release: releaseSegment}
+			chunkCount++
+			cursor = end - end%mediaBytesPerSample
+		}
+		if stopped || !time.Now().Before(deadline) {
+			break
+		}
 	}
-	return whisper.TranscribeAndRemove(ctx, wavPath)
+	close(jobs)
+	<-workerDone
+	if afterCapture != nil {
+		afterCapture()
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+	}
+	if chunkCount == 0 {
+		// Nothing was captured; an empty transcription matches the
+		// single-segment path's behavior on silence.
+		return "", nil
+	}
+	texts := make([]string, chunkCount)
+	var firstErr error
+	for range chunkCount {
+		select {
+		case result := <-results:
+			texts[result.index] = result.text
+			if result.err != nil && firstErr == nil {
+				firstErr = result.err
+			}
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	if firstErr != nil {
+		return "", firstErr
+	}
+	parts := make([]string, 0, chunkCount)
+	for _, text := range texts {
+		if trimmed := strings.TrimSpace(text); trimmed != "" {
+			parts = append(parts, trimmed)
+		}
+	}
+	return strings.Join(parts, " "), nil
 }
 
 // RecordAudio captures a bounded raw call segment and returns a normal WAV
@@ -269,11 +481,11 @@ func (r *VoiceRecorder) RecordAudioUntil(ctx context.Context, rawPath string, of
 		return nil, err
 	}
 	defer converted.Close()
-	data, err := io.ReadAll(io.LimitReader(converted, (2<<20)+1))
+	data, err := io.ReadAll(io.LimitReader(converted, (8<<20)+1))
 	if err != nil {
 		return nil, err
 	}
-	if len(data) > 2<<20 {
+	if len(data) > 8<<20 {
 		return nil, fmt.Errorf("audio attachment exceeds size limit")
 	}
 	return data, nil

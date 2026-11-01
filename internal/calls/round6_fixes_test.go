@@ -134,7 +134,7 @@ func TestRound6RecordingAndGraceConstantsStayInSync(t *testing.T) {
 	if dtmfReleaseGrace != 250*time.Millisecond {
 		t.Fatalf("dtmfReleaseGrace=%v, want 250ms so fast repeat presses survive", dtmfReleaseGrace)
 	}
-	if defaultSpeechWindow != 30*time.Second {
-		t.Fatalf("defaultSpeechWindow=%v, want 30s to match the announced cap", defaultSpeechWindow)
+	if defaultSpeechWindow != 120*time.Second {
+		t.Fatalf("defaultSpeechWindow=%v, want 2m to match the announced cap", defaultSpeechWindow)
 	}
 }
