@@ -245,7 +245,7 @@ func TestAudioConversionRejectsOversizedOutputAndCleansFile(t *testing.T) {
 	if err := os.WriteFile(raw, make([]byte, 128), 0600); err != nil {
 		t.Fatal(err)
 	}
-	converter := writeMediaTestCommand(t, "#!/bin/sh\nlast=\nfor arg do last=\"$arg\"; done\nprintf '%03145728d' 0 > \"$last\"\n")
+	converter := writeMediaTestCommand(t, "#!/bin/sh\nlast=\nfor arg do last=\"$arg\"; done\nprintf '%08388609d' 0 > \"$last\"\n")
 	stop := make(chan struct{})
 	close(stop)
 	data, err := (&VoiceRecorder{Binary: converter, Dir: dir}).RecordAudioUntil(context.Background(), raw, 0, stop)

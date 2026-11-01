@@ -15,7 +15,7 @@ import (
 const (
 	MaxOutput      = 1 << 20
 	PiperTimeout   = 2 * time.Minute
-	WhisperTimeout = 2 * time.Minute
+	WhisperTimeout = 5 * time.Minute
 	// 30 s was too tight under CPU contention: Piper, Whisper, and the
 	// converters share one box, and dictation conversions that lost the
 	// race were reported to callers as failures. Two minutes matches the

@@ -53,6 +53,9 @@ type Service struct {
 	// InactivityHangupDelay allows the goodbye prompt to finish before the
 	// bridge receives hangup. Zero uses the production default.
 	InactivityHangupDelay time.Duration
+	// InactivityWarnWait is how long the "are you still there" courtesy
+	// check holds before the goodbye plays. Zero uses the production default.
+	InactivityWarnWait time.Duration
 	mu                    sync.Mutex
 	sessions              map[string]*session
 	client                *bridge.Client
@@ -431,6 +434,7 @@ type session struct {
 	eventCancel          context.CancelFunc
 	inactivityCancel     context.CancelFunc
 	inactivityGeneration uint64
+	inactivityWarned     bool
 	promptMu             sync.Mutex
 	playCancel           context.CancelFunc
 	playSequence         uint64
@@ -439,6 +443,12 @@ type session struct {
 	// skip what would follow the interrupted audio.
 	playInterrupted bool
 	greetAttempts   int
+	// BodyPending holds the unheard remainder of a long message body so key
+	// 9 can page through the rest by phone instead of dead-ending.
+	BodyPending []string
+	// promptsHeard marks editor states whose keypad instructions already
+	// played on this call, so re-entry speaks the short reminder instead.
+	promptsHeard map[string]bool
 	// PendingAttachmentRemove tracks the two-press confirmation before an
 	// attachment is removed in attachment_edit.
 	PendingAttachmentRemove bool
@@ -475,6 +485,10 @@ const defaultInactivityTimeout = 2 * time.Minute
 
 const defaultInactivityHangupDelay = 3 * time.Second
 
+// inactivityWarnWait is how long the caller has to answer the "are you still
+// there" courtesy check before the goodbye plays.
+const inactivityWarnWait = 45 * time.Second
+
 const (
 	maxIVRRecipientRunes   = 254
 	maxIVRSubjectRunes     = 998
@@ -494,6 +508,9 @@ func (s *Service) armInactivityTimeoutLocked(sess *session) {
 	if sess.inactivityCancel != nil {
 		sess.inactivityCancel()
 	}
+	// Fresh caller input clears the still-there warning: the next idle
+	// stretch starts the courtesy check from the beginning.
+	sess.inactivityWarned = false
 	timeout := s.InactivityTimeout
 	if timeout <= 0 {
 		timeout = defaultInactivityTimeout
@@ -522,6 +539,37 @@ func (s *Service) armInactivityTimeoutLocked(sess *session) {
 		}
 		sess.inactivityCancel = nil
 		sess.inactivityGeneration++
+		// The first idle stretch asks instead of dropping: older callers
+		// thinking through a menu should not lose the call for it.
+		if !sess.inactivityWarned {
+			sess.inactivityWarned = true
+			warnGeneration := sess.inactivityGeneration
+			s.mu.Unlock()
+			s.startTask(func() { s.prompt(sess, "Are you still there? Press any key to keep going.") })
+			warnWait := s.InactivityWarnWait
+			if warnWait <= 0 {
+				warnWait = inactivityWarnWait
+			}
+			s.startDelayedTask(warnWait, func() {
+				s.mu.Lock()
+				if sess.Closed || sess.inactivityGeneration != warnGeneration {
+					s.mu.Unlock()
+					return
+				}
+				sess.inactivityCancel = nil
+				sess.inactivityGeneration++
+				sess.inactivityWarned = false
+				s.mu.Unlock()
+				s.startTask(func() { s.prompt(sess, "No input was received. Goodbye.") })
+				delay := s.InactivityHangupDelay
+				if delay <= 0 {
+					delay = defaultInactivityHangupDelay
+				}
+				s.startDelayedTask(delay, func() { _ = s.hangup(callID) })
+			})
+			return
+		}
+		sess.inactivityWarned = false
 		s.mu.Unlock()
 		s.startTask(func() { s.prompt(sess, "No input was received. Goodbye.") })
 		delay := s.InactivityHangupDelay
@@ -805,6 +853,37 @@ func menuPrompt(state string) string {
 		return prompt
 	}
 	return "Press pound to go back or star to repeat."
+}
+
+// entryPrompt returns the prompt for an editor state: the full keypad
+// instructions the first time on a call, a short reminder afterwards. Call it
+// with s.mu held.
+func (s *Service) entryPrompt(sess *session, state string) string {
+	if sess.promptsHeard == nil {
+		sess.promptsHeard = map[string]bool{}
+	}
+	heard := sess.promptsHeard[state]
+	sess.promptsHeard[state] = true
+	if heard {
+		return shortEditorPrompt(state)
+	}
+	return menuPrompt(state)
+}
+
+// shortEditorPrompt is the re-entry prompt for a typing state: the caller
+// has already heard the multi-tap instructions once this call.
+func shortEditorPrompt(state string) string {
+	switch state {
+	case "compose", "recipient_input":
+		return "Type the email address, then press pound."
+	case "subject":
+		return "Type the subject, then press pound."
+	case "body":
+		return "Type your message, then press pound."
+	case "contact_name":
+		return "Type a name for this contact, then press pound."
+	}
+	return menuPrompt(state)
 }
 
 func listPrompt(m store.MailSummary, cursor, total int) string {

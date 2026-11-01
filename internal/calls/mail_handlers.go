@@ -152,16 +152,31 @@ func (s *Service) readMessage(sess *session, m store.MailSummary) {
 		}
 	}
 	menu := menuPrompt("read")
+	s.mu.Lock()
+	sess.BodyPending = nil
+	s.mu.Unlock()
 	if runeLen(body) <= singlePromptBodyRunes {
 		s.prompt(sess, header+" "+body+" "+menu)
 		markRead()
 		return
 	}
-	spoken, truncated := truncateForSpeech(body, maxSpokenBodyRunes)
-	if truncated {
-		spoken += " This is a long message. Open it in your email app to read the rest."
+	// Page the whole body by phone: play the first window of chunks and hold
+	// the rest so key 9 can keep going. Long mail stays reachable for the
+	// callers whose phone is their only email access.
+	all := splitSpeechChunks(body, speechChunkRunes)
+	played := 0
+	initial := make([]string, 0, len(all))
+	for _, chunk := range all {
+		if played+runeLen(chunk) > maxSpokenBodyRunes {
+			break
+		}
+		initial = append(initial, chunk)
+		played += runeLen(chunk)
 	}
-	chunks := splitSpeechChunks(spoken, speechChunkRunes)
+	s.mu.Lock()
+	sess.BodyPending = all[len(initial):]
+	s.mu.Unlock()
+	chunks := initial
 	first := header
 	if len(chunks) > 0 {
 		first += " " + chunks[0]
@@ -183,7 +198,41 @@ func (s *Service) readMessage(sess *session, m store.MailSummary) {
 	if s.wasInterrupted(sess) {
 		return
 	}
+	if len(sess.BodyPending) > 0 {
+		s.prompt(sess, "This is a long message. Press 9 to hear the rest. "+menu)
+		return
+	}
 	s.promptMenu(sess, menu)
+}
+
+// speakMoreBody plays the next page of a long message body that did not fit
+// into the first read. It reports whether there was more to play; when false,
+// key 9 falls through to the more-options menu as before.
+func (s *Service) speakMoreBody(sess *session) bool {
+	s.mu.Lock()
+	pending := sess.BodyPending
+	if len(pending) == 0 {
+		s.mu.Unlock()
+		return false
+	}
+	played := 0
+	page := make([]string, 0, 8)
+	for len(pending) > 0 && played+runeLen(pending[0]) <= maxSpokenBodyRunes {
+		page = append(page, pending[0])
+		played += runeLen(pending[0])
+		pending = pending[1:]
+	}
+	sess.BodyPending = pending
+	more := len(pending) > 0
+	s.mu.Unlock()
+	text := strings.Join(page, " ")
+	if more {
+		text += " Press 9 to keep going, or pound to return."
+	} else {
+		text += " That is the end of the message. " + menuPrompt("read")
+	}
+	s.prompt(sess, text)
+	return true
 }
 
 func (s *Service) attachmentMenu(sess *session) {
