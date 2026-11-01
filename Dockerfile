@@ -6,7 +6,7 @@
 # Base manifest digests resolved 2026-10-06. Keep the human-readable tag next
 # to the digest so refreshes can be reviewed as a deliberate distribution
 # change; update both only through the documented image-pinning procedure.
-FROM debian:bookworm@sha256:2c037a04925515fdd6ea85ea14a682d0e79931f5e9f5d07b6dbfc6ba12f9e858 AS baresip-build
+FROM debian:bookworm@sha256:854dd8ab51d62866dbd8f5431d15ce77b12983a2a4a1e1fe43a2395dc7ef9f61 AS baresip-build
 # v4.11.0 tags resolved on 2026-09-24; callers may override with another
 # immutable commit or a reviewed tag when intentionally updating the native stack.
 ARG BARESIP_REF=3d30821f099925d24167f8a99e93ba4d1be98599
@@ -55,7 +55,7 @@ RUN --mount=type=cache,id=bare-baresip-source-${BARESIP_REF}-${TARGETARCH},targe
     find /build/baresip -name '*.so' -path '*/app_modules/*' -exec cp {} /out/modules/ \;; \
     printf 'requested=%s\ncommit=%s\narchitecture=%s\n' "${BARESIP_REF}" "$(git -C /src/baresip rev-parse HEAD)" "${TARGETARCH}" > /out/provenance/baresip.txt
 
-FROM debian:bookworm@sha256:2c037a04925515fdd6ea85ea14a682d0e79931f5e9f5d07b6dbfc6ba12f9e858 AS whisper-build
+FROM debian:bookworm@sha256:854dd8ab51d62866dbd8f5431d15ce77b12983a2a4a1e1fe43a2395dc7ef9f61 AS whisper-build
 # v1.9.5 tag resolved on 2026-10-20; callers may override with another
 # immutable commit or a reviewed tag when intentionally updating whisper.cpp.
 # v1.9.5 is required for the transcription flags in engines.go: the cli
