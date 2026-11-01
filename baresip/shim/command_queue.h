@@ -9,6 +9,7 @@ enum voxmail_command_type {
 	VOXMAIL_COMMAND_DIAL,
 	VOXMAIL_COMMAND_ANSWER,
 	VOXMAIL_COMMAND_HANGUP,
+	VOXMAIL_COMMAND_CLOSE_ALL,
 };
 
 struct voxmail_command {

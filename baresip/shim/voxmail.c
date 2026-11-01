@@ -1039,6 +1039,36 @@ static const struct voxmail_call_ops dispatch_ops = {
 	dispatch_release,
 };
 
+/* Close every matching open session, hanging up the underlying call first.
+ * Runs on the re main thread only: it drives baresip call teardown and
+ * mutates the session list. A UA argument closes that UA's sessions
+ * (module shutdown); NULL closes every session, used when the control
+ * connection drops and the bridge reconnects with no call state. */
+static void close_sessions(struct ua *ua, const char *reason)
+{
+	for (;;) {
+		struct le *le;
+		struct session *session = NULL;
+		pthread_mutex_lock(&session_lock);
+		for (le = sessions.head; le; le = le->next) {
+			struct session *candidate = le->data;
+			if (!candidate->closed &&
+			    (!ua || call_get_ua(candidate->call) == ua)) {
+				session = mem_ref(candidate);
+				break;
+			}
+		}
+		pthread_mutex_unlock(&session_lock);
+		if (!session)
+			break;
+		call_set_handlers(session->call, ignore_call_event_handler,
+		                  NULL, NULL);
+		call_hangup(session->call, 0, reason);
+		session_close(session);
+		mem_deref(session);
+	}
+}
+
 static void execute_command(struct voxmail_command *item)
 {
 	int err;
@@ -1049,6 +1079,12 @@ static void execute_command(struct voxmail_command *item)
 		info("voxmail: execute command type=%d\n", (int)item->type);
 	if (item->type == VOXMAIL_COMMAND_DIAL) {
 		dial_uri(item->request_id, item->uri);
+		return;
+	}
+	if (item->type == VOXMAIL_COMMAND_CLOSE_ALL) {
+		/* The control connection dropped: the bridge reconnects with no
+		 * memory of open calls, so close and release every session here. */
+		close_sessions(NULL, "bridge disconnected");
 		return;
 	}
 
@@ -1139,7 +1175,6 @@ static void baresip_event_handler(enum bevent_ev event, struct bevent *bevent,
 						 void *arg)
 {
 	struct call *call;
-	struct session *session;
 	const char *id;
 	int err;
 
@@ -1162,27 +1197,7 @@ static void baresip_event_handler(enum bevent_ev event, struct bevent *bevent,
 		 * sessions retain calls, so release them here while the UA still
 		 * owns each call; otherwise SIP shutdown waits for module teardown,
 		 * which itself cannot run until the SIP stack has finished. */
-		for (;;) {
-			struct le *le;
-			session = NULL;
-			pthread_mutex_lock(&session_lock);
-			for (le = sessions.head; le; le = le->next) {
-				struct session *candidate = le->data;
-				if (!candidate->closed &&
-				    call_get_ua(candidate->call) == bevent_get_ua(bevent)) {
-					session = mem_ref(candidate);
-					break;
-				}
-			}
-			pthread_mutex_unlock(&session_lock);
-			if (!session)
-				break;
-			call_set_handlers(session->call, ignore_call_event_handler,
-			                  NULL, NULL);
-			call_hangup(session->call, 0, "User-Agent shutdown");
-			session_close(session);
-			mem_deref(session);
-		}
+		close_sessions(bevent_get_ua(bevent), "User-Agent shutdown");
 		break;
 	case BEVENT_CALL_LOCAL_SDP:
 		/* Baresip emits CALL_OUTGOING/CALL_INCOMING before allocating the
@@ -1353,6 +1368,23 @@ static void *socket_worker(void *arg)
 				        frame_err);
 				break;
 			}
+		}
+		/* The control connection dropped (EOF, reset, or a malformed
+		 * frame). The bridge clears its own call state on disconnect and
+		 * reconnects fresh, so every session here is an orphan it can no
+		 * longer control. Close them through the command queue so teardown
+		 * runs on the re main thread; otherwise the ua call objects linger,
+		 * and once call_max_calls is reached baresip rejects every new call
+		 * until the container restarts. */
+		if (re_atomic_rlx(&running)) {
+			int queue_err = queue_command(VOXMAIL_COMMAND_CLOSE_ALL, NULL,
+			                              NULL, NULL, 0, NULL);
+			if (queue_err)
+				warning("voxmail: failed to schedule call cleanup"
+				        " after control disconnect (%m)\n", queue_err);
+			else if (verbose_logging)
+				info("voxmail: control connection lost;"
+				     " closing all calls\n");
 		}
 		(void)voxmail_client_owner_invalidate_if_current(&client_owner, fd,
 		                                                generation);
