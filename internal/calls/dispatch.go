@@ -2,6 +2,8 @@ package calls
 
 import (
 	"fmt"
+	"time"
+
 	"github.com/voxmail/voxmail/internal/diagnostics"
 	"log/slog"
 	"net"
@@ -39,8 +41,14 @@ func (s *Service) handleDTMF(conn net.Conn, message bridge.Message) error {
 		return s.chooseCallerAccount(conn, sess, message.Digit)
 	}
 	if message.Digit == "*" {
+		hadInput := sess.PIN != ""
 		sess.PIN = ""
 		s.mu.Unlock()
+		// Clearing the PIN used to be silent; a caller could not tell
+		// whether their keys registered at all.
+		if hadInput {
+			s.prompt(sess, "PIN cleared. Enter your PIN, then press pound.")
+		}
 		return nil
 	}
 	if message.Digit != "#" {
@@ -79,7 +87,14 @@ func (s *Service) handleDTMF(conn net.Conn, message bridge.Message) error {
 			if s.Log != nil {
 				s.Log.Warn("ivr PIN locked out", "call_id", message.CallID, "phone", phone)
 			}
-			return s.sendBridge(conn, bridge.Message{Type: "hangup", CallID: message.CallID, Code: 603, Reason: "PIN verification failed"})
+			// Never drop a locked-out caller in silence: say why, let the
+			// goodbye finish, then hang up.
+			callID := message.CallID
+			s.prompt(sess, "Too many PIN attempts. Goodbye.")
+			s.startDelayedTask(2*time.Second, func() {
+				_ = s.sendBridge(conn, bridge.Message{Type: "hangup", CallID: callID, Code: 603, Reason: "PIN verification failed"})
+			})
+			return nil
 		}
 		s.mu.Unlock()
 		s.prompt(sess, pinFailureNotice(remaining))
@@ -262,6 +277,9 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 		case "folder_action":
 			backUsingFlowLocked(sess, "folders")
 		case "read", "confirm_delete":
+			sess.BodyPaused = false
+			sess.BodyChunks = nil
+			sess.BodyMarkRead = nil
 			backUsingFlowLocked(sess, "list")
 		case "attachment_menu", "attachment_playback":
 			if sess.AttachmentCancel != nil {
@@ -451,6 +469,8 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 			s.startComposeLocked(sess, "reply")
 		case "6":
 			s.startComposeLocked(sess, "forward")
+		case "7":
+			transitionLocked(sess, "list_actions")
 		}
 		state, cursor, total := string(stateLocked(sess)), sess.Cursor, len(sess.Messages)
 		s.mu.Unlock()
@@ -465,6 +485,8 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 			s.prompt(sess, "Enter the recipient using multi tap, then press pound.")
 		} else if state == "subject" {
 			s.prompt(sess, "Enter the subject using multi tap, then press pound.")
+		} else if state == "list_actions" {
+			s.prompt(sess, menuPrompt("list_actions"))
 		} else if state == "subject_method" {
 			s.prompt(sess, menuPrompt("subject_method"))
 		} else if state == "body" {
@@ -472,7 +494,7 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 		} else {
 			s.prompt(sess, listPrompt(m, cursor, total))
 		}
-	case "read":
+	case "read", "list_actions":
 		s.mu.Lock()
 		if len(sess.Messages) == 0 {
 			s.mu.Unlock()
@@ -483,17 +505,23 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 			sess.Cursor = 0
 		}
 		m := sess.Messages[sess.Cursor]
+		isRead := string(stateLocked(sess)) == "read"
 		s.mu.Unlock()
+		// While a message body plays or sits paused, keys 4, 6 and 7 are
+		// pause, skip and speech rate instead of their read-menu meanings.
+		if isRead && s.handleBodyPlaybackKey(sess, key) {
+			return nil
+		}
 		if key == "1" {
 			s.readMessage(sess, m)
 		} else if key == "2" {
 			s.toggleRead(sess, m)
 		} else if key == "3" {
 			s.startCompose(sess, "reply")
-			s.prompt(sess, "Replying. "+menuPrompt("subject_method"))
+			s.prompt(sess, "Replying. "+menuPrompt("body_method"))
 		} else if key == "4" {
 			s.startCompose(sess, "replyall")
-			s.prompt(sess, "Reply all. "+menuPrompt("subject_method"))
+			s.prompt(sess, "Reply all. "+menuPrompt("body_method"))
 		} else if key == "5" {
 			s.mu.Lock()
 			transitionLocked(sess, "forward_options")
@@ -509,20 +537,39 @@ func (s *Service) handleMenu(conn net.Conn, sess *session, message bridge.Messag
 		} else if key == "7" {
 			s.openMoveMenu(sess, m)
 		} else if key == "9" {
-			s.mu.Lock()
-			transitionLocked(sess, "more_options")
-			s.mu.Unlock()
-			s.prompt(sess, menuPrompt("more_options"))
+			// While a long message still has unheard pages, key 9 keeps
+			// reading the rest; once the body is spent it opens the
+			// more-options menu as before.
+			if !s.speakMoreBody(sess) {
+				s.mu.Lock()
+				transitionLocked(sess, "more_options")
+				s.mu.Unlock()
+				s.prompt(sess, menuPrompt("more_options"))
+			}
 		} else if key == "0" {
 			// "0 for next" continues the list from the next message rather
 			// than reading it outright: the caller hears the next entry and
 			// the list menu, and stays in control of what plays.
 			m = s.advanceToPlayable(sess)
 			s.mu.Lock()
-			transitionLocked(sess, "list")
+			next := "list"
+			if string(stateLocked(sess)) == "list_actions" {
+				next = "list_actions"
+			}
+			transitionLocked(sess, next)
 			cursor, total := sess.Cursor, len(sess.Messages)
+			sess.BodyPending = nil
+			sess.BodyChunks = nil
+			sess.BodyIndex = 0
+			sess.BodyPaused = false
+			sess.BodyInterrupted = false
+			sess.BodyMarkRead = nil
 			s.mu.Unlock()
-			s.prompt(sess, listPrompt(m, cursor, total))
+			if next == "list_actions" {
+				s.prompt(sess, fmt.Sprintf("Message %d of %d. From %s. Subject %s. %s", cursor+1, total, spokenHeader(m.Sender, "unknown sender", 240), spokenHeader(m.Subject, "no subject", 300), menuPrompt("list_actions")))
+			} else {
+				s.prompt(sess, listPrompt(m, cursor, total))
+			}
 		}
 	case "attachment_menu":
 		if key == "0" {

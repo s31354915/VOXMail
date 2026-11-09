@@ -173,6 +173,88 @@ func (s *Service) playSpeechChunks(sess *session, chunks []string) {
 // plays: playPrompt advances the sequence for each chunk, so comparing
 // against a pre-loop snapshot made the stream stop after its first chunk.
 func (s *Service) streamSpeechChunks(sess *session, dir string, chunks []string, synthesize func(context.Context, string, string) error, play func(context.Context, string) error) {
+	s.streamSpeechChunksTracked(sess, dir, chunks, nil, synthesize, play)
+}
+
+// playBodyFrom streams the tracked chunks of the message page being read,
+// starting at chunk index start. Each completed chunk advances the session's
+// body index, so the pause, skip and speech-rate keys can resume exactly
+// where the caller left off. The caller speaks the follow-up menu.
+func (s *Service) playBodyFrom(sess *session, start int) {
+	if s == nil || sess == nil {
+		return
+	}
+	s.mu.Lock()
+	chunks := append([]string(nil), sess.BodyChunks...)
+	s.mu.Unlock()
+	if start < 0 {
+		start = 0
+	}
+	if start >= len(chunks) {
+		return
+	}
+	// The stream starts fresh: the key that triggered it may have arrived
+	// while other audio was playing, and that interruption must not stop
+	// this stream before its first chunk.
+	s.mu.Lock()
+	sess.playInterrupted = false
+	sess.BodyPaused = false
+	sess.BodyInterrupted = false
+	s.mu.Unlock()
+	runtime := s.promptRuntime(sess)
+	if runtime == nil {
+		for i := start; i < len(chunks); i++ {
+			s.prompt(sess, chunks[i])
+			s.mu.Lock()
+			sess.BodyIndex = i + 1
+			s.mu.Unlock()
+		}
+	} else {
+		dir := s.Media.Dir
+		if dir == "" {
+			dir = filepath.Dir(sess.TxPath)
+		}
+		s.streamSpeechChunksTracked(sess, dir, chunks[start:], func(index int) {
+			s.mu.Lock()
+			sess.BodyIndex = start + index + 1
+			s.mu.Unlock()
+		}, func(ctx context.Context, text, output string) error {
+			s.mu.Lock()
+			speed := sess.BodySpeed
+			s.mu.Unlock()
+			if speed != 0 {
+				return runtime.SynthesizeAt(ctx, text, output, speed)
+			}
+			return runtime.Synthesize(ctx, text, output)
+		}, func(ctx context.Context, path string) error {
+			return s.Media.playWAVTail(ctx, sess.TxPath, path, pcmChunkDrainTail)
+		})
+	}
+	if s.wasInterrupted(sess) {
+		return
+	}
+	// A short body interrupted mid-prompt has not spent its unread marker
+	// yet; finishing the resumed playback spends it.
+	s.mu.Lock()
+	markRead := sess.BodyMarkRead
+	s.mu.Unlock()
+	if markRead != nil {
+		s.mu.Lock()
+		sess.BodyMarkRead = nil
+		s.mu.Unlock()
+		markRead()
+	}
+}
+
+// streamSpeechChunksTracked owns the double-buffered streaming loop, split
+// from playSpeechChunks so tests can drive it with fake synthesis and
+// playback. The staleness check re-reads playSequence after every chunk this
+// loop plays: playPrompt advances the sequence for each chunk, so comparing
+// against a pre-loop snapshot made the stream stop after its first chunk.
+// onPlayed(index) fires after chunk index finished playing, and every early
+// exit from an interruption marks the session so the caller can resume
+// mid-message (pause, skip, speech rate).
+func (s *Service) streamSpeechChunksTracked(sess *session, dir string, chunks []string, onPlayed func(int), synthesize func(context.Context, string, string) error, play func(context.Context, string) error) {
 	s.mu.Lock()
 	startSequence := sess.playSequence
 	s.mu.Unlock()
@@ -232,11 +314,17 @@ func (s *Service) streamSpeechChunks(sess *session, dir string, chunks []string,
 		}
 	}()
 
-	for range chunks {
+	markInterrupted := func() {
+		s.mu.Lock()
+		sess.BodyInterrupted = true
+		s.mu.Unlock()
+	}
+	for i := range chunks {
 		s.mu.Lock()
 		stale := sess.Closed || sess.playSequence != startSequence || sess.playInterrupted
 		s.mu.Unlock()
 		if stale {
+			markInterrupted()
 			return
 		}
 		var item produced
@@ -266,6 +354,9 @@ func (s *Service) streamSpeechChunks(sess *session, dir string, chunks []string,
 		// back earlier let the worker reuse the file while its audio was
 		// still on the line, so a long email could play the wrong chunk.
 		free <- item.slot
+		if err == nil && onPlayed != nil {
+			onPlayed(i)
+		}
 		s.mu.Lock()
 		// Adopt the sequence our own play just produced (or a newer prompt
 		// replaced); the next iteration compares against the latest state,
@@ -273,7 +364,9 @@ func (s *Service) streamSpeechChunks(sess *session, dir string, chunks []string,
 		startSequence = sess.playSequence
 		s.mu.Unlock()
 		if err != nil {
-			if !errors.Is(err, context.Canceled) && s.Log != nil {
+			if errors.Is(err, context.Canceled) {
+				markInterrupted()
+			} else if s.Log != nil {
 				s.Log.Warn("email body chunk playback failed", "error", err)
 			}
 			return

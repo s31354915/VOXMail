@@ -116,6 +116,7 @@ func TestCallEventDispatcherInterruptsPromptBeforeHandlingDTMF(t *testing.T) {
 			promptCtx, cancel := context.WithCancel(ctx)
 			svc.mu.Lock()
 			sess.playCancel = cancel
+			sess.mediaPlays = 1 // the fake prompt is active audio
 			svc.mu.Unlock()
 			close(promptStarted)
 			<-promptCtx.Done()

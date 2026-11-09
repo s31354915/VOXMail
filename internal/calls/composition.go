@@ -464,7 +464,11 @@ func (s *Service) startComposeLocked(sess *session, mode string) {
 		sess.Editor = newIVREditor("compose")
 		return
 	}
-	transitionLocked(sess, "subject_method")
+	// Replies and reply-alls seed the subject from the original message, so
+	// asking the caller to choose a subject method only adds a step: go
+	// straight to the body. Key 3 at subject_method still skips the subject
+	// on a fresh compose, and draft_edit can change it later.
+	transitionLocked(sess, "body_method")
 	sess.Editor = nil
 }
 
@@ -585,7 +589,9 @@ func fieldConfirmPrompt(state, value string) string {
 func (s *Service) handleFieldConfirmation(sess *session, key string) {
 	s.mu.Lock()
 	value, state, recipientKind := sess.ConfirmValue, sess.ConfirmState, sess.ConfirmRecipientKind
-	if value == "" || state == "" {
+	// A blank subject is a legitimate choice for the caller who chose to
+	// skip it; every other field needs content before it can be confirmed.
+	if state == "" || (value == "" && state != "subject") {
 		s.mu.Unlock()
 		s.repeatCurrentPrompt(sess)
 		return
@@ -600,12 +606,13 @@ func (s *Service) handleFieldConfirmation(sess *session, key string) {
 			sess.Editor.Text = value
 		}
 		sess.ConfirmValue, sess.ConfirmState, sess.ConfirmRecipientKind = "", "", ""
+		entry := s.entryPrompt(sess, state)
 		s.mu.Unlock()
 		notice := "Editing your previous entry. Press star twice to delete the last character. "
 		if key == "3" {
 			notice = "Entry cleared. "
 		}
-		s.prompt(sess, notice+menuPrompt(state))
+		s.prompt(sess, notice+entry)
 		return
 	}
 	if key != "1" {

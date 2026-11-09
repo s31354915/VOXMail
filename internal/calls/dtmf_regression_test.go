@@ -55,7 +55,7 @@ func TestLostReleaseAndLegacyPressesDoNotDisableKey(t *testing.T) {
 func TestAllUnreadReadMenuAcceptsAdvertisedKeys(t *testing.T) {
 	for _, tc := range []struct{ key, state, phrase string }{
 		{"1", "read", "Subject subject"}, {"2", "read", "marked unread"},
-		{"3", "subject_method", "Replying"}, {"4", "subject_method", "Reply all"},
+		{"3", "body_method", "Replying"}, {"4", "body_method", "Reply all"},
 		{"5", "forward_options", "Forward the original"}, {"6", "confirm_delete", "Delete this message"},
 		{"7", "move_menu", "Move message"}, {"8", "read", "no playable attachments"},
 		{"9", "more_options", "More options"}, {"0", "list", "Message 1 of 1"},

@@ -445,6 +445,7 @@ func TestInactivityTimeoutHangsUpAndResets(t *testing.T) {
 	svc, _ := newTestService(t)
 	svc.InactivityTimeout = 20 * time.Millisecond
 	svc.InactivityHangupDelay = 10 * time.Millisecond
+	svc.InactivityWarnWait = 10 * time.Millisecond
 	server, client := net.Pipe()
 	defer server.Close()
 	defer client.Close()

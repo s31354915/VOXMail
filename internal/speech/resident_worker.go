@@ -40,6 +40,7 @@ const (
 // request so one resident model can serve every speech rate.
 type piperSynthesizer interface {
 	synthesize(ctx context.Context, text, output string, speed int) error
+	synthesizeForced(ctx context.Context, text, output string, speed int) error
 	close() error
 	// alive reports whether the engine currently holds a loaded model. A
 	// one-shot CLI worker never reports resident.
@@ -162,6 +163,14 @@ type residentProcess struct {
 }
 
 func (w *residentWorker) synthesize(ctx context.Context, text, output string, speed int) (retErr error) {
+	return w.synthesizeSpeed(ctx, text, output, speed, false)
+}
+
+func (w *residentWorker) synthesizeForced(ctx context.Context, text, output string, speed int) (retErr error) {
+	return w.synthesizeSpeed(ctx, text, output, speed, true)
+}
+
+func (w *residentWorker) synthesizeSpeed(ctx context.Context, text, output string, speed int, force bool) (retErr error) {
 	if w == nil {
 		return fmt.Errorf("piper worker is nil")
 	}
@@ -190,7 +199,7 @@ func (w *residentWorker) synthesize(ctx context.Context, text, output string, sp
 		deadline = wait
 	}
 	var lengthScale *float64
-	if speed >= 1 && speed <= 5 && !hasLengthScaleExtra(w.piper.Extra) {
+	if speed >= 1 && speed <= 5 && (force || !hasLengthScaleExtra(w.piper.Extra)) {
 		value := speedLengthScale(speed)
 		lengthScale = &value
 	}
@@ -221,7 +230,7 @@ func (w *residentWorker) synthesize(ctx context.Context, text, output string, sp
 		}
 		w.killProcessLocked(proc)
 	}
-	return w.fallbackLocked(ctx, text, output, speed)
+	return w.fallbackLocked(ctx, text, output, speed, force)
 }
 
 // errResidentTransport marks failures that a fresh child may not hit again.
@@ -423,13 +432,16 @@ func (w *residentWorker) killProcessLocked(proc *residentProcess) {
 	}
 }
 
-func (w *residentWorker) fallbackLocked(ctx context.Context, text, output string, speed int) error {
+func (w *residentWorker) fallbackLocked(ctx context.Context, text, output string, speed int, force bool) error {
 	if w.fallback == nil {
 		worker, err := startPiperWorker(ctx, w.piper)
 		if err != nil {
 			return err
 		}
 		w.fallback = worker
+	}
+	if force {
+		return w.fallback.synthesizeForced(ctx, text, output, speed)
 	}
 	return w.fallback.synthesize(ctx, text, output, speed)
 }
