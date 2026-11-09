@@ -11,9 +11,9 @@ jaraco-context==6.1.2 \
 numpy==2.4.6 \
     --hash=sha256:0ab0a9c4ffb1a6d95ef519fe4247dba8eb6b18ad93999f76b7f657039acabd47 \
     --hash=sha256:89cd468399cfd2504718f0ba50e410dca55a170b61a02ad92bb18c8a65186e93
-onnxruntime==1.31.0 \
-    --hash=sha256:37c7dfe398550afdf9670a29315dbb88e49d8afc473ffaf1f410376efbb9c80a \
-    --hash=sha256:d4092b78fc5bab77ce6522393098cdb2535423045ecdcff15cc0d022162d6b66
+onnxruntime==1.31.1 \
+    --hash=sha256:5752bd508126ae7c49894d3b9d2e83f0c3d487319246d04c444b393308d7ad7f \
+    --hash=sha256:da05378364c44d4407e463982d2bf8d5e4cfea873283757e48beeb41df97b7f3
 packaging==26.3 \
     --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
 pathvalidate==3.3.1 \
