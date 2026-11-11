@@ -115,9 +115,9 @@ Channel %s
 Master :%s-remote:
 Slave :%s-local:
 %sCreate Slave
-Remove None
+Remove Near
 Sync All
-Expunge None
+Expunge Near
 SyncState *
 	`, name, quote(a.IMAPHost), a.IMAPPort, tunnel, quote(a.IMAPUser), name, security, name, name, name, quote(root), quote(inbox), name, name, name, patternLine)
 	for i, remote := range remotes {
@@ -131,9 +131,9 @@ Channel %s
 Master :%s-remote:%s
 Slave :%s-local:%s
 Create Slave
-Remove None
+Remove Near
 Sync All
-Expunge None
+Expunge Near
 SyncState *
 `, channel, name, quote(imapUTF7(remote)), name, quote(local))
 	}

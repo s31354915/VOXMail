@@ -18,7 +18,7 @@ func TestGenerateDoesNotCreateRemoteFolders(t *testing.T) {
 	if !strings.Contains(text, "Create Slave") || strings.Contains(text, "Create Both") || strings.Contains(text, "Create Master") {
 		t.Fatalf("unsafe folder creation policy:\n%s", text)
 	}
-	if !strings.Contains(text, "Expunge None") || strings.Contains(text, "Pass \"p\"") {
+	if !strings.Contains(text, "Expunge Near") || strings.Contains(text, "Pass \"p\"") {
 		t.Fatalf("unsafe deletion or credential policy:\n%s", text)
 	}
 	if !strings.Contains(text, "Patterns *") {
