@@ -124,7 +124,10 @@ func scanContextWithFilterAndErrors(ctx context.Context, root string, parser fun
 		name := filepath.Base(path)
 		read := false
 		if marker := strings.Index(name, ":2,"); marker >= 0 {
-			read = strings.Contains(name[marker+3:], "S")
+			flags := name[marker+3:]
+			// Trashed files are orphan candidates during sync and must not
+			// inflate unread counts while reconciliation catches up.
+			read = strings.Contains(flags, "S") || strings.Contains(flags, "T")
 		}
 		return visit(MaildirMessage{Path: path, Folder: folder, Read: read, Message: msg})
 	})
