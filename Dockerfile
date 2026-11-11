@@ -106,7 +106,7 @@ RUN --mount=type=cache,id=gobuild-${TARGETARCH},target=/root/.cache/go-build,sha
     printf 'piper_tts=1.3.0\npiper_model_sha256=%s\npiper_config_sha256=%s\nwhisper_model_sha256=%s\n' \
       "${piper_model_sha}" "${piper_config_sha}" "${whisper_model_sha}" > /out/provenance/models.txt
 
-FROM python:3.11-slim-bookworm@sha256:94a8fee35252d06ab75856f15f12c7bae67b10e8a6da93c7fded82b2610926cd
+FROM python:3.11-slim-bookworm@sha256:a83ba18aef0f865b1a4a611c2cf460fe446f2795673bbb9fe43be570439e3b39
 COPY LICENSE /usr/local/share/licenses/voxmail/LICENSE
 ARG VOXMAIL_REVISION=unknown
 LABEL org.opencontainers.image.revision="${VOXMAIL_REVISION}"
